@@ -1,0 +1,16 @@
+# The frontend Dockerfile does `COPY . .` then builds, so excluding these keeps
+# the build context small and avoids copying secrets / rebuilt artifacts.
+node_modules
+dist
+.env
+.env.*
+.git
+.gitignore
+.dockerignore
+Dockerfile
+*.md
+
+# build / test artifacts
+coverage
+playwright-report
+test-results

@@ -1,0 +1,44 @@
+# License Check — protects the Sustainable Use License distribution.
+#
+# Fails if a newly added *production* dependency carries a license that isn't on
+# the permissive allow-list, so a contributor can't accidentally introduce a
+# copyleft (GPL/AGPL) or non-commercial package that would conflict with
+# ForgeChat's redistribution under the Sustainable Use License (see LICENSE.md).
+# This is the automated, permanent version of a manual dependency licence review.
+#
+# Node-only stack: backend (Express) and frontend (React/Vite) are scanned
+# separately since each has its own package.json. Dev dependencies are excluded.
+name: License Check
+
+on: [pull_request]
+
+jobs:
+  licenses:
+    name: Licenses (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+      - name: Install ${{ matrix.dir }} production dependencies
+        working-directory: ${{ matrix.dir }}
+        run: npm ci --omit=dev
+      - name: Scan licenses (fail on anything not permissively licensed)
+        working-directory: ${{ matrix.dir }}
+        # The allow-list also includes a few permissive licenses expressed in
+        # non-canonical forms pulled in (transitively) by exceljs:
+        #   MIT/X11                     = MIT (chainsaw, traverse)
+        #   (MIT OR GPL-3.0-or-later)   = choose MIT (jszip)
+        #   (MIT AND Zlib)              = both permissive (pako)
+        # `buffers@0.1.1` ships no license field but is MIT per its repository,
+        # so it is excluded by name.
+        run: |
+          npx --yes license-checker@25.0.1 --production --summary \
+            --excludePrivatePackages \
+            --excludePackages "buffers@0.1.1" \
+            --onlyAllow "MIT;MIT-0;ISC;Apache-2.0;BSD-2-Clause;BSD-3-Clause;0BSD;BlueOak-1.0.0;CC0-1.0;Unlicense;Python-2.0;MIT/X11;(MIT OR GPL-3.0-or-later);(MIT AND Zlib)"

@@ -1,0 +1,76 @@
+name: 🐛 Bug Report
+description: Report something that isn't working as expected
+title: "fix: <short description>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! ⚠️ **Do not** report security
+        vulnerabilities here — follow the private process in
+        [SECURITY.md](../blob/main/SECURITY.md) instead.
+  - type: checkboxes
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: I searched existing issues and this has not been reported yet.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce the behaviour?
+      placeholder: |
+        1. Go to '...'
+        2. Click on '...'
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include error messages, screenshots, or backend logs if relevant.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: ForgeChat version or git commit hash.
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Local development
+        - Self-hosted (Docker)
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Node version / browser
+      placeholder: "e.g. Node 20.11, Chrome 124"
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context

@@ -1,0 +1,87 @@
+# Standalone single-droplet deployment for ForgeChat — SAMPLE / TEMPLATE.
+# Plain PostgreSQL + Redis + backend + frontend(nginx) + Caddy (auto-HTTPS).
+#
+# This is a committed template. To deploy:
+#   1. cp docker-compose.sample.yml docker-compose.yml   # your real, gitignored copy
+#   2. cp backend/.env.example backend/.env  && edit it  # secrets/config
+#   3. docker compose up -d --build
+#
+# The actual docker-compose.yml is gitignored so each deployment keeps its own.
+# Secrets/config live in ./backend/.env (NOT committed); the db service reads the
+# same file for POSTGRES_PASSWORD so there's a single source of truth. The first
+# `docker compose up` fails with "env file ./backend/.env not found" until you
+# create backend/.env in step 2.
+services:
+  forgecrm-db:
+    image: postgres:15
+    container_name: forgecrm-db
+    restart: unless-stopped
+    env_file: ./backend/.env          # supplies POSTGRES_PASSWORD (other vars ignored by postgres)
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    container_name: forgecrm-redis
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  forgecrm-backend:
+    build: ./backend
+    container_name: forgecrm-backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      NODE_ENV: production
+      PORT: "3011"                     # nginx (frontend) proxies to forgecrm-backend:3011
+    volumes:
+      - media:/app/media               # downloaded inbound/outbound chat media
+      - uploads:/app/uploads           # team-member profile pictures
+    depends_on:
+      forgecrm-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  forgecrm-frontend:
+    build: ./frontend
+    container_name: forgecrm-frontend
+    restart: unless-stopped
+    depends_on:
+      - forgecrm-backend
+
+  caddy:
+    image: caddy:2
+    container_name: forgecrm-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - forgecrm-frontend
+
+volumes:
+  pgdata:
+  redisdata:
+  media:
+  uploads:
+  caddy_data:
+  caddy_config:

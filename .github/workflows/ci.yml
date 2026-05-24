@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Backend (install + syntax check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      - name: Install
+        working-directory: backend
+        run: npm ci --omit=dev
+      - name: Syntax-check every backend source file
+        working-directory: backend
+        run: |
+          fail=0
+          for f in $(find src scripts -type f -name "*.js"); do
+            node --check "$f" || { echo "::error file=$f::Syntax error"; fail=1; }
+          done
+          exit $fail
+
+  frontend:
+    name: Frontend (build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  migrations:
+    name: Migrations (lint SQL against Postgres 15)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Apply every migration in order against a fresh DB
+        env:
+          PGPASSWORD: ci
+        run: |
+          # Plain Postgres — the app uses a single `coexistence` schema and no
+          # extra roles. Just create the schema, then apply migrations in order.
+          psql -h localhost -U postgres -d ci -c "CREATE SCHEMA IF NOT EXISTS coexistence;"
+          for f in $(ls db/migrations/*.sql | sort); do
+            echo "→ Applying $f"
+            psql -h localhost -U postgres -d ci -v ON_ERROR_STOP=1 -f "$f" \
+              || { echo "::error file=$f::Migration failed"; exit 1; }
+          done
+
+  secret-scan:
+    name: Secret scan (reject obvious tokens)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+      - name: Grep for high-confidence secret patterns
+        run: |
+          # Meta tokens (EAA…), GitHub PATs (ghp_…), OpenAI keys (sk-…), generic AKIA
+          if git ls-files | xargs grep -EHn 'EAA[A-Za-z0-9_-]{60,}|ghp_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}' 2>/dev/null; then
+            echo "::error::High-confidence secret pattern detected in tracked files"
+            exit 1
+          fi
+          echo "No secrets found in tracked files."

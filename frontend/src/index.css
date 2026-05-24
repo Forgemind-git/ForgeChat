@@ -1,0 +1,72 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'DM Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: var(--c-pageBg);
+  color: var(--c-text);
+}
+
+input, button, textarea, select {
+  font-family: inherit;
+}
+
+/* ─── Color palette (light only) ────────────────────────────────────────
+   Tokens consumed via the `C` object in constants.js (each maps to var(--c-*)).
+   This app is light-mode only — there is no dark theme. */
+:root {
+  --c-pageBg: #F7F7F3;
+  --c-sidebarBg: #FAF9F5;
+  --c-sidebarBorder: #E5E5E0;
+  --c-headerBg: #0F0F10;
+  --c-headerText: #F5F5F2;
+  --c-headerMuted: #A1A1AA;
+  --c-headerBorder: rgba(255,255,255,.12);
+  --c-headerSurface: rgba(255,255,255,.06);
+  --c-cardBg: #ffffff;
+  --c-border: #E5E5E0;
+  --c-borderDark: #d1d7db;
+  --c-text: #111111;
+  --c-textSecondary: #6B7280;
+  --c-textMuted: #8696a0;
+  --c-primary: #dc2626;
+  --c-primaryHover: #b91c1c;
+  --c-primaryLight: #FCEBEB;
+  --c-primaryText: #111b21;
+  --c-purple: #534AB7;
+  --c-green: #0F6E56;
+  --c-amber: #E8A317;
+  --c-shadowSm: 0 1px 2px rgba(0,0,0,.08);
+  --c-shadowMd: 0 8px 24px rgba(0,0,0,.06);
+  --c-shadowLg: 0 20px 60px rgba(0,0,0,.15);
+  --c-waBg: #e5ddd5;
+  /* chat */
+  --c-incomingBg: #ffffff;
+  --c-incomingText: #111b21;
+  --c-outgoingBg: #d9fdd3;
+  --c-outgoingText: #111b21;
+  --c-chatBg: #e5ddd5;
+  --c-statusDelivered: #53bdeb;
+  --c-statusRead: #53bdeb;
+  --c-statusSent: #8696a0;
+  /* neutral aliases for literal-heavy views */
+  --c-surface: #ffffff;
+  --c-surfaceAlt: #F7F7F3;
+  --c-hover: #EFEEE6;
+  --c-chatPanel: #f0f2f5;
+  --c-chatWall: #efeae2;
+}
+
+input, textarea, select { color: var(--c-text); }
+::placeholder { color: var(--c-textMuted); opacity: 1; }

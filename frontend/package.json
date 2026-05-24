@@ -1,0 +1,31 @@
+{
+  "name": "forgecrm-frontend",
+  "version": "1.0.0",
+  "description": "ForgeChat frontend — WhatsApp chat viewer",
+  "private": true,
+  "license": "LicenseRef-Sustainable-Use-License",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:e2e": "playwright test",
+    "test:unit": "vitest run",
+    "test": "npm run test:unit && npm run test:e2e"
+  },
+  "dependencies": {
+    "lucide-react": "^0.577.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@vitejs/plugin-react": "^4.3.1",
+    "jsdom": "^29.1.1",
+    "vite": "^5.3.3",
+    "vitest": "^4.1.7"
+  }
+}

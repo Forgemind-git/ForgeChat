@@ -1,0 +1,39 @@
+name: ✨ Feature Request
+description: Suggest an idea or enhancement for ForgeChat
+title: "feat: <short description>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Please open an issue to discuss scope
+        **before** sending a large pull request.
+  - type: checkboxes
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: I searched existing issues and this has not been requested yet.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem does this solve? Why is it needed?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe what you'd like to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Mockups, screenshots, or links that help explain the request.

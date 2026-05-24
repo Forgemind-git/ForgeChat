@@ -1,0 +1,7 @@
+# Caddy reverse proxy with automatic HTTPS (Let's Encrypt).
+# Terminates TLS for the subdomain and forwards everything to the frontend
+# container (nginx), which serves the SPA and proxies /api, /uploads, /l/ to the
+# backend. Requires: DNS A record for the domain -> droplet IP, ports 80+443 open.
+forgechat.akilsadik.live {
+    reverse_proxy forgecrm-frontend:80
+}

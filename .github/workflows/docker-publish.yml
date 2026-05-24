@@ -1,0 +1,51 @@
+# Publish Docker Images — makes one-command deploy real.
+#
+# On a published release, builds the backend and frontend images and pushes them
+# to GitHub's free container registry (GHCR), tagged by the release version.
+# Self-hosters then pull pre-built, versioned images instead of building from
+# source:
+#   ghcr.io/forgemind-git/forge-chat-backend:<version>
+#   ghcr.io/forgemind-git/forge-chat-frontend:<version>
+#
+# ForgeChat ships two images (Express API + nginx-served React build), so this
+# builds both via a matrix. The image name is lowercased by metadata-action.
+name: Publish Docker Images
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  docker:
+    name: Build & push ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: backend
+            context: ./backend
+          - name: frontend
+            context: ./frontend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}-${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

@@ -1,0 +1,76 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+build/
+**/dist/
+**/build/
+*.tgz
+
+# Environment & secrets — NEVER commit
+.env
+.env.local
+.env.production
+.env.*.local
+**/.env
+!.env.example
+!**/.env.example
+
+# Runtime data (mounted as docker volumes in prod)
+backend/uploads/
+backend/media/
+uploads/
+media/
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Coverage & cache
+coverage/
+.nyc_output/
+.cache/
+.parcel-cache/
+.vite/
+
+# Temp / scratch
+*.tmp
+*.bak
+/tmp/
+scratch/
+
+# Legacy reference / scratch files at repo root (not imported by the app — see LLD.md)
+# Root-level JSX only; frontend/src/**/*.jsx is real source and stays tracked.
+/*.jsx
+transform.js
+
+# Local deployment compose — copy from docker-compose.sample.yml (gitignored so
+# each deployment keeps its own).
+docker-compose.yml
+
+# PDFs / large generated artifacts
+ForgeCRM_LLD.html
+*.pdf
+
+# Local Claude memory (machine-specific)
+.claude/
+.CLAUDE.md
+
+# Backups
+*.dump
+*.sql.gz
+*.backup
