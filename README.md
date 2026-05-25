@@ -472,6 +472,4 @@ Copyright © 2026 **Forgemind Techhub LLP**. "Forgemind" and "ForgeChat" are tra
 
 **ForgeChat** — own your WhatsApp inbox.
 
-<sub>Made with ❤️ by <a href="https://github.com/Forgemind-git">Forgemind</a></sub>
-
 </div>
