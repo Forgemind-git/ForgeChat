@@ -770,8 +770,10 @@ router.post('/messages/react', async (req, res) => {
       );
     } else {
       await pool.query(
-        `DELETE FROM coexistence.message_reactions WHERE target_message_id = $1 AND direction = 'outgoing'`,
-        [messageId]
+        `DELETE FROM coexistence.message_reactions
+           WHERE target_message_id = $1 AND direction = 'outgoing'
+             AND wa_number = $2 AND contact_number = $3`,
+        [messageId, wa, contact]
       );
     }
 
@@ -801,9 +803,14 @@ router.post('/messages/star', async (req, res) => {
       return res.status(400).json({ error: 'waNumber, contactNumber and messageId required' });
     }
     if (!(await assertContactAccess(req, res, waNumber, contactNumber))) return;
+    // Scope to the validated (wa_number, contact_number) so a pair the user owns
+    // can't be used to star a message_id from another conversation (IDOR).
+    const waDigits = String(waNumber).replace(/\D/g, '');
+    const contactDigits = String(contactNumber).replace(/\D/g, '');
     const { rowCount } = await pool.query(
-      `UPDATE coexistence.chat_history SET starred = $1 WHERE message_id = $2`,
-      [!!starred, messageId]
+      `UPDATE coexistence.chat_history SET starred = $1
+         WHERE message_id = $2 AND wa_number = $3 AND contact_number = $4`,
+      [!!starred, messageId, waDigits, contactDigits]
     );
     if (rowCount === 0) return res.status(404).json({ error: 'Message not found' });
     res.json({ ok: true, messageId, starred: !!starred });
@@ -825,6 +832,10 @@ router.post('/messages/send', async (req, res) => {
     if (!fromNumber || !toNumber || !text || !String(text).trim()) {
       return res.status(400).json({ error: 'fromNumber, toNumber, text required' });
     }
+    // Ownership: the (wa_number, contact_number) pair must belong to the
+    // requester (admins bypass). This ties fromNumber to the user and gates
+    // toNumber — a non-admin can't send from a WABA or to a contact they don't own.
+    if (!(await assertContactAccess(req, res, fromNumber, toNumber))) return;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: fromNumber });
     if (error) return res.status(400).json({ error });
@@ -872,6 +883,7 @@ router.post('/messages/send-media', mediaUpload.single('file'), async (req, res)
     const { fromNumber, toNumber, caption = '', contextMessageId } = req.body || {};
     if (!fromNumber || !toNumber) return res.status(400).json({ error: 'fromNumber and toNumber required' });
     if (!req.file) return res.status(400).json({ error: 'file required' });
+    if (!(await assertContactAccess(req, res, fromNumber, toNumber))) return;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: fromNumber });
     if (error) return res.status(400).json({ error });
@@ -962,6 +974,7 @@ router.post('/messages/send-audio', mediaUpload.single('file'), async (req, res)
     if (!req.file.buffer || req.file.buffer.length === 0) {
       return res.status(400).json({ error: 'The recording was empty. Please record again before sending.' });
     }
+    if (!(await assertContactAccess(req, res, fromNumber, toNumber))) return;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: fromNumber });
     if (error) return res.status(400).json({ error });
@@ -1052,6 +1065,7 @@ router.post('/messages/send-library-media', async (req, res) => {
     if (!fromNumber || !toNumber || !mediaLibraryId) {
       return res.status(400).json({ error: 'fromNumber, toNumber, mediaLibraryId required' });
     }
+    if (!(await assertContactAccess(req, res, fromNumber, toNumber))) return;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: fromNumber });
     if (error) return res.status(400).json({ error });
