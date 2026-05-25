@@ -735,7 +735,7 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
 
   return (
     <div style={{
-      flex: 1, display: 'flex', flexDirection: 'column',
+      flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column',
       overflow: 'hidden',
       background: 'var(--c-chatWall)',
     }}>

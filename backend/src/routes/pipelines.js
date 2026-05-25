@@ -78,6 +78,22 @@ function statusForStageType(stageType) {
   return 'open';
 }
 
+// Mirror a deal's assignment onto its linked contact so the assignee sees the
+// contact (and its whole chat) everywhere — identical effect to assigning from
+// the Chats page, because contact list visibility and conversation access
+// (assertContactAccess) both gate on contacts.assigned_user_id.
+// No-op unless we have a linked contact AND a non-null assignee, so unassigning
+// a deal (assignee = NULL) never strips the contact from its current owner.
+async function syncContactAssignment(waNumber, contactNumber, assigneeId) {
+  if (!waNumber || !contactNumber || !assigneeId) return;
+  await pool.query(
+    `UPDATE coexistence.contacts
+        SET assigned_user_id = $1, updated_at = NOW()
+      WHERE wa_number = $2 AND contact_number = $3`,
+    [assigneeId, waNumber, contactNumber]
+  );
+}
+
 /* ------------------------------- pipelines ------------------------------- */
 
 // List all pipelines (with nested stages) — any authenticated user.
@@ -381,7 +397,11 @@ router.post('/deals', adminOnly, async (req, res) => {
         posRows[0].pos, req.user.id,
       ]
     );
-    res.status(201).json(dealShape(rows[0]));
+    // If this deal links a contact and has an assignee, hand that contact (and
+    // its chat) to the assignee — same behaviour as assigning in Chats.
+    const created = rows[0];
+    await syncContactAssignment(created.contact_wa_number, created.contact_number, created.assigned_user_id);
+    res.status(201).json(dealShape(created));
   } catch (err) {
     console.error('[pipelines] create deal error:', err.message);
     res.status(500).json({ error: 'Failed to create deal' });
@@ -430,7 +450,13 @@ router.put('/deals/:id', adminOnly, async (req, res) => {
     const { rows } = await pool.query(
       `UPDATE coexistence.deals SET ${sets.join(', ')} WHERE id = $${i} RETURNING *`, params
     );
-    res.json(dealShape(rows[0]));
+    // If the assignee was (re)assigned, mirror it onto the linked contact so the
+    // new owner gets the contact + chat too.
+    const updated = rows[0];
+    if (b.assignedUserId !== undefined) {
+      await syncContactAssignment(updated.contact_wa_number, updated.contact_number, updated.assigned_user_id);
+    }
+    res.json(dealShape(updated));
   } catch (err) {
     console.error('[pipelines] update deal error:', err.message);
     res.status(500).json({ error: 'Failed to update deal' });
