@@ -327,6 +327,15 @@ router.post('/contacts/save', async (req, res) => {
     if (!waNumber || !contactNumber) {
       return res.status(400).json({ error: 'waNumber and contactNumber required' });
     }
+    if (name != null && String(name).length > 255) {
+      return res.status(400).json({ error: 'Name too long (max 255 characters)' });
+    }
+    if (tags != null && (!Array.isArray(tags) || tags.length > 50)) {
+      return res.status(400).json({ error: 'tags must be an array of at most 50 items' });
+    }
+    if (customFields != null && JSON.stringify(customFields).length > 10000) {
+      return res.status(400).json({ error: 'customFields payload too large' });
+    }
     const admin = isAdmin(req.user);
 
     // Sales users may only edit a contact already assigned to them.
@@ -833,6 +842,9 @@ router.post('/messages/send', async (req, res) => {
     const { fromNumber, toNumber, text, contextMessageId } = req.body || {};
     if (!fromNumber || !toNumber || !text || !String(text).trim()) {
       return res.status(400).json({ error: 'fromNumber, toNumber, text required' });
+    }
+    if (String(text).length > 4096) {
+      return res.status(400).json({ error: 'Message too long (max 4096 characters)' });
     }
     // Ownership: the (wa_number, contact_number) pair must belong to the
     // requester (admins bypass). This ties fromNumber to the user and gates

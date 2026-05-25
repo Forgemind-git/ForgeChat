@@ -294,6 +294,12 @@ router.post('/broadcasts', requirePermission('bulk-message'), async (req, res) =
     if (!from_number || !recipient_numbers) {
       return res.status(400).json({ error: 'from_number and recipient_numbers required' });
     }
+    if (!Array.isArray(recipient_numbers) || recipient_numbers.length === 0) {
+      return res.status(400).json({ error: 'recipient_numbers must be a non-empty array' });
+    }
+    if (recipient_numbers.length > 5000) {
+      return res.status(400).json({ error: 'Too many recipients (max 5000 per broadcast)' });
+    }
 
     const msgType = message_type || 'template';
     if (msgType === 'template' && !template_id) {
