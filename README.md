@@ -10,8 +10,7 @@
 <p align="center">
   <a href="#-what-is-forgechat">What is it?</a> •
   <a href="#-what-you-can-do">Features</a> •
-  <a href="#-run-it-on-your-computer-windows-or-mac">Run locally</a> •
-  <a href="#-deploy-it-yourself-step-by-step">Deploy to a server</a> •
+  <a href="#-deploy-it-yourself">Deploy</a> •
   <a href="#-connect-your-whatsapp">Connect WhatsApp</a> •
   <a href="#-everyday-use">Use it</a> •
   <a href="#-help--troubleshooting">Help</a>
@@ -89,11 +88,23 @@ It connects to the **official Meta WhatsApp Cloud API** (the real, approved What
 
 ---
 
-## 💻 Run it on your computer (Windows or Mac)
+## 🚀 Deploy it yourself
 
-No server or domain yet? Run ForgeChat on your own computer with **Docker Desktop**, and expose it to WhatsApp using a free **Cloudflare Tunnel** (no account needed). Perfect for testing, development, and demos — for real 24/7 use, follow the **[server deployment](#-deploy-it-yourself-step-by-step)** below.
+Three ways to run ForgeChat — pick one:
 
-> You'll log in locally at **<http://localhost>** with `admin@forgechat.local` / `Admin@123456`.
+| # | Install on | Best for | Guide |
+| --- | --- | --- | --- |
+| 1 | 🪟 **Windows** | Trying it on your own PC | [Windows setup ↓](#-windows) |
+| 2 | 🍎 **macOS** | Trying it on your own Mac | [macOS setup ↓](#-macos) |
+| 3 | 🖥️ **Server** | Real 24/7 use with your own domain | [Server setup ↓](#-deploy-on-a-server-production) |
+
+> **Windows** and **Mac** run on your own computer with Docker Desktop + a free Cloudflare Tunnel — great for testing and demos. The **Server** option is for real production use, online 24/7. Each option's steps below end with how to log in.
+
+> ⚡ **Prefer one command?** After you've installed Docker and downloaded ForgeChat (the "Install the tools" + "Download" steps below), you can skip the rest of the manual setup and run the installer instead — it generates secrets, builds everything, applies all migrations, and starts the app:
+> - 🍎 **macOS** / 🐧 **Linux server:** `bash install.sh`
+> - 🪟 **Windows** (PowerShell): `.\install.ps1`
+>
+> It's safe to re-run — it never overwrites an existing `backend/.env`.
 
 ### 🪟 Windows
 
@@ -271,9 +282,9 @@ It prints a public address like `https://some-random-words.trycloudflare.com`. T
 
 ---
 
-## 🚀 Deploy it yourself (step by step)
+## 🖥️ Deploy on a server (production)
 
-> 🌐 **This is the production path** — your own server and domain, online 24/7. Just want to try it first? Use the **[local option](#-run-it-on-your-computer-windows-or-mac)** above.
+> 🌐 **The production path** — your own server and domain, online 24/7. Just testing? Use the **[Windows or Mac](#-deploy-it-yourself)** setup above.
 >
 > 💡 **Prefer a click-by-click version with pictures?** Follow **[DEPLOY-DIGITALOCEAN.md](./DEPLOY-DIGITALOCEAN.md)** instead — it's the same process with more detail. The steps below are the short version.
 
@@ -493,139 +504,6 @@ crontab -e
 | **Is my data safe?** | Yes — everything lives on *your* server. WhatsApp tokens are encrypted, and access is protected by login. Just keep your backups (above). |
 
 Still stuck? Open an issue on [GitHub](https://github.com/Forgemind-git/ForgeChat/issues) and we'll help.
-
----
-
-## 👩‍💻 For developers
-
-<details>
-<summary><strong>Run it locally, tech stack, architecture, API, and project structure</strong> (click to expand)</summary>
-
-<br/>
-
-### Run locally for development
-
-You'll need **Node.js 20+**, **PostgreSQL 15**, and **Redis 7** running locally.
-
-```bash
-# Backend → http://localhost:3001
-cd backend
-cp .env.example .env          # fill DB url, Redis url, JWT secret, encryption key
-npm install
-# apply migrations from db/migrations/ to your local DB, then:
-npm run dev
-
-# Frontend → http://localhost:5173  (Vite proxies /api + /uploads to :3001)
-cd ../frontend
-npm install
-npm run dev
-```
-
-### Tech stack
-
-| Layer | Technology |
-| --- | --- |
-| Backend | Node.js 20 + Express 4 + `pg` (raw SQL, **no ORM**) |
-| Frontend | React 18 + Vite, inline styles (no Tailwind), `lucide-react` |
-| Database | PostgreSQL 15 (`coexistence` schema) |
-| Queues | BullMQ on Redis 7 (send + media-download workers) |
-| Auth | JWT in httpOnly cookies + bcryptjs |
-| Encryption | AES-256-GCM for stored Meta access tokens |
-| Media | ffmpeg (Ogg/Opus → MP3), ExcelJS (contact import) |
-| WhatsApp | Meta WhatsApp Business **Cloud API** (official) |
-| Reverse proxy | Caddy (auto-HTTPS) → nginx (SPA + `/api` `/uploads` `/l/` proxy) |
-| Tests | Vitest + Testing Library (unit), Playwright (E2E), `node --test` |
-
-### Architecture
-
-```
-                         Internet (HTTPS)
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │   Caddy (auto-TLS)    │  Let's Encrypt
-                    └──────────┬───────────┘
-                               ▼
-                    ┌──────────────────────┐
-                    │  Frontend (nginx)     │  React 18 + Vite SPA
-                    │  serves SPA + proxies │
-                    │  /api  /uploads  /l/  │
-                    └──────────┬───────────┘
-   Meta WhatsApp               ▼
-   Cloud API  ──webhook──►┌──────────────────────┐  BullMQ  ┌──────────────┐
-        ▲                 │  Backend (Express)    │ ───────► │  Redis 7     │
-        │  send/template  │  Node 20 + pg Pool    │ ◄─────── │  send/media  │
-        └─────────────────┤                       │          │  queues      │
-                          └──────────┬────────────┘          └──────────────┘
-                                     ▼
-                          ┌──────────────────────┐
-                          │  PostgreSQL 15        │
-                          │  schema: coexistence  │
-                          └──────────────────────┘
-```
-
-> **Single-WABA by design:** ForgeChat connects to exactly **one** WhatsApp Business Account, enforced in the UI, the API (`409` on a second account), and the DB (a unique index). Account health is tracked, with a topbar banner on `invalid_token`.
-
-### API (cookie auth, not API keys)
-
-```bash
-# Log in (saves the auth cookie)
-curl -X POST http://localhost:3001/api/auth/login \
-  -H "Content-Type: application/json" -c cookies.txt \
-  -d '{"email":"admin@forgemind.space","password":"YOUR_PASSWORD"}'
-
-# Use the cookie on protected endpoints
-curl http://localhost:3001/api/numbers  -b cookies.txt
-curl http://localhost:3001/api/contacts -b cookies.txt
-
-# Send a text (subject to Meta's 24h window → 409 OUTSIDE_WINDOW if expired)
-curl -X POST http://localhost:3001/api/messages/send \
-  -H "Content-Type: application/json" -b cookies.txt \
-  -d '{"fromNumber":"919342245724","toNumber":"15551234567","text":"Hello!"}'
-```
-
-Meta webhook: `GET /api/webhook/whatsapp` (verification) and `POST /api/webhook/whatsapp` (inbound, HMAC-verified with `META_APP_SECRET`).
-
-### Configuration
-
-All backend config is in `backend/.env` (copy from `backend/.env.example`). Key variables: `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, `FORGECRM_ENCRYPTION_KEY` (must differ from `JWT_SECRET`), `CORS_ORIGIN`, `ADMIN_EMAIL`/`ADMIN_PASSWORD`, and the `META_*` keys for live WhatsApp. In production the app refuses to boot with blank/placeholder/short secrets.
-
-### Project structure
-
-```
-ForgeChat/
-├── backend/                # Express API (3001 dev / 3011 docker)
-│   ├── src/
-│   │   ├── index.js        # bootstrap, middleware, routes, queue workers
-│   │   ├── auth.js         # JWT cookie auth + first-run admin seed
-│   │   ├── db.js           # pg Pool
-│   │   ├── engine/         # automation trigger engine
-│   │   ├── integrations/   # Meta send / media / templates
-│   │   ├── services/       # message sender, media downloader, account health
-│   │   ├── queue/          # BullMQ send + media workers
-│   │   ├── util/           # crypto, pgStorage, webhook signature
-│   │   └── routes/         # webhook, messages, templates, broadcasts,
-│   │                       #   chatbots, pipelines, mediaLibrary, users, …
-│   └── scripts/            # cron jobs + helpers
-├── frontend/               # React + Vite SPA (nginx in prod)
-│   └── src/{components,pages,api.js,App.jsx}
-├── db/migrations/          # numbered SQL files (000 → 048)
-├── docker-compose.sample.yml
-├── Caddyfile
-└── DEPLOY*.md / LLD.md     # deploy runbooks + low-level design
-```
-
-### Testing
-
-```bash
-cd backend  && npm test            # Node's built-in test runner
-cd frontend && npm run test:unit   # Vitest + Testing Library
-cd frontend && npm run test:e2e    # Playwright
-```
-
-CI runs tests/build/migrations, a dependency license check, secret scanning (gitleaks), and publishes Docker images to GHCR (`forge-chat-backend`, `forge-chat-frontend`) on release.
-
-</details>
 
 ---
 
