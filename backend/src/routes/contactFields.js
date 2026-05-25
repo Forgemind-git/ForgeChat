@@ -1,5 +1,6 @@
 const { Router } = require('express');
 const pool = require('../db');
+const { requirePermission } = require('../middleware/access');
 
 const router = Router();
 
@@ -33,7 +34,7 @@ router.get('/contact-fields', async (req, res) => {
 });
 
 // POST /api/contact-fields — create a field definition
-router.post('/contact-fields', async (req, res) => {
+router.post('/contact-fields', requirePermission('admin-settings:fields'), async (req, res) => {
   try {
     const { name, description, fieldType, sortOrder } = req.body || {};
     if (!name || !name.trim()) {
@@ -55,7 +56,7 @@ router.post('/contact-fields', async (req, res) => {
 });
 
 // PUT /api/contact-fields/:id — update a field definition
-router.put('/contact-fields/:id', async (req, res) => {
+router.put('/contact-fields/:id', requirePermission('admin-settings:fields'), async (req, res) => {
   try {
     const { name, description, fieldType, sortOrder } = req.body || {};
     if (name !== undefined && (!name || !name.trim())) {
@@ -87,7 +88,7 @@ router.put('/contact-fields/:id', async (req, res) => {
 });
 
 // DELETE /api/contact-fields/:id — remove a field definition
-router.delete('/contact-fields/:id', async (req, res) => {
+router.delete('/contact-fields/:id', requirePermission('admin-settings:fields'), async (req, res) => {
   try {
     const { rowCount } = await pool.query(
       `DELETE FROM coexistence.contact_field_definitions WHERE id = $1`,
