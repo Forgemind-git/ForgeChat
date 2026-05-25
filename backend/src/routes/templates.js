@@ -120,45 +120,50 @@ function buildPayload(data) {
 
 // GET /templates — list all
 router.get('/templates', async (req, res) => {
-  const { accountId, status, q } = req.query;
-  const where = [];
-  const params = [];
-  if (accountId === 'unassigned') {
-    where.push('t.whatsapp_account_id IS NULL');
-  } else if (accountId) {
-    params.push(accountId);
-    where.push(`t.whatsapp_account_id = $${params.length}`);
+  try {
+    const { accountId, status, q } = req.query;
+    const where = [];
+    const params = [];
+    if (accountId === 'unassigned') {
+      where.push('t.whatsapp_account_id IS NULL');
+    } else if (accountId) {
+      params.push(accountId);
+      where.push(`t.whatsapp_account_id = $${params.length}`);
+    }
+    if (status && status !== 'all') {
+      params.push(status);
+      where.push(`t.status = $${params.length}`);
+    }
+    if (q && String(q).trim()) {
+      params.push(`%${String(q).trim().toLowerCase()}%`);
+      where.push(`(lower(t.name) LIKE $${params.length} OR lower(t.body) LIKE $${params.length})`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const { rows } = await pool.query(
+      `SELECT t.id, t.name, t.category, t.language, t.header_type, t.header_text, t.body, t.footer,
+              t.buttons, t.samples, t.security_recommendation, t.code_expiry_minutes,
+              t.allow_category_change, t.status, t.meta_template_id, t.submitted_at,
+              t.quality_score, t.rejection_reason, t.previous_category, t.last_synced_at,
+              t.template_group_key,
+              t.created_at, t.updated_at,
+              t.whatsapp_account_id AS "whatsappAccountId",
+              wa.display_name AS "whatsappAccountName",
+              wa.display_phone_number AS "whatsappAccountPhone",
+              (SELECT COUNT(*) FROM coexistence.broadcasts WHERE template_id = t.id)::int AS "broadcastCount",
+              (SELECT COUNT(*) FROM coexistence.broadcast_logs bl
+                JOIN coexistence.broadcasts b ON b.id = bl.broadcast_id
+               WHERE b.template_id = t.id AND bl.action = 'BROADCAST')::int AS "sendCount"
+       FROM coexistence.message_templates t
+       LEFT JOIN coexistence.whatsapp_accounts wa ON wa.id = t.whatsapp_account_id
+       ${whereSql}
+       ORDER BY t.updated_at DESC`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('[templates] list error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch templates' });
   }
-  if (status && status !== 'all') {
-    params.push(status);
-    where.push(`t.status = $${params.length}`);
-  }
-  if (q && String(q).trim()) {
-    params.push(`%${String(q).trim().toLowerCase()}%`);
-    where.push(`(lower(t.name) LIKE $${params.length} OR lower(t.body) LIKE $${params.length})`);
-  }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const { rows } = await pool.query(
-    `SELECT t.id, t.name, t.category, t.language, t.header_type, t.header_text, t.body, t.footer,
-            t.buttons, t.samples, t.security_recommendation, t.code_expiry_minutes,
-            t.allow_category_change, t.status, t.meta_template_id, t.submitted_at,
-            t.quality_score, t.rejection_reason, t.previous_category, t.last_synced_at,
-            t.template_group_key,
-            t.created_at, t.updated_at,
-            t.whatsapp_account_id AS "whatsappAccountId",
-            wa.display_name AS "whatsappAccountName",
-            wa.display_phone_number AS "whatsappAccountPhone",
-            (SELECT COUNT(*) FROM coexistence.broadcasts WHERE template_id = t.id)::int AS "broadcastCount",
-            (SELECT COUNT(*) FROM coexistence.broadcast_logs bl
-              JOIN coexistence.broadcasts b ON b.id = bl.broadcast_id
-             WHERE b.template_id = t.id AND bl.action = 'BROADCAST')::int AS "sendCount"
-     FROM coexistence.message_templates t
-     LEFT JOIN coexistence.whatsapp_accounts wa ON wa.id = t.whatsapp_account_id
-     ${whereSql}
-     ORDER BY t.updated_at DESC`,
-    params
-  );
-  res.json(rows);
 });
 
 // GET /templates/:id — single template
@@ -677,15 +682,20 @@ async function submitOneInline(id) {
 
 // GET /templates/:id/payload — get Meta API payload
 router.get('/templates/:id/payload', async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT name, category, language, header_type, header_text, media_handle, body, footer,
-            buttons, samples, security_recommendation, code_expiry_minutes, allow_category_change
-     FROM coexistence.message_templates WHERE id = $1`,
-    [req.params.id]
-  );
-  if (rows.length === 0) return res.status(404).json({ error: 'Template not found' });
-  const payload = buildPayload(rows[0]);
-  res.json(payload);
+  try {
+    const { rows } = await pool.query(
+      `SELECT name, category, language, header_type, header_text, media_handle, body, footer,
+              buttons, samples, security_recommendation, code_expiry_minutes, allow_category_change
+       FROM coexistence.message_templates WHERE id = $1`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Template not found' });
+    const payload = buildPayload(rows[0]);
+    res.json(payload);
+  } catch (err) {
+    console.error('[templates] payload error:', err.message);
+    res.status(500).json({ error: 'Failed to load payload' });
+  }
 });
 
 /**
