@@ -124,51 +124,17 @@ It's safe to re-run — it never overwrites an existing `backend/.env`.
 cd $env:USERPROFILE\Desktop
 git clone https://github.com/Forgemind-git/ForgeChat.git forgechat
 cd forgechat
-copy docker-compose.sample.yml docker-compose.yml
 ```
 
-**3. Create your settings** — paste this whole block into PowerShell (it generates secure secrets):
+**3. Run the installer** — it generates secrets, builds everything, applies all migrations, and starts the app:
 
 ```powershell
-$PGPASS = -join ((48..57+65..90+97..122)|Get-Random -Count 32|%{[char]$_})
-$JWT    = -join ((48..57+65..90+97..122)|Get-Random -Count 64|%{[char]$_})
-$ENCKEY = -join ((48..57+65..90+97..122)|Get-Random -Count 64|%{[char]$_})
-$VERIFY = -join ((48..57+65..90+97..122)|Get-Random -Count 32|%{[char]$_})
-@"
-NODE_ENV=production
-PORT=3011
-POSTGRES_PASSWORD=$PGPASS
-DATABASE_URL=postgresql://postgres:$PGPASS@forgecrm-db:5432/postgres
-POSTGRES_SSL=false
-REDIS_URL=redis://redis:6379
-JWT_SECRET=$JWT
-FORGECRM_ENCRYPTION_KEY=$ENCKEY
-CORS_ORIGIN=http://localhost
-META_API_VERSION=v21.0
-META_WEBHOOK_VERIFY_TOKEN=$VERIFY
-MEDIA_DIR=/app/media
-ADMIN_EMAIL=admin@forgechat.local
-ADMIN_PASSWORD=Admin@123456
-"@ | Out-File -FilePath "backend\.env" -Encoding utf8
-Write-Host "SAVE THIS verify token (needed for WhatsApp): $VERIFY"
+.\install.ps1
 ```
 
-**4. Build, create the database tables, and start** — in PowerShell:
+When it finishes, open **<http://localhost>** and log in with the email/password it asked for (defaults: `admin@forgechat.local` / `Admin@123456`). **Save the webhook verify token** it prints — you'll need it below.
 
-```powershell
-docker compose build
-docker compose up -d forgecrm-db redis
-Start-Sleep -Seconds 10
-# apply every migration in order
-Get-ChildItem "db\migrations\*.sql" | Sort-Object Name | ForEach-Object {
-  Get-Content $_.FullName | docker exec -i forgecrm-db psql -U postgres -d postgres
-}
-docker compose up -d forgecrm-backend forgecrm-frontend
-```
-
-Open **<http://localhost>** and log in with `admin@forgechat.local` / `Admin@123456`.
-
-**5. Make it reachable by WhatsApp (Cloudflare Tunnel)** — Meta needs a public URL to deliver messages. Cloudflare Tunnel gives you a free temporary HTTPS URL with **no sign-up**:
+**4. Make it reachable by WhatsApp (Cloudflare Tunnel)** — Meta needs a public URL to deliver messages. Cloudflare Tunnel gives you a free temporary HTTPS URL with **no sign-up**:
 
 ```powershell
 # one-time: install cloudflared
@@ -208,69 +174,17 @@ It prints a public address like `https://some-random-words.trycloudflare.com`. T
 cd ~/Desktop
 git clone https://github.com/Forgemind-git/ForgeChat.git forgechat
 cd forgechat
-cp docker-compose.sample.yml docker-compose.yml
 ```
 
-**3. Create your settings** — paste this whole block into Terminal (it generates secure secrets):
+**3. Run the installer** — choose **local** when it asks; it generates secrets, builds everything, applies all migrations, and starts the app:
 
 ```bash
-PGPASS=$(openssl rand -hex 24)
-JWT=$(openssl rand -hex 32)
-ENCKEY=$(openssl rand -hex 32)
-VERIFY=$(openssl rand -hex 16)
-
-cat > backend/.env <<EOF
-NODE_ENV=production
-PORT=3011
-POSTGRES_PASSWORD=${PGPASS}
-DATABASE_URL=postgresql://postgres:${PGPASS}@forgecrm-db:5432/postgres
-POSTGRES_SSL=false
-REDIS_URL=redis://redis:6379
-JWT_SECRET=${JWT}
-FORGECRM_ENCRYPTION_KEY=${ENCKEY}
-CORS_ORIGIN=http://localhost
-META_API_VERSION=v21.0
-META_WEBHOOK_VERIFY_TOKEN=${VERIFY}
-MEDIA_DIR=/app/media
-ADMIN_EMAIL=admin@forgechat.local
-ADMIN_PASSWORD=Admin@123456
-EOF
-
-echo "SAVE THIS verify token (needed for WhatsApp): ${VERIFY}"
+bash install.sh
 ```
 
-**4. Build, create the database tables, and start** — in Terminal:
+When it finishes, open **<http://localhost>** and log in with the email/password it asked for (defaults: `admin@forgechat.local` / `Admin@123456`). **Save the webhook verify token** it prints — you'll need it below.
 
-```bash
-docker compose build
-docker compose up -d forgecrm-db redis
-until [ "$(docker inspect -f '{{.State.Health.Status}}' forgecrm-db)" = healthy ]; do
-  echo "waiting for database..."; sleep 2; done
-
-# create the schema + base table, then apply every migration in order
-docker compose exec -T forgecrm-db psql -U postgres -d postgres <<'SQL'
-CREATE SCHEMA IF NOT EXISTS coexistence;
-CREATE TABLE IF NOT EXISTS coexistence.forgecrm_users (
-  id BIGSERIAL PRIMARY KEY,
-  username TEXT NOT NULL UNIQUE,
-  email TEXT NOT NULL UNIQUE,
-  password TEXT NOT NULL,
-  display_name TEXT,
-  role TEXT NOT NULL DEFAULT 'viewer',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-SQL
-for f in $(ls db/migrations/*.sql | sort); do
-  docker compose exec -T forgecrm-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < "$f";
-done
-
-docker compose up -d forgecrm-backend forgecrm-frontend
-```
-
-Open **<http://localhost>** and log in with `admin@forgechat.local` / `Admin@123456`.
-
-**5. Make it reachable by WhatsApp (Cloudflare Tunnel)** — Meta needs a public URL to deliver messages. Cloudflare Tunnel gives you a free temporary HTTPS URL with **no sign-up**:
+**4. Make it reachable by WhatsApp (Cloudflare Tunnel)** — Meta needs a public URL to deliver messages. Cloudflare Tunnel gives you a free temporary HTTPS URL with **no sign-up**:
 
 ```bash
 # install cloudflared (needs Homebrew — https://brew.sh)
