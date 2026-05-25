@@ -94,19 +94,24 @@ Three ways to run ForgeChat — pick one:
 
 | # | Install on | Best for | Guide |
 | --- | --- | --- | --- |
-| 1 | 🪟 **Windows** | Trying it on your own PC | [Windows setup ↓](#-windows) |
-| 2 | 🍎 **macOS** | Trying it on your own Mac | [macOS setup ↓](#-macos) |
-| 3 | 🖥️ **Server** | Real 24/7 use with your own domain | [Server setup ↓](#-deploy-on-a-server-production) |
+| 1 | 🪟 **Windows** | Trying it on your own PC | [Open ↓](#install-on-windows) |
+| 2 | 🍎 **macOS** | Trying it on your own Mac | [Open ↓](#install-on-mac) |
+| 3 | 🖥️ **Server** | Real 24/7 use with your own domain | [Open ↓](#run-on-server) |
 
 > **Windows** and **Mac** run on your own computer with Docker Desktop + a free Cloudflare Tunnel — great for testing and demos. The **Server** option is for real production use, online 24/7. Each option's steps below end with how to log in.
 
-> ⚡ **Prefer one command?** After you've installed Docker and downloaded ForgeChat (the "Install the tools" + "Download" steps below), you can skip the rest of the manual setup and run the installer instead — it generates secrets, builds everything, applies all migrations, and starts the app:
-> - 🍎 **macOS** / 🐧 **Linux server:** `bash install.sh`
-> - 🪟 **Windows** (PowerShell): `.\install.ps1`
->
-> It's safe to re-run — it never overwrites an existing `backend/.env`.
+⚡ **Prefer one command?** After you've installed Docker and downloaded ForgeChat (the "Install the tools" + "Download" steps inside your platform below), you can skip the rest of the manual setup and run the installer instead — it generates secrets, builds everything, applies all migrations, and starts the app:
 
-### 🪟 Windows
+- 🍎 **macOS** / 🐧 **Linux server:** `bash install.sh`
+- 🪟 **Windows** (PowerShell): `.\install.ps1`
+
+It's safe to re-run — it never overwrites an existing `backend/.env`.
+
+<a id="install-on-windows"></a>
+<details>
+<summary><strong>🪟 Install on Windows</strong></summary>
+
+<br/>
 
 **1. Install the tools**
 
@@ -184,7 +189,13 @@ It prints a public address like `https://some-random-words.trycloudflare.com`. T
 
 > ℹ️ The quick-tunnel URL changes each time you restart cloudflared — update `CORS_ORIGIN` and the Meta webhook URL whenever it does, and don't close the cloudflared window while testing.
 
-### 🍎 macOS
+</details>
+
+<a id="install-on-mac"></a>
+<details>
+<summary><strong>🍎 Install on Mac</strong></summary>
+
+<br/>
 
 **1. Install the tools**
 
@@ -280,11 +291,15 @@ It prints a public address like `https://some-random-words.trycloudflare.com`. T
 
 > ℹ️ The quick-tunnel URL changes each time you restart cloudflared — update `CORS_ORIGIN` and the Meta webhook URL whenever it does, and keep the cloudflared window open while testing.
 
----
+</details>
 
-## 🖥️ Deploy on a server (production)
+<a id="run-on-server"></a>
+<details>
+<summary><strong>🖥️ Run on a server (production, 24/7)</strong></summary>
 
-> 🌐 **The production path** — your own server and domain, online 24/7. Just testing? Use the **[Windows or Mac](#-deploy-it-yourself)** setup above.
+<br/>
+
+> 🌐 **The production path** — your own server and domain, online 24/7, with automatic HTTPS.
 >
 > 💡 **Prefer a click-by-click version with pictures?** Follow **[DEPLOY-DIGITALOCEAN.md](./DEPLOY-DIGITALOCEAN.md)** instead — it's the same process with more detail. The steps below are the short version.
 
@@ -431,6 +446,8 @@ docker compose up -d forgecrm-backend forgecrm-frontend caddy
 In your browser, go to **`https://chat.yourbusiness.com`** and log in with the email and password you set in Step 6.
 
 > The first time you visit, the secure padlock (HTTPS) is set up automatically. If you see a certificate warning, wait a minute and refresh — your domain's DNS may still be updating.
+
+</details>
 
 ---
 
