@@ -31,7 +31,7 @@ Meta WhatsApp Cloud API.
   audio, document), per-recipient send queue, live status rollup, Media Library
   integration, and per-broadcast variable mapping.
 - **Automation builder** — visual flow editor with 33 block types, drag-to-
-  connect handles, AI Agent resource picker, and a synchronous trigger engine
+  connect handles and a synchronous trigger engine
   (keyword / anyMessage / newContact / messageRead / messageDelivered /
   messageSent).
 - **Multi-WABA** — `whatsapp_accounts` with AES-256-GCM encrypted access tokens
