@@ -1,5 +1,6 @@
 const { Router } = require('express');
 const pool = require('../db');
+const { requirePermission } = require('../middleware/access');
 
 const router = Router();
 
@@ -26,7 +27,7 @@ router.get('/categories', async (req, res) => {
 });
 
 // POST /api/categories
-router.post('/categories', async (req, res) => {
+router.post('/categories', requirePermission('admin-settings:category'), async (req, res) => {
   try {
     const { name, description } = req.body;
     if (!name || !name.trim()) {
@@ -47,7 +48,7 @@ router.post('/categories', async (req, res) => {
 });
 
 // PUT /api/categories/:id
-router.put('/categories/:id', async (req, res) => {
+router.put('/categories/:id', requirePermission('admin-settings:category'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, description } = req.body;
@@ -70,7 +71,7 @@ router.put('/categories/:id', async (req, res) => {
 });
 
 // DELETE /api/categories/:id
-router.delete('/categories/:id', async (req, res) => {
+router.delete('/categories/:id', requirePermission('admin-settings:category'), async (req, res) => {
   try {
     const { id } = req.params;
     const { rowCount } = await pool.query(
@@ -107,7 +108,7 @@ router.get('/tags', async (req, res) => {
 });
 
 // POST /api/tags
-router.post('/tags', async (req, res) => {
+router.post('/tags', requirePermission('admin-settings:tags'), async (req, res) => {
   try {
     const { name, color, categoryId } = req.body;
     if (!name || !name.trim()) {
@@ -131,7 +132,7 @@ router.post('/tags', async (req, res) => {
 });
 
 // PUT /api/tags/:id
-router.put('/tags/:id', async (req, res) => {
+router.put('/tags/:id', requirePermission('admin-settings:tags'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, color, categoryId } = req.body;
@@ -154,7 +155,7 @@ router.put('/tags/:id', async (req, res) => {
 });
 
 // DELETE /api/tags/:id
-router.delete('/tags/:id', async (req, res) => {
+router.delete('/tags/:id', requirePermission('admin-settings:tags'), async (req, res) => {
   try {
     const { id } = req.params;
     const { rowCount } = await pool.query(

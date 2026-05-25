@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
+const { requirePermission } = require('../middleware/access');
 
 /**
  * Automations are linear keyword→message flows: one Keyword Trigger followed by
@@ -75,7 +76,7 @@ router.get('/chatbots/:id', async (req, res) => {
 });
 
 // POST /chatbots — create
-router.post('/chatbots', async (req, res) => {
+router.post('/chatbots', requirePermission('chatbot-builder'), async (req, res) => {
   const { name, description, status, trigger_type, config } = req.body;
   if (!name || !name.trim()) {
     return res.status(400).json({ error: 'Name is required' });
@@ -90,7 +91,7 @@ router.post('/chatbots', async (req, res) => {
 });
 
 // PUT /chatbots/:id — update
-router.put('/chatbots/:id', async (req, res) => {
+router.put('/chatbots/:id', requirePermission('chatbot-builder'), async (req, res) => {
   const { name, description, status, trigger_type, config } = req.body;
   if (name !== undefined && !name.trim()) {
     return res.status(400).json({ error: 'Name is required' });
@@ -113,7 +114,7 @@ router.put('/chatbots/:id', async (req, res) => {
 
 // POST /chatbots/:id/duplicate — clone an automation. The copy is always
 // created DISABLED ('inactive') so it can't fire until reviewed/enabled.
-router.post('/chatbots/:id/duplicate', async (req, res) => {
+router.post('/chatbots/:id/duplicate', requirePermission('chatbot-builder'), async (req, res) => {
   const { rows: src } = await pool.query(
     'SELECT name, description, trigger_type, config FROM coexistence.chatbots WHERE id = $1',
     [req.params.id]
@@ -130,7 +131,7 @@ router.post('/chatbots/:id/duplicate', async (req, res) => {
 });
 
 // DELETE /chatbots/:id
-router.delete('/chatbots/:id', async (req, res) => {
+router.delete('/chatbots/:id', requirePermission('chatbot-builder'), async (req, res) => {
   const { rowCount } = await pool.query(
     'DELETE FROM coexistence.chatbots WHERE id = $1', [req.params.id]
   );
@@ -249,7 +250,7 @@ router.get('/executions/:id', async (req, res) => {
 // POST /executions/:id/cancel — stop a non-terminal execution. A cancelled
 // 'paused' execution will no longer resume when the customer replies (the
 // webhook resume only claims rows WHERE status='paused').
-router.post('/executions/:id/cancel', async (req, res) => {
+router.post('/executions/:id/cancel', requirePermission('chatbot-builder'), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE coexistence.automation_executions

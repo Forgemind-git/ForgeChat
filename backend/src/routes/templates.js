@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
+const { requirePermission } = require('../middleware/access');
 const { canonicalizeMime, isTemplateHeaderMime, TEMPLATE_TYPES_MSG } = require('../util/metaMime');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -191,7 +192,7 @@ router.get('/templates/:id', async (req, res) => {
 });
 
 // POST /templates — create
-router.post('/templates', async (req, res) => {
+router.post('/templates', requirePermission('template-builder'), async (req, res) => {
   const data = req.body;
   const errors = runValidation(data);
   if (Object.keys(errors).length > 0) {
@@ -242,7 +243,7 @@ router.post('/templates', async (req, res) => {
 //   APPROVED / PAUSED → calls Meta edit API, status flips to SUBMITTED for re-review
 //   SUBMITTED         → 409 (already under review; wait for outcome)
 //   DISABLED          → 409 (must duplicate + recreate per Meta policy)
-router.put('/templates/:id', async (req, res) => {
+router.put('/templates/:id', requirePermission('template-builder'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { rows: existing } = await client.query(
@@ -354,7 +355,7 @@ router.put('/templates/:id', async (req, res) => {
 });
 
 // DELETE /templates/:id — removes from local DB AND from Meta if it was submitted
-router.delete('/templates/:id', async (req, res) => {
+router.delete('/templates/:id', requirePermission('template-builder'), async (req, res) => {
   try {
     const { rows: tplRows } = await pool.query(
       'SELECT * FROM coexistence.message_templates WHERE id = $1', [req.params.id]
@@ -397,7 +398,7 @@ const { submitTemplate } = require('../integrations/metaTemplates');
 const { getAccountWithToken } = require('./whatsappAccounts');
 const { markAccountHealth } = require('../services/accountHealth');
 
-router.post('/templates/:id/submit', async (req, res) => {
+router.post('/templates/:id/submit', requirePermission('template-builder'), async (req, res) => {
   try {
     const { rows: tplRows } = await pool.query(
       'SELECT * FROM coexistence.message_templates WHERE id = $1',
@@ -510,7 +511,7 @@ async function syncAccountTemplates(account) {
  * Looks up the linked account, lists Meta's templates, finds the match by
  * (name, language), updates local row.
  */
-router.post('/templates/:id/sync', async (req, res) => {
+router.post('/templates/:id/sync', requirePermission('template-builder'), async (req, res) => {
   try {
     const { rows: tplRows } = await pool.query(
       'SELECT * FROM coexistence.message_templates WHERE id = $1', [req.params.id]
@@ -569,7 +570,7 @@ async function syncAllAccountTemplates() {
  * POST /templates/sync-all — sync every account's templates. Used by the
  * "Refresh All" button in the list view + the periodic auto-sync cron.
  */
-router.post('/templates/sync-all', async (req, res) => {
+router.post('/templates/sync-all', requirePermission('template-builder'), async (req, res) => {
   try {
     const result = await syncAllAccountTemplates();
     res.json({ ok: true, ...result });
@@ -582,7 +583,7 @@ router.post('/templates/sync-all', async (req, res) => {
 /**
  * POST /templates/:id/duplicate — create a DRAFT clone with " (copy)" name suffix.
  */
-router.post('/templates/:id/duplicate', async (req, res) => {
+router.post('/templates/:id/duplicate', requirePermission('template-builder'), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `INSERT INTO coexistence.message_templates
@@ -609,7 +610,7 @@ router.post('/templates/:id/duplicate', async (req, res) => {
  * POST /templates/bulk-submit — submit multiple DRAFT templates in one call.
  * Body: { ids: [1, 2, 3] }. Returns per-id outcome.
  */
-router.post('/templates/bulk-submit', async (req, res) => {
+router.post('/templates/bulk-submit', requirePermission('template-builder'), async (req, res) => {
   try {
     const { ids } = req.body || {};
     if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'ids required' });
@@ -695,7 +696,7 @@ router.get('/templates/:id/payload', async (req, res) => {
 const { resolveAccount, insertPendingRow } = require('../services/messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
 
-router.post('/templates/:id/test-send', async (req, res) => {
+router.post('/templates/:id/test-send', requirePermission('template-builder'), async (req, res) => {
   try {
     const { to, sampleValues = {} } = req.body || {};
     if (!to) return res.status(400).json({ error: 'to (recipient phone) required' });
@@ -745,7 +746,7 @@ const multer = require('multer');
 const { uploadTemplateMediaHandle } = require('../integrations/metaResumableUpload');
 const tplMediaUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-router.post('/templates/upload-media-handle', tplMediaUpload.single('file'), async (req, res) => {
+router.post('/templates/upload-media-handle', requirePermission('template-builder'), tplMediaUpload.single('file'), async (req, res) => {
   try {
     const { accountId } = req.body || {};
     if (!accountId) return res.status(400).json({ error: 'accountId required' });
@@ -797,7 +798,7 @@ router.post('/templates/upload-media-handle', tplMediaUpload.single('file'), asy
  * persist anything per-WABA for templates — this is purely a convenience
  * that lets users build templates from previously uploaded library assets.
  */
-router.post('/templates/upload-media-handle-from-library', async (req, res) => {
+router.post('/templates/upload-media-handle-from-library', requirePermission('template-builder'), async (req, res) => {
   try {
     const { accountId, mediaLibraryId } = req.body || {};
     if (!accountId || !mediaLibraryId) {

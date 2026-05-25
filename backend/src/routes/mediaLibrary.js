@@ -10,6 +10,7 @@ const storage = require('../util/pgStorage');
 const { uploadMedia: metaUploadMedia } = require('../integrations/metaSend');
 const { getAccountWithToken } = require('./whatsappAccounts');
 const { canonicalizeMime, isChatSendable, CHAT_TYPES_MSG } = require('../util/metaMime');
+const { requirePermission } = require('../middleware/access');
 
 const router = Router();
 
@@ -118,7 +119,7 @@ router.get('/media-library', async (req, res) => {
 });
 
 // POST /api/media-library  (multipart, field "file")
-router.post('/media-library', upload.single('file'), async (req, res) => {
+router.post('/media-library', requirePermission('media-library'), upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const { originalname, mimetype, size, buffer } = req.file;
@@ -170,7 +171,7 @@ router.post('/media-library', upload.single('file'), async (req, res) => {
 });
 
 // PUT /api/media-library/:id  — auto_resync, name, and notes are editable
-router.put('/media-library/:id', async (req, res) => {
+router.put('/media-library/:id', requirePermission('media-library'), async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const { autoResync, name, notes } = req.body || {};
@@ -196,7 +197,7 @@ router.put('/media-library/:id', async (req, res) => {
 });
 
 // DELETE /api/media-library/:id  (soft-delete + remove stored object)
-router.delete('/media-library/:id', async (req, res) => {
+router.delete('/media-library/:id', requirePermission('media-library'), async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const { rows } = await pool.query(
@@ -292,7 +293,7 @@ async function syncMediaToAccount(mediaId, accountId) {
   }
 }
 
-router.post('/media-library/:id/sync/:accountId', async (req, res) => {
+router.post('/media-library/:id/sync/:accountId', requirePermission('media-library'), async (req, res) => {
   try {
     const sync = await syncMediaToAccount(
       parseInt(req.params.id, 10),

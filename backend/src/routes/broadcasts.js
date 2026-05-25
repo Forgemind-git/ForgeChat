@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
+const { requirePermission } = require('../middleware/access');
 const { resolveAccount, insertPendingRow } = require('../services/messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
 
@@ -283,7 +284,7 @@ router.get('/broadcasts/:id', async (req, res) => {
 });
 
 // POST /broadcasts — create broadcast + optional log entry
-router.post('/broadcasts', async (req, res) => {
+router.post('/broadcasts', requirePermission('bulk-message'), async (req, res) => {
   try {
     const {
       from_number, recipient_numbers, template_id, status, test_number,
@@ -349,7 +350,7 @@ router.post('/broadcasts', async (req, res) => {
 });
 
 // PUT /broadcasts/:id — update (only if DRAFT)
-router.put('/broadcasts/:id', async (req, res) => {
+router.put('/broadcasts/:id', requirePermission('bulk-message'), async (req, res) => {
   try {
     const { rows: existing } = await pool.query(
       'SELECT status FROM coexistence.broadcasts WHERE id = $1', [req.params.id]
@@ -403,7 +404,7 @@ router.put('/broadcasts/:id', async (req, res) => {
 });
 
 // DELETE /broadcasts/:id
-router.delete('/broadcasts/:id', async (req, res) => {
+router.delete('/broadcasts/:id', requirePermission('bulk-message'), async (req, res) => {
   try {
     const { rowCount } = await pool.query(
       'DELETE FROM coexistence.broadcasts WHERE id = $1', [req.params.id]
@@ -417,7 +418,7 @@ router.delete('/broadcasts/:id', async (req, res) => {
 });
 
 // POST /broadcasts/:id/send — real Meta send, one job per recipient via BullMQ
-router.post('/broadcasts/:id/send', async (req, res) => {
+router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (req, res) => {
   try {
     const { rows: bRows } = await pool.query(
       `SELECT b.*, t.id AS t_id, t.name AS t_name, t.language AS t_language, t.body AS t_body,
@@ -513,7 +514,7 @@ router.post('/broadcasts/:id/send', async (req, res) => {
 });
 
 // POST /broadcasts/:id/test — real Meta send to a single test number
-router.post('/broadcasts/:id/test', async (req, res) => {
+router.post('/broadcasts/:id/test', requirePermission('bulk-message'), async (req, res) => {
   try {
     const { test_number } = req.body;
     if (!test_number) return res.status(400).json({ error: 'test_number required' });
