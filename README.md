@@ -374,7 +374,14 @@ To send and receive real messages, link your Meta WhatsApp Business account (one
 3. In the **Meta dashboard** (WhatsApp → Configuration), set up the webhook so Meta sends incoming messages to ForgeChat:
    - **Callback URL:** `https://chat.yourbusiness.com/api/webhook/whatsapp`
    - **Verify token:** the verify token you saved in Step 6
-   - **Subscribe to:** `messages`
+   - **Subscribe to these webhook fields** (under *WhatsApp Business Account*):
+     - `messages` — incoming messages + delivery/read statuses *(required)*
+     - `message_template_status_update` — template approved / rejected / paused by Meta
+     - `message_template_quality_update` — template quality rating changes (GREEN / YELLOW / RED)
+     - `message_template_components_update` — edits to an approved template's content
+     - `template_category_update` — Meta re-categorises a template
+     - `template_correct_category_detection` — Meta's suggested correct category
+     - `smb_message_echoes` — copies of messages your team sends from the WhatsApp app, so they also appear in ForgeChat (coexistence)
 
 That's it — incoming WhatsApp messages will now appear in your inbox.
 
