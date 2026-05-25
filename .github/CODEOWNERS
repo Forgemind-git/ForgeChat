@@ -1,0 +1,7 @@
+# Code owners — GitHub requests review from these owners on matching changes.
+#
+# CI/CD and automation config is security-sensitive (workflow permissions,
+# pinned action SHAs, secret scanning). Require the repo owner's review on any
+# change under .github/ so a privilege-escalating workflow edit can't merge
+# unreviewed. Enforce via a branch-protection rule requiring CODEOWNERS review.
+/.github/ @KingArthur000
