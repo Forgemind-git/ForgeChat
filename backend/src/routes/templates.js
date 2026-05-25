@@ -619,6 +619,7 @@ router.post('/templates/bulk-submit', requirePermission('template-builder'), asy
   try {
     const { ids } = req.body || {};
     if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'ids required' });
+    if (ids.length > 50) return res.status(400).json({ error: 'Too many templates (max 50 per bulk submit)' });
     const results = [];
     for (const id of ids) {
       try {
