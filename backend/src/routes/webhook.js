@@ -397,7 +397,10 @@ router.get('/webhook/whatsapp', async (req, res) => {
 
   if (accepted) {
     console.log('[webhook] Meta verification accepted');
-    return res.status(200).send(challenge);
+    // Echo the challenge as plain text (Meta sends a numeric token). Sending it
+    // as text/plain — not the res.send default of text/html — prevents the
+    // reflected value from being interpreted as HTML (reflected-XSS).
+    return res.status(200).type('text/plain').send(String(challenge ?? ''));
   }
   res.status(403).json({ error: 'Verification failed' });
 });
