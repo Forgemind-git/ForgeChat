@@ -117,23 +117,46 @@ function signToken(user) {
   );
 }
 
-function authMiddleware(req, res, next) {
+async function authMiddleware(req, res, next) {
   const token = req.cookies?.[COOKIE_NAME];
   if (!token) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
+  let payload;
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    // Legacy tokens (issued by the single-user build) carry no role. Force a
-    // clean re-login so every session has a role for permission checks.
-    if (!payload.role) {
-      res.clearCookie(COOKIE_NAME);
-      return res.status(401).json({ error: 'Session expired, please sign in again' });
-    }
-    req.user = payload;
-    next();
+    payload = jwt.verify(token, JWT_SECRET);
   } catch {
-    res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+  // Legacy tokens (issued by the single-user build) carry no role. Force a
+  // clean re-login so every session has a role for permission checks.
+  if (!payload.role) {
+    res.clearCookie(COOKIE_NAME);
+    return res.status(401).json({ error: 'Session expired, please sign in again' });
+  }
+  try {
+    // Re-check the live account on every request so a deactivated or demoted
+    // user loses access immediately, instead of keeping their old privileges
+    // until the 24h token expires. The fresh role also overrides any stale role
+    // embedded in the JWT (an admin who demotes a user takes effect at once).
+    const { rows } = await pool.query(
+      'SELECT role, is_active FROM coexistence.forgecrm_users WHERE id = $1',
+      [payload.id]
+    );
+    const u = rows[0];
+    if (!u) {
+      res.clearCookie(COOKIE_NAME);
+      return res.status(401).json({ error: 'User not found' });
+    }
+    if (u.is_active === false) {
+      res.clearCookie(COOKIE_NAME);
+      return res.status(403).json({ error: 'Account disabled' });
+    }
+    req.user = { ...payload, role: u.role };
+    next();
+  } catch (err) {
+    console.error('[auth] authMiddleware account check failed:', err.message);
+    res.status(500).json({ error: 'Authentication check failed' });
   }
 }
 
