@@ -994,7 +994,7 @@ router.post('/messages/send-audio', mediaUpload.single('file'), async (req, res)
       audioMime = transcoded.mime;
       audioExt = transcoded.ext;
     } catch (err) {
-      return res.status(400).json({ error: `Audio transcode failed: ${err.message}` });
+      return res.status(400).json({ error: 'Audio processing failed. Please try a different recording.' });
     }
 
     // Upload to Meta
@@ -1107,7 +1107,7 @@ router.post('/messages/send-library-media', async (req, res) => {
           status: sync.status,
         };
       } catch (err) {
-        return res.status(502).json({ error: `Auto-sync to Meta failed: ${err.message}` });
+        return res.status(502).json({ error: 'Auto-sync to Meta failed' });
       }
     }
 
@@ -1120,7 +1120,7 @@ router.post('/messages/send-library-media', async (req, res) => {
     try {
       buf = await storage.getObjectBuffer(media.storage_key);
     } catch (err) {
-      return res.status(502).json({ error: `Failed to read media from storage: ${err.message}` });
+      return res.status(502).json({ error: 'Failed to read media from storage' });
     }
 
     const ctxId = sanitizeContextId(contextMessageId);

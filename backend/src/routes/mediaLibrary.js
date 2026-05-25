@@ -166,7 +166,7 @@ router.post('/media-library', requirePermission('media-library'), upload.single(
     res.json({ media: rowToMedia(rows[0]) });
   } catch (err) {
     console.error('[media-library] upload error:', err);
-    res.status(500).json({ error: err.message || 'Failed to upload media' });
+    res.status(500).json({ error: 'Failed to upload media' });
   }
 });
 
@@ -302,7 +302,7 @@ router.post('/media-library/:id/sync/:accountId', requirePermission('media-libra
     res.json({ sync });
   } catch (err) {
     console.error('[media-library] sync error:', err.message);
-    res.status(500).json({ error: err.message || 'Sync failed' });
+    res.status(500).json({ error: 'Sync failed' });
   }
 });
 

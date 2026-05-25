@@ -309,7 +309,7 @@ router.put('/templates/:id', requirePermission('template-builder'), async (req, 
         const isAuth = err.status === 401 || err.metaError?.code === 190;
         await markAccountHealth(account.id, isAuth ? 'invalid_token' : 'unknown_error', err.message).catch(() => {});
         return res.status(err.status === 401 ? 401 : 400).json({
-          error: err.metaError?.message || err.message || 'Meta edit failed',
+          error: err.metaError?.message || 'Meta API error',
           metaCode: err.metaError?.code,
           metaErrorSubcode: err.metaError?.error_subcode,
           metaErrorData: err.metaError?.error_data,

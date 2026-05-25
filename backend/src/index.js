@@ -120,7 +120,9 @@ app.use('/api', authMiddleware, pipelinesRouter);
 
 // Error handler
 app.use((err, req, res, next) => {
-  console.error('[Error]', err.message);
+  // Full error (with stack) in dev for debugging; message-only in production.
+  if (process.env.NODE_ENV !== 'production') console.error('[Error]', err);
+  else console.error('[Error]', err.message);
   res.status(500).json({ error: 'Internal server error' });
 });
 
