@@ -239,7 +239,7 @@ export function BroadcastMessagePreview({ messageType, body, url, mediaLibraryId
           )}
           {messageType === 'link' && (
             <div style={{ fontSize: 13.5, lineHeight: 1.55, fontFamily: FONT }}>
-              <a href={url || '#'} target="_blank" rel="noreferrer" style={{ color: '#027EB5', textDecoration: 'underline', wordBreak: 'break-all' }} onClick={e => e.preventDefault()}>
+              <a href={/^https?:\/\//i.test(String(url || '')) ? url : '#'} target="_blank" rel="noreferrer" style={{ color: '#027EB5', textDecoration: 'underline', wordBreak: 'break-all' }} onClick={e => e.preventDefault()}>
                 {url || 'https://example.com'}
               </a>
             </div>
