@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.1-blue.svg" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-1.0.0-blue.svg" alt="Version"/>
   <img src="https://img.shields.io/badge/license-Sustainable%20Use-green.svg" alt="License"/>
   <img src="https://img.shields.io/badge/fair--code-%E2%9C%93-brightgreen.svg" alt="fair-code"/>
   <img src="https://img.shields.io/badge/setup-no%20coding%20needed-success.svg" alt="No coding needed"/>
