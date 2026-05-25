@@ -667,7 +667,9 @@ router.get('/messages', async (req, res) => {
 
     res.json({
       messages: rows
-        .map(m => ({ ...m, reactions: reactionsByMsg[m.message_id] || [] }))
+        // Strip raw_payload (the full Meta webhook JSON) — it's internal-only,
+        // never read by the client, and can carry extra PII / metadata.
+        .map(({ raw_payload, ...m }) => ({ ...m, reactions: reactionsByMsg[m.message_id] || [] }))
         .reverse(), // oldest first for chat display
       total,
       page: pageNum,
