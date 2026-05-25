@@ -4,8 +4,8 @@
 # to GitHub's free container registry (GHCR), tagged by the release version.
 # Self-hosters then pull pre-built, versioned images instead of building from
 # source:
-#   ghcr.io/forgemind-git/forge-chat-backend:<version>
-#   ghcr.io/forgemind-git/forge-chat-frontend:<version>
+#   ghcr.io/forgemind-git/forgechat-backend:<version>
+#   ghcr.io/forgemind-git/forgechat-frontend:<version>
 #
 # ForgeChat ships two images (Express API + nginx-served React build), so this
 # builds both via a matrix. The image name is lowercased by metadata-action.

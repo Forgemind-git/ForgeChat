@@ -44,7 +44,7 @@ Meta WhatsApp Cloud API.
   concurrency-2 media-download queue.
 - **CI/CD pipelines** — test/build/migrations gatekeeper, dependency **license
   check**, full-history **secret scanning** (gitleaks), and **Docker image
-  publishing** to GHCR on release (`forge-chat-backend`, `forge-chat-frontend`).
+  publishing** to GHCR on release (`forgechat-backend`, `forgechat-frontend`).
 - **Project governance & docs** — `LICENSE.md` (Sustainable Use License),
   `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `TRADEMARK.md`,
   `AUTHORS.md`, `VERSIONING.md`, and GitHub issue/PR templates.
