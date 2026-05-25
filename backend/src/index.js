@@ -64,7 +64,9 @@ app.use(cors({
 }));
 
 app.use(cookieParser());
-app.use(express.json({ limit: '1mb' }));
+// Capture the raw request body so the webhook route can verify Meta's
+// X-Hub-Signature-256 HMAC over the exact bytes Meta signed.
+app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // Serve uploaded files statically
 app.use('/uploads', express.static(UPLOAD_DIR));
