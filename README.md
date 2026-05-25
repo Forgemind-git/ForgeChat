@@ -110,7 +110,7 @@ You'll be copy-pasting commands into your server. **You won't write any code.**
 Create a server (also called a "VPS" or "droplet") at a provider like **[DigitalOcean](https://www.digitalocean.com/)**, Hetzner, or any cloud host.
 
 - **Operating system:** Ubuntu 24.04 (LTS)
-- **Size:** at least **2 GB of RAM** (smaller works but may struggle during setup)
+- **Size:** **4 GB of RAM** recommended (2 GB works, but building the frontend is memory-hungry and can run out)
 
 When it's ready, copy the server's **public IP address** (it looks like `203.0.113.10`).
 
@@ -132,10 +132,19 @@ Open a terminal on your computer and connect to your server (replace with your I
 ssh root@YOUR_SERVER_IP
 ```
 
+Open the firewall so visitors can reach the app over the web (SSH, HTTP, HTTPS):
+
+```bash
+ufw allow OpenSSH && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
+```
+
 Then install **Docker** (the software that runs ForgeChat) by pasting this:
 
 ```bash
 curl -fsSL https://get.docker.com | sh
+
+# (optional) run Docker without typing "sudo" every time
+usermod -aG docker $USER && newgrp docker
 ```
 
 ### Step 4 — Download ForgeChat
@@ -231,7 +240,7 @@ In your browser, go to **`https://chat.yourbusiness.com`** and log in with the e
 
 ## 🖥️ Run on your own PC instead (Windows — for testing)
 
-No server or domain yet? You can run ForgeChat on a **Windows PC** with Docker Desktop and expose it to WhatsApp using a free **ngrok** tunnel. Great for testing, development, and demos — for real 24/7 use, follow the server steps above.
+No server or domain yet? You can run ForgeChat on a **Windows PC** with Docker Desktop and expose it to WhatsApp using a free **Cloudflare Tunnel** (no account needed, and no antivirus headaches). Great for testing, development, and demos — for real 24/7 use, follow the server steps above.
 
 **1. Install the tools**
 
@@ -288,21 +297,26 @@ docker compose up -d forgecrm-backend forgecrm-frontend
 
 Open **<http://localhost>** and log in with `admin@forgechat.local` / `Admin@123456`.
 
-**5. Make it reachable by WhatsApp (ngrok)** — Meta needs a public URL to deliver messages:
+**5. Make it reachable by WhatsApp (Cloudflare Tunnel)** — Meta needs a public URL to deliver messages. Cloudflare Tunnel gives you a free temporary HTTPS URL with **no sign-up**:
 
 ```powershell
-# one-time: sign up at https://ngrok.com, then add your token
-.\ngrok.exe config add-authtoken YOUR_AUTHTOKEN
-# start the tunnel — keep this window open
-.\ngrok.exe http 80
+# one-time: install cloudflared
+winget install --id Cloudflare.cloudflared
+
+# open a NEW PowerShell window and start the tunnel — keep this window open
+& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --url http://localhost:80
 ```
 
-Copy the `https://….ngrok-free.app` address it prints, then:
+It prints a public address like `https://some-random-words.trycloudflare.com`. Then, in another PowerShell window:
 
-1. In `backend\.env`, set `CORS_ORIGIN=https://….ngrok-free.app` and run `docker compose restart forgecrm-backend`.
-2. Follow **[Connect your WhatsApp](#-connect-your-whatsapp)** below, but use the ngrok address as the **Callback URL** (`https://….ngrok-free.app/api/webhook/whatsapp`) with the verify token from step 3.
+1. Point ForgeChat at that address (use your real URL) and restart the backend:
+   ```powershell
+   (Get-Content backend\.env) -replace 'CORS_ORIGIN=.*', 'CORS_ORIGIN=https://some-random-words.trycloudflare.com' | Set-Content backend\.env
+   docker compose restart forgecrm-backend
+   ```
+2. Follow **[Connect your WhatsApp](#-connect-your-whatsapp)** below, but use the Cloudflare address as the **Callback URL** (`https://some-random-words.trycloudflare.com/api/webhook/whatsapp`) with the verify token from step 3.
 
-> ℹ️ On ngrok's free plan the URL changes each restart — update `CORS_ORIGIN` and the Meta webhook URL whenever it does.
+> ℹ️ The quick-tunnel URL changes each time you restart cloudflared — update `CORS_ORIGIN` and the Meta webhook URL whenever it does, and don't close the cloudflared window while testing.
 
 ---
 
@@ -318,6 +332,8 @@ To send and receive real messages, link your Meta WhatsApp Business account (one
    - **Subscribe to:** `messages`
 
 That's it — incoming WhatsApp messages will now appear in your inbox.
+
+**Verify it works:** in ForgeChat go to **Settings → Webhooks → Send Test Webhook** (the row should show *processed*). Then send a real WhatsApp message from your phone to the business number — it should appear in **Chats** within seconds, and your reply from ForgeChat should arrive back on your phone (with a *delivered* status under Settings → Webhooks).
 
 > ℹ️ You can explore the whole app (inbox, contacts, automations, templates) **before** connecting WhatsApp — you just won't send/receive real messages until this step is done.
 
@@ -370,7 +386,7 @@ crontab -e
 | **Changed `.env` but nothing updated** | Restart the backend so it picks up the new values: `docker compose restart forgecrm-backend`. |
 | **HTTPS certificate won't issue (server)** | DNS isn't pointing at the server yet. Check with `dig +short chat.yourbusiness.com` (should return your server IP), then `docker compose restart caddy`. |
 | **Docker Desktop won't start (Windows)** | Open PowerShell as Administrator, run `wsl --install`, then restart your PC — Docker needs WSL 2. |
-| **ngrok shows "502" (Windows)** | The backend is still starting. Wait ~30 seconds and refresh the ngrok URL. |
+| **Cloudflare Tunnel shows "502" (Windows)** | The backend is still starting. Wait ~30 seconds, then refresh the Cloudflare URL. |
 | **Is my data safe?** | Yes — everything lives on *your* server. WhatsApp tokens are encrypted, and access is protected by login. Just keep your backups (above). |
 
 Still stuck? Open an issue on [GitHub](https://github.com/Forgemind-git/ForgeChat/issues) and we'll help.
