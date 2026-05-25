@@ -12,9 +12,18 @@ const LS_WIDTH = 'forgecrm.chats.contactWidth';
 const LS_COLLAPSED = 'forgecrm.chats.navCollapsed';
 
 export default function ChatsPage({ subParts = [], navigate, user }) {
-  const selectedNumber = subParts[0] || null;
-  const selectedContact = subParts[1] || null;
+  // Selection lives in component state, NOT the URL, so customer/business phone
+  // numbers never appear in the address bar (consistent with phone masking).
+  const [selectedNumber, setSelectedNumber] = useState(subParts[0] || null);
+  const [selectedContact, setSelectedContact] = useState(subParts[1] || null);
   const [contactRefreshKey, setContactRefreshKey] = useState(0);
+
+  // A deep-link like #/chats/<wa>/<contact> still opens that chat once (state is
+  // seeded above), then we scrub the numbers out of the hash → URL stays #/chats.
+  useEffect(() => {
+    if (subParts.length > 0) window.history.replaceState(null, '', '#/chats');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Persisted UI prefs — read once on mount, written back on change.
   const [navCollapsed, setNavCollapsed] = useState(
@@ -28,8 +37,8 @@ export default function ChatsPage({ subParts = [], navigate, user }) {
   useEffect(() => { localStorage.setItem(LS_COLLAPSED, navCollapsed ? '1' : '0'); }, [navCollapsed]);
   useEffect(() => { localStorage.setItem(LS_WIDTH, String(contactWidth)); }, [contactWidth]);
 
-  const selectNumber = (n) => navigate('chats', n);
-  const selectContact = (c) => navigate('chats', selectedNumber, c);
+  const selectNumber = (n) => { setSelectedNumber(n); setSelectedContact(null); };
+  const selectContact = (c) => setSelectedContact(c);
 
   // Drag the divider to resize the contacts list; the chat window (flex:1) takes the rest.
   const startResize = useCallback((e) => {

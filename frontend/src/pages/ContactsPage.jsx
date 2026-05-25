@@ -5,7 +5,7 @@ import WhatsAppPreview, { BroadcastMessagePreview } from '../components/WhatsApp
 import TagMultiSelect from '../components/TagMultiSelect.jsx';
 import { CustomFieldEditor, CustomFieldView } from '../components/CustomFieldInputs.jsx';
 import { api } from '../api.js';
-import { C, FONT, maskPhone } from '../constants.js';
+import { C, FONT, maskPhone, darkenColor } from '../constants.js';
 import MaskedNumber from '../components/MaskedNumber.jsx';
 
 const ROLE_LABEL_MAP = { admin: 'Admin', bda_sales: 'Sales', viewer: 'Viewer' };
@@ -15,9 +15,9 @@ function TagBadge({ tag, onRemove }) {
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 4,
       padding: '3px 8px', borderRadius: 4,
-      background: tag.color,
+      background: darkenColor(tag.color),
       color: '#fff',
-      border: `1px solid ${tag.color}`,
+      border: `1px solid ${darkenColor(tag.color)}`,
       fontSize: 11, fontWeight: 700,
       fontFamily: FONT,
     }}>

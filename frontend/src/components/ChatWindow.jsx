@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Search, Loader2, MoreVertical, Phone, Pencil, X, Send, Lock, Paperclip, Image as ImageIcon, FileText, Video, Music, Library, RefreshCw, CheckCircle2, AlertTriangle, Mic, Square, Trash2, User, Download, Forward, Reply, Tag, UserPlus, Check } from 'lucide-react';
 import { usePolling } from '../hooks/usePolling.js';
 import { api } from '../api.js';
-import { C, FONT, MONO, maskPhone } from '../constants.js';
+import { C, FONT, MONO, maskPhone, darkenColor } from '../constants.js';
 import MessageBubble, { quoteSnippet } from './MessageBubble.jsx';
 import MaskedNumber from './MaskedNumber.jsx';
 import { CustomFieldEditor } from './CustomFieldInputs.jsx';
@@ -1326,9 +1326,9 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
                     <span key={t.id} style={{
                       display: 'inline-flex', alignItems: 'center', gap: 4,
                       padding: '3px 8px', borderRadius: 4,
-                      background: t.color,
+                      background: darkenColor(t.color),
                       color: '#fff',
-                      border: `1px solid ${t.color}`,
+                      border: `1px solid ${darkenColor(t.color)}`,
                       fontSize: 11, fontWeight: 700, fontFamily: FONT,
                     }}>
                       {t.name}

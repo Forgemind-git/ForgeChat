@@ -76,6 +76,19 @@ export function maskPhone(raw) {
   return digits.slice(0, 2) + '*'.repeat(digits.length - 5) + digits.slice(-3);
 }
 
+// Tag colors are stored as pale pastels (good as light fills, unreadable with
+// the white chip text). Darken a hex color so a white label reads clearly while
+// the tag keeps its own hue. Falls back to a dark slate for missing/invalid.
+export function darkenColor(hex, factor = 0.5) {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex || '');
+  if (!m) return '#374151';
+  const n = parseInt(m[1], 16);
+  const r = Math.round(((n >> 16) & 255) * factor);
+  const g = Math.round(((n >> 8) & 255) * factor);
+  const b = Math.round((n & 255) * factor);
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
 export function formatDate(ts) {
   const d = new Date(ts);
   const now = new Date();

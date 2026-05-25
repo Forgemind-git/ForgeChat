@@ -10,7 +10,7 @@ license grants rights to the *code*; this policy governs the *brand*.
 
 All marks described below are owned by **Forgemind** ("Forgemind", "we", "us"),
 the maintainer of this repository
-(<https://github.com/Forgemind-git/ForgeChat>) and of the products published
+(<https://github.com/Forgemind-git/Forge-Chat>) and of the products published
 under the `forgemind.space` domain.
 
 For trademark inquiries, permission requests, or to report misuse, contact:

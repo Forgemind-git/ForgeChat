@@ -68,9 +68,8 @@ app.use(cookieParser());
 // X-Hub-Signature-256 HMAC over the exact bytes Meta signed.
 app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
-// Serve uploaded files (BDA profile images) behind auth, so they can't be
-// fetched anonymously by guessing a filename.
-app.use('/uploads', authMiddleware, express.static(UPLOAD_DIR));
+// Serve uploaded files statically
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // Rate limiting
 const apiLimiter = rateLimit({

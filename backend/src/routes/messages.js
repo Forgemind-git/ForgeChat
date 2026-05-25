@@ -186,6 +186,16 @@ router.get('/numbers', async (req, res) => {
         COUNT(*) AS message_count
       FROM coexistence.chat_history
       WHERE timestamp >= NOW() - ${DEFAULT_DATA_WINDOW} ${extraFilter}
+        -- Only surface numbers that are still connected WhatsApp accounts, so
+        -- data from a previously-connected number (after the account is edited
+        -- to a new number or removed) stops showing. The rows stay in the DB —
+        -- this just hides orphaned numbers from the picker. Digits-only match
+        -- tolerates '+'/spaces in stored display_phone_number.
+        AND regexp_replace(wa_number, '[^0-9]', '', 'g') IN (
+          SELECT regexp_replace(display_phone_number, '[^0-9]', '', 'g')
+          FROM coexistence.whatsapp_accounts
+          WHERE display_phone_number IS NOT NULL
+        )
       GROUP BY wa_number
       ORDER BY last_message_time DESC
     `, params);

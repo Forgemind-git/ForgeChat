@@ -3627,6 +3627,7 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
   const [showPreview,setShowPreview]= useState(false);
   const [picker,     setPicker]     = useState(null);
   const [confirmOpen,setConfirmOpen]= useState(false);
+  const [backConfirmOpen,setBackConfirmOpen]= useState(false);
   const [ghost,      setGhost]      = useState(null);
 
   // ── Undo / Redo history ──
@@ -4007,21 +4008,35 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
   }, [nodes, edges, savedSnapshot]);
 
   const handleSave = async () => {
-    if (saving) return;
+    if (saving) return true;
     const snap = JSON.stringify({ nodes, edges });
-    if (snap === savedSnapshotRef.current) return; // nothing to save
+    if (snap === savedSnapshotRef.current) return true; // nothing to save
     setSaving(true);
     try {
       await onSave({ config: { nodes, edges } });
       savedSnapshotRef.current = snap;
       setSavedSnapshot(snap);
+      return true;
     } catch (err) {
       console.error('[builder] save failed:', err);
       alert('Failed to save: ' + (err?.message || 'unknown error'));
+      return false;
     } finally {
       setSaving(false);
     }
   };
+
+  // Guard the Back button: if there are unsaved edits, ask before leaving so
+  // the user can save or knowingly discard (reverts to the last saved version).
+  const handleBack = () => {
+    if (isDirty) { setBackConfirmOpen(true); return; }
+    onBack();
+  };
+  const saveAndExit = async () => {
+    const ok = await handleSave();
+    if (ok) { setBackConfirmOpen(false); onBack(); }
+  };
+  const discardAndExit = () => { setBackConfirmOpen(false); onBack(); };
 
   if (loading) {
     return (
@@ -4039,7 +4054,7 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
       <BuilderToolbar
         automationName={automation?.name || "Untitled Automation"}
         status={automation?.status || "draft"}
-        onBack={onBack}
+        onBack={handleBack}
         onSave={handleSave}
         isDirty={isDirty}
         saving={saving}
@@ -4166,6 +4181,22 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
             <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
               <Btn kind="ghost" onClick={closeConfirm}>Cancel</Btn>
               <Btn kind="danger" onClick={confirmDelete}>Delete block</Btn>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {backConfirmOpen && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.35)", zIndex:80, display:"flex", alignItems:"center", justifyContent:"center" }} onClick={()=>setBackConfirmOpen(false)}>
+          <div style={{ background:"#fff", borderRadius:12, padding:"24px", width:400, boxShadow:"0 20px 50px rgba(0,0,0,.2)" }} onClick={e=>e.stopPropagation()}>
+            <div style={{ fontSize:16, fontWeight:700, color:C.text1, marginBottom:8 }}>Unsaved changes</div>
+            <div style={{ fontSize:13, color:C.text3, lineHeight:1.5, marginBottom:20 }}>
+              You have unsaved changes to this automation. Save them, or go back without saving (this discards your edits and keeps the last saved version)?
+            </div>
+            <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
+              <Btn kind="ghost" onClick={()=>setBackConfirmOpen(false)}>Cancel</Btn>
+              <Btn kind="ghost" onClick={discardAndExit}>Discard &amp; exit</Btn>
+              <Btn kind="primary" onClick={saveAndExit}>{saving ? 'Saving…' : 'Save &amp; exit'}</Btn>
             </div>
           </div>
         </div>

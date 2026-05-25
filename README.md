@@ -1,186 +1,549 @@
-# ForgeChat
+<p align="center">
+  <img src="frontend/public/forgemind-logo.gif" alt="ForgeChat Logo" width="180"/>
+</p>
 
-A full-stack WhatsApp CRM that receives messages from the Meta WhatsApp Cloud API, stores them in PostgreSQL, and surfaces them through a custom React chat interface with contact management, tags, custom fields, team members (BDAs), message templates, bulk broadcasts, a visual automation builder, and a webhook audit log.
+<h1 align="center">ForgeChat</h1>
+<p align="center">
+  <strong>Your own WhatsApp Business inbox & CRM — running on your own server</strong>
+</p>
 
-**Self-hostable** — see [`DEPLOY-DIGITALOCEAN.md`](./DEPLOY-DIGITALOCEAN.md) for a single-host deployment guide.
+<p align="center">
+  <a href="#-what-is-forgechat">What is it?</a> •
+  <a href="#-what-you-can-do">Features</a> •
+  <a href="#-deploy-it-yourself-step-by-step">Deploy</a> •
+  <a href="#-connect-your-whatsapp">Connect WhatsApp</a> •
+  <a href="#-everyday-use">Use it</a> •
+  <a href="#-help--troubleshooting">Help</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.0.1-blue.svg" alt="Version"/>
+  <img src="https://img.shields.io/badge/license-Sustainable%20Use-green.svg" alt="License"/>
+  <img src="https://img.shields.io/badge/fair--code-%E2%9C%93-brightgreen.svg" alt="fair-code"/>
+  <img src="https://img.shields.io/badge/setup-no%20coding%20needed-success.svg" alt="No coding needed"/>
+  <img src="https://img.shields.io/badge/docker-ready-2496ED.svg" alt="Docker"/>
+</p>
 
 ---
 
-## Architecture
+## 🤔 What is ForgeChat?
 
-```
-Meta WhatsApp Cloud API
-        │
-        ▼ webhook
-   ForgeChat Backend  ───►  PostgreSQL (coexistence schema)
-   (Express + pg)          ├─ chat_history, contacts, tags, …
-        │                  ├─ message_templates + revisions + analytics
-        │                  ├─ whatsapp_accounts (multi-WABA, AES-256-GCM tokens)
-        │                  ├─ chatbots + automation_executions
-        │                  └─ webhook_events (audit log)
-        │
-        ├──► BullMQ on Redis  ──►  outbound send queue (60 msg/sec)
-        │                          + media download queue (concurrency 2)
-        │
-        ▼
-   ForgeChat Frontend
-   (React 18 + Vite, inline styles, no Tailwind)
-        │
-        ▼
-   Traefik (TLS) ──► browser
-```
+**ForgeChat** is a free WhatsApp Business inbox and CRM that **you host yourself**. Instead of paying a monthly fee to a SaaS company that keeps all your customer chats on *their* servers, you run ForgeChat on your own server — so **you own your data and your customer conversations**.
 
-## Tech Stack
+It connects to the **official Meta WhatsApp Cloud API** (the real, approved WhatsApp Business system — not a risky unofficial hack), and gives your whole team a clean, WhatsApp-style screen to:
 
-| Layer            | Technology                                                   |
-|------------------|--------------------------------------------------------------|
-| Database         | PostgreSQL (`coexistence` schema)                            |
-| Backend          | Node.js 20 + Express 4 + `pg` (raw SQL, no ORM)              |
-| Queues           | BullMQ on shared Redis (send + media-download)               |
-| Frontend         | React 18 + Vite, inline styles, DM Sans / DM Mono            |
-| Icons            | `lucide-react`                                               |
-| Auth             | JWT in httpOnly cookies (`forgecrm_token`)                   |
-| Encryption       | AES-256-GCM for stored Meta access tokens                    |
-| Reverse proxy    | Traefik (Let's Encrypt, `mytlschallenge` resolver)           |
-| Container build  | Docker Compose (shared `docker-compose.yml`)           |
+- 💬 **Reply to customers** from a shared team inbox
+- 🗂️ **Keep a customer database** with tags, notes, and custom fields
+- 📣 **Send bulk broadcasts** to many customers at once
+- 🤖 **Build auto-replies** with a drag-and-drop builder (no coding)
+- 📋 **Track deals** on a sales pipeline board
 
-## Features
+> **You don't need to be a programmer to set this up.** This guide walks you through every step — you mostly just copy and paste. It takes about **15–20 minutes**.
 
-- **Chats** — 3-pane WhatsApp-style inbox with per-BDA filtering, media rendering (image/video/audio/document with ffmpeg Ogg→MP3 fallback for Safari), 24h customer-service-window enforcement, optimistic-UI outbound sends, mic recording in the composer
-- **Contacts** — CRUD with tags + custom field definitions per WABA
-- **Message Templates** — full Meta lifecycle: real submit/sync/delete, PAUSED / DISABLED / REJECTED handling, quality score, COPY_CODE buttons, translations grouped by name, library browse + clone
-- **Template Editing + History** — APPROVED templates editable via Meta's edit API, snapshot per change to `message_template_revisions`, 2-edits-per-24h rate limit, History side drawer with restore
-- **Template Analytics** — daily Meta `template_analytics` cache, KPI tiles + SVG line chart + per-button click breakdown, daily refresh cron
-- **Bulk Broadcasts** — 7 message types (template, text, link, image, video, audio, document), per-recipient send queue, live status rollup (SENDING / SENT / PARTIAL / FAILED), Media Library integration for media types, variable mapping per broadcast, aggregated activity log
-- **Automation Builder** — visual flow editor (~3.9k lines), 33 block types, drag-to-connect handles, side-handle resource picker for AI Agent (model + tools); engine evaluates `keyword / anyMessage / newContact / messageRead / messageDelivered / messageSent` triggers synchronously on each webhook
-- **Multi-WABA** — `whatsapp_accounts` table, encrypted access tokens, health tracking with topbar banner on `invalid_token`
-- **Webhook History** — every inbound Meta/n8n payload audited with kind + subtype + extracted content preview + parser outcome; Send-Test-Webhook modal generates synthetic payloads of every common shape; replay button re-runs any historical payload through the handler
-- **Media Library** — upload images/videos/audio/documents to Postgres once, sync per-WABA to Meta on demand (each WABA gets its own 28-day `media_id`), toggle Auto-resync to let a daily cron refresh expiring IDs ~24h before TTL
+---
 
-## Project layout
+## 📸 What it looks like
 
-```
-ForgeCRM/
-├── backend/                # Express API on :3011 (Docker) / :3001 (dev)
-│   ├── src/
-│   │   ├── index.js                 # bootstrap, middleware, route mounting
-│   │   ├── auth.js                  # JWT auth + user table mgmt
-│   │   ├── db.js                    # pg Pool config
-│   │   ├── engine/automationEngine.js
-│   │   ├── integrations/
-│   │   │   ├── metaSend.js          # text / template / media
-│   │   │   ├── metaMedia.js         # download from Meta CDN
-│   │   │   ├── metaTemplates.js     # submit / edit / sync / library / analytics
-│   │   │   └── metaResumableUpload.js
-│   │   ├── queue/{mediaQueue,sendQueue}.js
-│   │   ├── services/
-│   │   │   ├── messageSender.js
-│   │   │   ├── mediaDownloader.js
-│   │   │   ├── templateAnalytics.js
-│   │   │   └── accountHealth.js
-│   │   ├── util/crypto.js           # AES-256-GCM
-│   │   └── routes/
-│   │       ├── webhook.js           # Meta receiver + parser + audit logger
-│   │       ├── webhookHistory.js    # /webhook-events listing + replay
-│   │       ├── messages.js          # numbers, contacts, chat, send paths
-│   │       ├── templates.js         # CRUD + submit/sync/edit/revisions/analytics
-│   │       ├── broadcasts.js        # multi-type broadcasts + send/test + status rollup
-│   │       ├── chatbots.js          # automations + executions
-│   │       ├── whatsappAccounts.js  # multi-WABA + encrypted tokens
-│   │       ├── mediaLibrary.js      # Postgres object storage + Meta sync
-│   │       ├── webhookHistory.js    # webhook audit log
-│   │       └── media.js             # auth-proxied /api/media/:msgId
-│   └── scripts/             # cron jobs (template sync, analytics, media cleanup, webhook cleanup)
-├── frontend/                # React + Vite, served by nginx in prod
-│   └── src/
-│       ├── App.jsx
-│       ├── api.js                   # fetch wrapper for every endpoint
-│       ├── hooks/useHashRoute.js    # survives reload
-│       ├── components/              # ChatsPage, ChatWindow, MessageBubble, AutomationBuilderView, …
-│       └── pages/                   # TemplateBuilderPage, BulkMessagePage, AdminSettingsPage, …
-└── db/migrations/           # numbered SQL files (001 → 044)
-```
+| Team Inbox | Auto-reply Builder |
+| :---: | :---: |
+| ![Chats](docs/ui-screenshots/11-chats-conversation.png) | ![Automations](docs/ui-screenshots/04-automation-builder.png) |
+| **Message Templates** | **Customer Database** |
+| ![Templates](docs/ui-screenshots/08-template-builder-form.png) | ![Contacts](docs/ui-screenshots/12-contacts.png) |
+| **Bulk Broadcasts** | **Settings** |
+| ![Bulk](docs/ui-screenshots/13-bulk-message.png) | ![Admin](docs/ui-screenshots/15-admin-general.png) |
 
-## Running locally
+---
 
-```bash
-# Backend
-cd backend
-cp .env.example .env       # fill in DB url, JWT secret, encryption key, Meta verify token
-npm install
-npm run dev                # nodemon on :3001
+## ✨ What you can do
 
-# Frontend (Vite proxies /api + /uploads to backend)
-cd frontend
-npm install
-npm run dev                # :5173
-```
+### 💬 Chat with customers
+- A **shared team inbox** that looks just like WhatsApp
+- Send and receive **text, photos, videos, voice notes, and documents**
+- **Record voice notes** right inside the chat box
+- React with emojis, reply to specific messages, and star important ones
+- ForgeChat reminds you about WhatsApp's **24-hour reply rule** and suggests a template when needed
 
-## Deploying
+### 🗂️ Manage customers
+- A full **contact list** with names and phone numbers
+- Organize people with **color-coded tags and categories**
+- Add your own **custom fields** (e.g. city, order number, plan)
+- **Import contacts** from an Excel/CSV spreadsheet
+- Track sales opportunities on a **deals pipeline (Kanban board)**
 
-For a **fresh host**, follow [`DEPLOY.md`](./DEPLOY.md) — it covers the required containers, persistent volumes, env vars, DNS/TLS, migrations, bootstrap order, cron jobs, and end-to-end verification.
+### 📣 Reach people at scale
+- Build approved **WhatsApp message templates** with a live phone preview
+- Send **bulk broadcasts** (templates, text, links, images, video, audio, documents)
+- Watch **live delivery status** for every recipient
+- See **template performance** with charts and click stats
 
-For **rolling updates** on the existing production VPS:
+### 🤖 Automate replies
+- A **drag-and-drop builder** for auto-replies — no coding
+- Trigger flows on **keywords**, **any new message**, **new contacts**, and delivery/read events
+- Every automation run is **logged** so you can see exactly what happened
+
+### 🔐 Keep it secure & organized
+- **Team accounts** with roles — admins control who sees what
+- Assign specific chats to specific team members
+- Secure login, encrypted WhatsApp tokens, and protected access throughout
+
+---
+
+## 🚀 Deploy it yourself (step by step)
+
+> 💡 **Prefer a click-by-click version with pictures?** Follow **[DEPLOY-DIGITALOCEAN.md](./DEPLOY-DIGITALOCEAN.md)** instead — it's the same process with more detail. The steps below are the short version.
+
+### ✅ What you'll need first
+
+| You need | Roughly | What it's for |
+| --- | --- | --- |
+| A **server** (a small cloud computer you rent) | ~$12 / month | Where ForgeChat runs, 24/7 |
+| A **domain name** (like `chat.yourbusiness.com`) | ~$10 / year | The web address you'll open in the browser |
+| A **Meta WhatsApp Business** account | Free | To send/receive real WhatsApp messages |
+| About **15–20 minutes** | — | To follow these steps |
+
+You'll be copy-pasting commands into your server. **You won't write any code.**
+
+---
+
+### Step 1 — Rent a server
+
+Create a server (also called a "VPS" or "droplet") at a provider like **[DigitalOcean](https://www.digitalocean.com/)**, Hetzner, or any cloud host.
+
+- **Operating system:** Ubuntu 24.04 (LTS)
+- **Size:** at least **2 GB of RAM** (smaller works but may struggle during setup)
+
+When it's ready, copy the server's **public IP address** (it looks like `203.0.113.10`).
+
+### Step 2 — Point your domain at the server
+
+In your domain provider's DNS settings, add an **"A record"**:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| A | `chat` (or whatever subdomain you want) | your server's IP address |
+
+This makes `chat.yourbusiness.com` lead to your server. (DNS can take a few minutes to update.)
+
+### Step 3 — Connect to your server and install Docker
+
+Open a terminal on your computer and connect to your server (replace with your IP):
 
 ```bash
-cd /root
+ssh root@YOUR_SERVER_IP
+```
+
+Then install **Docker** (the software that runs ForgeChat) by pasting this:
+
+```bash
+curl -fsSL https://get.docker.com | sh
+```
+
+### Step 4 — Download ForgeChat
+
+```bash
+git clone https://github.com/Forgemind-git/ForgeChat.git forgechat
+cd forgechat
+cp docker-compose.sample.yml docker-compose.yml
+```
+
+### Step 5 — Set your domain
+
+Tell ForgeChat your web address (replace with your real domain):
+
+```bash
+sed -i 's/forgechat.example.com/chat.yourbusiness.com/' Caddyfile
+```
+
+### Step 6 — Create your secret settings
+
+This creates secure passwords automatically and saves your settings. **Replace `chat.yourbusiness.com` with your real domain** before pasting:
+
+```bash
+PGPASS=$(openssl rand -hex 24)
+JWT=$(openssl rand -hex 32)
+ENCKEY=$(openssl rand -hex 32)
+VERIFY=$(openssl rand -hex 16)
+
+cat > backend/.env <<EOF
+NODE_ENV=production
+PORT=3011
+POSTGRES_PASSWORD=${PGPASS}
+DATABASE_URL=postgresql://postgres:${PGPASS}@forgecrm-db:5432/postgres
+POSTGRES_SSL=false
+REDIS_URL=redis://redis:6379
+JWT_SECRET=${JWT}
+FORGECRM_ENCRYPTION_KEY=${ENCKEY}
+CORS_ORIGIN=https://chat.yourbusiness.com
+META_API_VERSION=v21.0
+META_WEBHOOK_VERIFY_TOKEN=${VERIFY}
+MEDIA_DIR=/app/media
+ADMIN_EMAIL=you@yourbusiness.com
+ADMIN_PASSWORD=choose-a-strong-password
+EOF
+
+echo "SAVE THIS — your WhatsApp verify token: ${VERIFY}"
+```
+
+> 📝 Write down the **verify token** it prints — you'll need it when connecting WhatsApp. Also remember the `ADMIN_EMAIL` and `ADMIN_PASSWORD` you set — that's your login.
+
+### Step 7 — Build and start everything
+
+Paste this block. It builds the app, starts the database, loads the tables, then starts the app and the secure web address:
+
+```bash
+# Build the app (this takes a few minutes the first time)
+docker compose build
+
+# Start the database + wait until it's ready
+docker compose up -d forgecrm-db redis
+until [ "$(docker inspect -f '{{.State.Health.Status}}' forgecrm-db)" = healthy ]; do
+  echo "waiting for database..."; sleep 2; done
+
+# Create the database tables
+docker compose exec -T forgecrm-db psql -U postgres -d postgres <<'SQL'
+CREATE SCHEMA IF NOT EXISTS coexistence;
+CREATE TABLE IF NOT EXISTS coexistence.forgecrm_users (
+  id BIGSERIAL PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL UNIQUE,
+  password TEXT NOT NULL,
+  display_name TEXT,
+  role TEXT NOT NULL DEFAULT 'viewer',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+SQL
+for f in $(ls db/migrations/*.sql | sort); do
+  docker compose exec -T forgecrm-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < "$f";
+done
+
+# Start the app + secure web address
+docker compose up -d forgecrm-backend forgecrm-frontend caddy
+```
+
+### Step 8 — Open it! 🎉
+
+In your browser, go to **`https://chat.yourbusiness.com`** and log in with the email and password you set in Step 6.
+
+> The first time you visit, the secure padlock (HTTPS) is set up automatically. If you see a certificate warning, wait a minute and refresh — your domain's DNS may still be updating.
+
+---
+
+## 🖥️ Run on your own PC instead (Windows — for testing)
+
+No server or domain yet? You can run ForgeChat on a **Windows PC** with Docker Desktop and expose it to WhatsApp using a free **ngrok** tunnel. Great for testing, development, and demos — for real 24/7 use, follow the server steps above.
+
+**1. Install the tools**
+
+- **Git for Windows** — <https://git-scm.com/download/win> (click *Next* through the installer).
+- **Docker Desktop** — <https://www.docker.com/products/docker-desktop/> (keep **WSL 2** ticked, restart your PC, then open Docker Desktop and wait for **"Engine running"**).
+
+**2. Download ForgeChat** — open **PowerShell** and run:
+
+```powershell
+cd $env:USERPROFILE\Desktop
+git clone https://github.com/Forgemind-git/ForgeChat.git forgechat
+cd forgechat
+copy docker-compose.sample.yml docker-compose.yml
+```
+
+**3. Create your settings** — paste this whole block into PowerShell (it generates secure secrets):
+
+```powershell
+$PGPASS = -join ((48..57+65..90+97..122)|Get-Random -Count 32|%{[char]$_})
+$JWT    = -join ((48..57+65..90+97..122)|Get-Random -Count 64|%{[char]$_})
+$ENCKEY = -join ((48..57+65..90+97..122)|Get-Random -Count 64|%{[char]$_})
+$VERIFY = -join ((48..57+65..90+97..122)|Get-Random -Count 32|%{[char]$_})
+@"
+NODE_ENV=production
+PORT=3011
+POSTGRES_PASSWORD=$PGPASS
+DATABASE_URL=postgresql://postgres:$PGPASS@forgecrm-db:5432/postgres
+POSTGRES_SSL=false
+REDIS_URL=redis://redis:6379
+JWT_SECRET=$JWT
+FORGECRM_ENCRYPTION_KEY=$ENCKEY
+CORS_ORIGIN=http://localhost
+META_API_VERSION=v21.0
+META_WEBHOOK_VERIFY_TOKEN=$VERIFY
+MEDIA_DIR=/app/media
+ADMIN_EMAIL=admin@forgechat.local
+ADMIN_PASSWORD=Admin@123456
+"@ | Out-File -FilePath "backend\.env" -Encoding utf8
+Write-Host "SAVE THIS verify token (needed for WhatsApp): $VERIFY"
+```
+
+**4. Build, create the database tables, and start** — in PowerShell:
+
+```powershell
+docker compose build
+docker compose up -d forgecrm-db redis
+Start-Sleep -Seconds 10
+# apply every migration in order
+Get-ChildItem "db\migrations\*.sql" | Sort-Object Name | ForEach-Object {
+  Get-Content $_.FullName | docker exec -i forgecrm-db psql -U postgres -d postgres
+}
+docker compose up -d forgecrm-backend forgecrm-frontend
+```
+
+Open **<http://localhost>** and log in with `admin@forgechat.local` / `Admin@123456`.
+
+**5. Make it reachable by WhatsApp (ngrok)** — Meta needs a public URL to deliver messages:
+
+```powershell
+# one-time: sign up at https://ngrok.com, then add your token
+.\ngrok.exe config add-authtoken YOUR_AUTHTOKEN
+# start the tunnel — keep this window open
+.\ngrok.exe http 80
+```
+
+Copy the `https://….ngrok-free.app` address it prints, then:
+
+1. In `backend\.env`, set `CORS_ORIGIN=https://….ngrok-free.app` and run `docker compose restart forgecrm-backend`.
+2. Follow **[Connect your WhatsApp](#-connect-your-whatsapp)** below, but use the ngrok address as the **Callback URL** (`https://….ngrok-free.app/api/webhook/whatsapp`) with the verify token from step 3.
+
+> ℹ️ On ngrok's free plan the URL changes each restart — update `CORS_ORIGIN` and the Meta webhook URL whenever it does.
+
+---
+
+## 📱 Connect your WhatsApp
+
+To send and receive real messages, link your Meta WhatsApp Business account (one-time setup):
+
+1. **Log in** to ForgeChat → click **Settings** → **WhatsApp Accounts** → **Add**.
+2. Paste your details from the [Meta Business dashboard](https://business.facebook.com/): **Display Phone Number**, **Phone Number ID**, **WABA ID**, **Meta App ID**, and a **Meta access token**. (ForgeChat stores the token encrypted.)
+3. In the **Meta dashboard** (WhatsApp → Configuration), set up the webhook so Meta sends incoming messages to ForgeChat:
+   - **Callback URL:** `https://chat.yourbusiness.com/api/webhook/whatsapp`
+   - **Verify token:** the verify token you saved in Step 6
+   - **Subscribe to:** `messages`
+
+That's it — incoming WhatsApp messages will now appear in your inbox.
+
+> ℹ️ You can explore the whole app (inbox, contacts, automations, templates) **before** connecting WhatsApp — you just won't send/receive real messages until this step is done.
+
+---
+
+## 🧭 Everyday use
+
+| You want to… | Go to… |
+| --- | --- |
+| Reply to customers | **Chats** |
+| Add or edit customers, tags, custom fields | **Contacts** |
+| Create approved WhatsApp templates | **Template Builder** |
+| Send a message to many people at once | **Bulk Message** |
+| Set up automatic replies | **Automations** |
+| Track sales/deals | **Pipelines** |
+| Add team members & control access | **Settings → Users** |
+
+---
+
+## 🔄 Keeping it running
+
+**Update to the latest version** (run on your server, inside the `forgechat` folder):
+
+```bash
+git pull
 docker compose build forgecrm-backend forgecrm-frontend
-docker compose up -d --force-recreate forgecrm-backend forgecrm-frontend
+docker compose up -d forgecrm-backend forgecrm-frontend
 ```
 
-Traefik labels handle TLS + path routing. The frontend nginx config proxies `/api` and `/uploads` to the backend on port 3011.
-
-## Database migrations
-
-Numbered SQL files in `db/migrations/` are applied manually against the Postgres container:
+**Back up your data** (highly recommended — set up a daily automatic backup):
 
 ```bash
-docker exec -i forgecrm-postgres psql -U postgres -d postgres < db/migrations/0NN_xxx.sql
+mkdir -p ~/backups
+crontab -e
+# add this line to back up every day at 3 AM and keep 7 days:
+0 3 * * * docker exec forgecrm-db pg_dump -U postgres postgres | gzip > ~/backups/forgechat-$(date +\%Y\%m\%d).sql.gz && find ~/backups -name '*.sql.gz' -mtime +7 -delete
 ```
 
-Latest applied: `026_broadcast_message_type.sql`.
+---
 
-## Cron jobs (host crontab)
+## 🆘 Help & Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| **The page won't load / shows a security warning** | Your domain may not point to the server yet. Double-check the DNS "A record" (Step 2), wait a few minutes, then refresh. |
+| **"502" error or blank screen** | The app may still be starting. Wait a minute, then check: `docker compose logs forgecrm-backend`. |
+| **Can't log in** | Use the exact `ADMIN_EMAIL` / `ADMIN_PASSWORD` from Step 6. If you forgot the password, you can reset it via Settings → Users (or re-run setup). |
+| **Setup got "Killed" / "out of memory" while building** | The build ran out of RAM. Use **2 GB+**, or add swap and rebuild: `fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile`. |
+| **Messages aren't arriving** | Re-check the **webhook** in the Meta dashboard. Subscribe to `messages`, and make sure the **Callback URL ends with `/api/webhook/whatsapp`** and the **Verify token matches your `.env` exactly** (no extra spaces). |
+| **Changed `.env` but nothing updated** | Restart the backend so it picks up the new values: `docker compose restart forgecrm-backend`. |
+| **HTTPS certificate won't issue (server)** | DNS isn't pointing at the server yet. Check with `dig +short chat.yourbusiness.com` (should return your server IP), then `docker compose restart caddy`. |
+| **Docker Desktop won't start (Windows)** | Open PowerShell as Administrator, run `wsl --install`, then restart your PC — Docker needs WSL 2. |
+| **ngrok shows "502" (Windows)** | The backend is still starting. Wait ~30 seconds and refresh the ngrok URL. |
+| **Is my data safe?** | Yes — everything lives on *your* server. WhatsApp tokens are encrypted, and access is protected by login. Just keep your backups (above). |
+
+Still stuck? Open an issue on [GitHub](https://github.com/Forgemind-git/ForgeChat/issues) and we'll help.
+
+---
+
+## 👩‍💻 For developers
+
+<details>
+<summary><strong>Run it locally, tech stack, architecture, API, and project structure</strong> (click to expand)</summary>
+
+<br/>
+
+### Run locally for development
+
+You'll need **Node.js 20+**, **PostgreSQL 15**, and **Redis 7** running locally.
+
+```bash
+# Backend → http://localhost:3001
+cd backend
+cp .env.example .env          # fill DB url, Redis url, JWT secret, encryption key
+npm install
+# apply migrations from db/migrations/ to your local DB, then:
+npm run dev
+
+# Frontend → http://localhost:5173  (Vite proxies /api + /uploads to :3001)
+cd ../frontend
+npm install
+npm run dev
+```
+
+### Tech stack
+
+| Layer | Technology |
+| --- | --- |
+| Backend | Node.js 20 + Express 4 + `pg` (raw SQL, **no ORM**) |
+| Frontend | React 18 + Vite, inline styles (no Tailwind), `lucide-react` |
+| Database | PostgreSQL 15 (`coexistence` schema) |
+| Queues | BullMQ on Redis 7 (send + media-download workers) |
+| Auth | JWT in httpOnly cookies + bcryptjs |
+| Encryption | AES-256-GCM for stored Meta access tokens |
+| Media | ffmpeg (Ogg/Opus → MP3), ExcelJS (contact import) |
+| WhatsApp | Meta WhatsApp Business **Cloud API** (official) |
+| Reverse proxy | Caddy (auto-HTTPS) → nginx (SPA + `/api` `/uploads` `/l/` proxy) |
+| Tests | Vitest + Testing Library (unit), Playwright (E2E), `node --test` |
+
+### Architecture
 
 ```
-0  3  * * *  docker exec forgecrm-backend node scripts/cleanupMedia.js
-0  */4 * * * docker exec forgecrm-backend node scripts/syncTemplates.js
-0  2  * * *  docker exec forgecrm-backend node scripts/syncTemplateAnalytics.js
-0  4  * * *  docker exec forgecrm-backend node scripts/syncMediaResync.js
+                         Internet (HTTPS)
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │   Caddy (auto-TLS)    │  Let's Encrypt
+                    └──────────┬───────────┘
+                               ▼
+                    ┌──────────────────────┐
+                    │  Frontend (nginx)     │  React 18 + Vite SPA
+                    │  serves SPA + proxies │
+                    │  /api  /uploads  /l/  │
+                    └──────────┬───────────┘
+   Meta WhatsApp               ▼
+   Cloud API  ──webhook──►┌──────────────────────┐  BullMQ  ┌──────────────┐
+        ▲                 │  Backend (Express)    │ ───────► │  Redis 7     │
+        │  send/template  │  Node 20 + pg Pool    │ ◄─────── │  send/media  │
+        └─────────────────┤                       │          │  queues      │
+                          └──────────┬────────────┘          └──────────────┘
+                                     ▼
+                          ┌──────────────────────┐
+                          │  PostgreSQL 15        │
+                          │  schema: coexistence  │
+                          └──────────────────────┘
 ```
 
-## Security
+> **Single-WABA by design:** ForgeChat connects to exactly **one** WhatsApp Business Account, enforced in the UI, the API (`409` on a second account), and the DB (a unique index). Account health is tracked, with a topbar banner on `invalid_token`.
 
-> Found a vulnerability? Please report it privately — see [`SECURITY.md`](./SECURITY.md). Do **not** open a public issue.
+### API (cookie auth, not API keys)
 
-- **Never commit** `.env` or `backend/.env` — both gitignored
-- Meta access tokens are encrypted at rest with AES-256-GCM (`backend/src/util/crypto.js`); the key lives in `FORGECRM_ENCRYPTION_KEY` env var
-- JWT tokens use httpOnly, sameSite-strict cookies
-- Webhook verify token is dedicated (`FORGECRM_META_WEBHOOK_VERIFY_TOKEN`), kept separate from the JWT signing secret
-- All SQL uses parameterized queries (`pg` Pool, no ORM, no string interpolation)
-- helmet + rate limiter (600 req/min/user) on the API surface
-- Phone numbers normalized to digits-only on insert (`normalizePhone()` in `routes/webhook.js`) to avoid duplicate chat threads from `+91…` vs `91…`
+```bash
+# Log in (saves the auth cookie)
+curl -X POST http://localhost:3001/api/auth/login \
+  -H "Content-Type: application/json" -c cookies.txt \
+  -d '{"email":"admin@forgemind.space","password":"YOUR_PASSWORD"}'
 
-## Contributing
+# Use the cookie on protected endpoints
+curl http://localhost:3001/api/numbers  -b cookies.txt
+curl http://localhost:3001/api/contacts -b cookies.txt
 
-Contributions are welcome! Please read [`CONTRIBUTING.md`](./CONTRIBUTING.md) for
-development setup, coding conventions, Conventional Commits, and the DCO sign-off
-requirement, and abide by our [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md). See
-[`CHANGELOG.md`](./CHANGELOG.md) for the release history,
-[`VERSIONING.md`](./VERSIONING.md) for the versioning & upgrade policy, and
-[`AUTHORS.md`](./AUTHORS.md) for the people behind ForgeChat.
+# Send a text (subject to Meta's 24h window → 409 OUTSIDE_WINDOW if expired)
+curl -X POST http://localhost:3001/api/messages/send \
+  -H "Content-Type: application/json" -b cookies.txt \
+  -d '{"fromNumber":"919342245724","toNumber":"15551234567","text":"Hello!"}'
+```
 
-## License
+Meta webhook: `GET /api/webhook/whatsapp` (verification) and `POST /api/webhook/whatsapp` (inbound, HMAC-verified with `META_APP_SECRET`).
 
-ForgeChat is [fair-code](https://faircode.io) distributed under the
-[**Sustainable Use License**](./LICENSE.md).
+### Configuration
 
-- ✅ Source available — view, modify, and use for your own internal business, non-commercial, or personal purposes.
-- ✅ Redistribute free of charge for non-commercial purposes.
-- ❌ No commercial resale or hosting as a paid service without permission.
+All backend config is in `backend/.env` (copy from `backend/.env.example`). Key variables: `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, `FORGECRM_ENCRYPTION_KEY` (must differ from `JWT_SECRET`), `CORS_ORIGIN`, `ADMIN_EMAIL`/`ADMIN_PASSWORD`, and the `META_*` keys for live WhatsApp. In production the app refuses to boot with blank/placeholder/short secrets.
 
-Copyright © 2026 Forgemind Techhub LLP. See [`LICENSE.md`](./LICENSE.md) for full terms.
+### Project structure
 
-## Trademarks
+```
+ForgeChat/
+├── backend/                # Express API (3001 dev / 3011 docker)
+│   ├── src/
+│   │   ├── index.js        # bootstrap, middleware, routes, queue workers
+│   │   ├── auth.js         # JWT cookie auth + first-run admin seed
+│   │   ├── db.js           # pg Pool
+│   │   ├── engine/         # automation trigger engine
+│   │   ├── integrations/   # Meta send / media / templates
+│   │   ├── services/       # message sender, media downloader, account health
+│   │   ├── queue/          # BullMQ send + media workers
+│   │   ├── util/           # crypto, pgStorage, webhook signature
+│   │   └── routes/         # webhook, messages, templates, broadcasts,
+│   │                       #   chatbots, pipelines, mediaLibrary, users, …
+│   └── scripts/            # cron jobs + helpers
+├── frontend/               # React + Vite SPA (nginx in prod)
+│   └── src/{components,pages,api.js,App.jsx}
+├── db/migrations/          # numbered SQL files (000 → 048)
+├── docker-compose.sample.yml
+├── Caddyfile
+└── DEPLOY*.md / LLD.md     # deploy runbooks + low-level design
+```
 
-"Forgemind", "ForgeChat", and the other Forge\* marks and logos are trademarks of Forgemind. See [`TRADEMARK.md`](./TRADEMARK.md) for the brand usage policy.
+### Testing
+
+```bash
+cd backend  && npm test            # Node's built-in test runner
+cd frontend && npm run test:unit   # Vitest + Testing Library
+cd frontend && npm run test:e2e    # Playwright
+```
+
+CI runs tests/build/migrations, a dependency license check, secret scanning (gitleaks), and publishes Docker images to GHCR (`forge-chat-backend`, `forge-chat-frontend`) on release.
+
+</details>
+
+---
+
+## 🔒 Security
+
+- Everything runs on **your** server — your data never leaves it.
+- WhatsApp access tokens are **encrypted** at rest (AES-256-GCM).
+- Login uses secure httpOnly cookies; passwords are hashed with bcrypt.
+- Incoming webhooks are verified with Meta's signature so fake messages are rejected.
+- The API is protected with rate limiting, security headers, and parameterized database queries.
+
+Found a security issue? Please report it privately — see **[SECURITY.md](./SECURITY.md)**. Don't open a public issue.
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! See **[CONTRIBUTING.md](./CONTRIBUTING.md)** for setup and conventions, and the **[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)**. Release history is in **[CHANGELOG.md](./CHANGELOG.md)**.
+
+---
+
+## 📄 License
+
+ForgeChat is [**fair-code**](https://faircode.io) distributed under the **[Sustainable Use License](./LICENSE.md)**.
+
+- ✅ Use it for your own business, personal, or non-commercial purposes.
+- ✅ Share it free of charge for non-commercial purposes.
+- ❌ No reselling or paid hosting as a service without permission.
+
+Copyright © 2026 **Forgemind Techhub LLP**. "Forgemind" and "ForgeChat" are trademarks of Forgemind — see **[TRADEMARK.md](./TRADEMARK.md)**.
+
+---
+
+<div align="center">
+
+**ForgeChat** — own your WhatsApp inbox.
+
+<sub>Made with ❤️ by <a href="https://github.com/Forgemind-git">Forgemind</a></sub>
+
+</div>
