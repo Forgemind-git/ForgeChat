@@ -56,87 +56,117 @@ function sanitizeToLinear(config) {
 
 // GET /chatbots — list all
 router.get('/chatbots', async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT id, name, description, status, trigger_type, config, created_at, updated_at
-     FROM coexistence.chatbots
-     ORDER BY updated_at DESC`
-  );
-  res.json(rows);
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, description, status, trigger_type, config, created_at, updated_at
+       FROM coexistence.chatbots
+       ORDER BY updated_at DESC`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('[chatbots] list error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch chatbots' });
+  }
 });
 
 // GET /chatbots/:id — single chatbot
 router.get('/chatbots/:id', async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT id, name, description, status, trigger_type, config, created_at, updated_at
-     FROM coexistence.chatbots WHERE id = $1`,
-    [req.params.id]
-  );
-  if (rows.length === 0) return res.status(404).json({ error: 'Chatbot not found' });
-  res.json(rows[0]);
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, description, status, trigger_type, config, created_at, updated_at
+       FROM coexistence.chatbots WHERE id = $1`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Chatbot not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('[chatbots] get error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch chatbot' });
+  }
 });
 
 // POST /chatbots — create
 router.post('/chatbots', requirePermission('chatbot-builder'), async (req, res) => {
-  const { name, description, status, trigger_type, config } = req.body;
-  if (!name || !name.trim()) {
-    return res.status(400).json({ error: 'Name is required' });
+  try {
+    const { name, description, status, trigger_type, config } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.chatbots (name, description, status, trigger_type, config)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING *`,
+      [name.trim(), description || null, status || 'draft', trigger_type || 'keyword', JSON.stringify(sanitizeToLinear(config) || {})]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('[chatbots] create error:', err.message);
+    res.status(500).json({ error: 'Failed to create chatbot' });
   }
-  const { rows } = await pool.query(
-    `INSERT INTO coexistence.chatbots (name, description, status, trigger_type, config)
-     VALUES ($1,$2,$3,$4,$5)
-     RETURNING *`,
-    [name.trim(), description || null, status || 'draft', trigger_type || 'keyword', JSON.stringify(sanitizeToLinear(config) || {})]
-  );
-  res.status(201).json(rows[0]);
 });
 
 // PUT /chatbots/:id — update
 router.put('/chatbots/:id', requirePermission('chatbot-builder'), async (req, res) => {
-  const { name, description, status, trigger_type, config } = req.body;
-  if (name !== undefined && !name.trim()) {
-    return res.status(400).json({ error: 'Name is required' });
+  try {
+    const { name, description, status, trigger_type, config } = req.body;
+    if (name !== undefined && !name.trim()) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE coexistence.chatbots SET
+        name = COALESCE($1, name),
+        description = $2,
+        status = COALESCE($3, status),
+        trigger_type = COALESCE($4, trigger_type),
+        config = COALESCE($5, config),
+        updated_at = NOW()
+       WHERE id = $6
+       RETURNING *`,
+      [name ? name.trim() : null, description, status, trigger_type, config ? JSON.stringify(sanitizeToLinear(config)) : null, req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Chatbot not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('[chatbots] update error:', err.message);
+    res.status(500).json({ error: 'Failed to update chatbot' });
   }
-  const { rows } = await pool.query(
-    `UPDATE coexistence.chatbots SET
-      name = COALESCE($1, name),
-      description = $2,
-      status = COALESCE($3, status),
-      trigger_type = COALESCE($4, trigger_type),
-      config = COALESCE($5, config),
-      updated_at = NOW()
-     WHERE id = $6
-     RETURNING *`,
-    [name ? name.trim() : null, description, status, trigger_type, config ? JSON.stringify(sanitizeToLinear(config)) : null, req.params.id]
-  );
-  if (rows.length === 0) return res.status(404).json({ error: 'Chatbot not found' });
-  res.json(rows[0]);
 });
 
 // POST /chatbots/:id/duplicate — clone an automation. The copy is always
 // created DISABLED ('inactive') so it can't fire until reviewed/enabled.
 router.post('/chatbots/:id/duplicate', requirePermission('chatbot-builder'), async (req, res) => {
-  const { rows: src } = await pool.query(
-    'SELECT name, description, trigger_type, config FROM coexistence.chatbots WHERE id = $1',
-    [req.params.id]
-  );
-  if (src.length === 0) return res.status(404).json({ error: 'Chatbot not found' });
-  const c = src[0];
-  const { rows } = await pool.query(
-    `INSERT INTO coexistence.chatbots (name, description, status, trigger_type, config)
-     VALUES ($1,$2,'inactive',$3,$4)
-     RETURNING id, name, description, status, trigger_type, config, created_at, updated_at`,
-    [`${c.name} (copy)`, c.description, c.trigger_type, JSON.stringify(c.config || {})]
-  );
-  res.status(201).json(rows[0]);
+  try {
+    const { rows: src } = await pool.query(
+      'SELECT name, description, trigger_type, config FROM coexistence.chatbots WHERE id = $1',
+      [req.params.id]
+    );
+    if (src.length === 0) return res.status(404).json({ error: 'Chatbot not found' });
+    const c = src[0];
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.chatbots (name, description, status, trigger_type, config)
+       VALUES ($1,$2,'inactive',$3,$4)
+       RETURNING id, name, description, status, trigger_type, config, created_at, updated_at`,
+      [`${c.name} (copy)`, c.description, c.trigger_type, JSON.stringify(c.config || {})]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('[chatbots] duplicate error:', err.message);
+    res.status(500).json({ error: 'Failed to duplicate chatbot' });
+  }
 });
 
 // DELETE /chatbots/:id
 router.delete('/chatbots/:id', requirePermission('chatbot-builder'), async (req, res) => {
-  const { rowCount } = await pool.query(
-    'DELETE FROM coexistence.chatbots WHERE id = $1', [req.params.id]
-  );
-  if (rowCount === 0) return res.status(404).json({ error: 'Chatbot not found' });
-  res.json({ ok: true });
+  try {
+    const { rowCount } = await pool.query(
+      'DELETE FROM coexistence.chatbots WHERE id = $1', [req.params.id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Chatbot not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[chatbots] delete error:', err.message);
+    res.status(500).json({ error: 'Failed to delete chatbot' });
+  }
 });
 
 // GET /chatbots/:id/executions — paginated list of executions for an automation
