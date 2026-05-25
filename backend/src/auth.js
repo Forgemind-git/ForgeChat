@@ -34,13 +34,23 @@ async function loadUserSession(userId) {
 }
 
 const JWT_SECRET = process.env.JWT_SECRET || 'forgecrm-dev-secret-change-me';
-// In production, refuse to start with a missing or default signing secret —
-// otherwise auth tokens could be forged using the well-known default (the
-// source is public). Dev/test keep the convenient fallback.
-if (process.env.NODE_ENV === 'production' &&
-    (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'forgecrm-dev-secret-change-me')) {
-  console.error('[auth] FATAL: JWT_SECRET must be set to a strong, unique value in production.');
-  process.exit(1);
+// Known-weak / placeholder secrets that must never reach production. Includes the
+// code's own dev fallback and the placeholders shipped in backend/.env.example —
+// a self-hoster who copies the example unchanged must NOT pass this guard.
+const WEAK_SECRETS = new Set([
+  'forgecrm-dev-secret-change-me',
+  'change-this-to-a-random-string',
+  'change-this-to-another-random-string',
+]);
+// In production, refuse to start with a missing, placeholder, or low-entropy
+// signing secret — otherwise auth tokens could be forged (the source is public).
+// Dev/test keep the convenient fallback.
+if (process.env.NODE_ENV === 'production') {
+  const s = process.env.JWT_SECRET;
+  if (!s || WEAK_SECRETS.has(s) || s.length < 32) {
+    console.error('[auth] FATAL: JWT_SECRET must be a strong, unique value (>= 32 chars) in production — not blank, a placeholder, or the example value.');
+    process.exit(1);
+  }
 }
 const COOKIE_NAME = 'forgecrm_token';
 const TOKEN_EXPIRY = '24h';
@@ -79,8 +89,17 @@ async function ensureTables() {
         [adminEmail, hash]
       );
       if (generated) {
-        console.log(`[auth] Created admin '${adminEmail}' with a GENERATED password: ${adminPassword}`);
-        console.log("[auth] Log in and change it now, or set ADMIN_PASSWORD before first boot.");
+        // Do NOT print the password to stdout — container logs are often shipped
+        // to aggregators where the credential would persist. Write it to a
+        // 0600 file the operator reads once, then deletes.
+        const fs = require('fs');
+        const pwFile = process.env.ADMIN_PASSWORD_FILE || 'admin-initial-password.txt';
+        try {
+          fs.writeFileSync(pwFile, `email: ${adminEmail}\npassword: ${adminPassword}\n`, { mode: 0o600 });
+          console.log(`[auth] Created admin '${adminEmail}'. One-time generated password written to ${pwFile} (mode 0600). Log in, change it via Admin Settings, then delete that file. Set ADMIN_PASSWORD to skip generation.`);
+        } catch (e) {
+          console.log(`[auth] Created admin '${adminEmail}' with a generated password, but could not write ${pwFile} (${e.message}). Set ADMIN_PASSWORD and recreate to avoid this.`);
+        }
       } else {
         console.log(`[auth] Created admin '${adminEmail}' from ADMIN_PASSWORD.`);
       }

@@ -252,7 +252,7 @@ docker compose logs -f caddy        # look for "certificate obtained successfull
 
 ```bash
 # Backend health (through Caddy → frontend nginx → backend)
-curl -fsS https://forgechat.example.com/api/health      # -> {"ok":true}
+curl -fsS https://forgechat.example.com/health      # -> {"ok":true}
 
 # Backend logs should show it booted + workers started
 docker compose logs forgecrm-backend | tail -n 20

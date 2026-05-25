@@ -44,21 +44,22 @@ PORT=3011                        # Matches docker compose port mapping
 NODE_ENV=production
 
 # Database
-DATABASE_URL=postgresql://postgres:<password>@forgecrm-db:5432/postgres
+POSTGRES_PASSWORD=<strong-random-password>   # also used by the db container
+DATABASE_URL=postgresql://postgres:<same-password>@forgecrm-db:5432/postgres
 POSTGRES_SSL=false               # true if connecting over public network
 
-# Auth
-FORGECRM_JWT_SECRET=<random-64-char-hex>     # openssl rand -hex 32
+# Auth — names MUST match what the app reads (see backend/.env.example).
+# In production these must be >= 32 chars and not the example placeholders.
+JWT_SECRET=<random-64-char-hex>              # openssl rand -hex 32
 CORS_ORIGIN=https://crm.yourdomain.com
 
-# Cookie domain — must be a parent of CORS_ORIGIN for cookies to stick
-COOKIE_PARENT_DOMAINS=.yourdomain.com
+# Encryption for stored Meta access tokens (AES-256-GCM) — DIFFERENT from JWT secret
+FORGECRM_ENCRYPTION_KEY=<random-64-char-hex>  # openssl rand -hex 32
 
-# Encryption for stored Meta access tokens (AES-256-GCM)
-FORGECRM_ENCRYPTION_KEY=<random-64-char-hex>  # openssl rand -hex 32 — DIFFERENT from JWT secret
-
-# Meta webhook verify token (whatever string you configure in Meta's webhook settings)
-FORGECRM_META_WEBHOOK_VERIFY_TOKEN=<your-chosen-string>
+# Meta webhook (verify token = the string you configure in Meta's webhook UI;
+# app secret = Meta App → Settings → Basic, used to verify inbound signatures)
+META_WEBHOOK_VERIFY_TOKEN=<your-chosen-string>
+META_APP_SECRET=<meta-app-secret>
 META_API_VERSION=v21.0
 
 # Queues / Redis
@@ -124,7 +125,7 @@ docker compose up -d forgecrm-frontend    # nginx proxies to backend
 Verify each service:
 ```bash
 docker compose ps                                 # all five should be "Up"
-curl -fsS https://crm.<yourdomain>/api/health     # → {"ok":true,"ts":...}
+curl -fsS https://crm.<yourdomain>/health     # → {"ok":true}
 docker logs forgecrm-backend | tail               # should show "Backend running on port 3011"
                                                   # + "[mediaQueue] worker started, concurrency=2"
                                                   # + "[sendQueue] worker started, concurrency=5, rate=60/1000ms"
@@ -152,7 +153,7 @@ Without these, you'll still get inbound webhooks + manual sends + manual refresh
    - Access Token (Meta System User token; encrypted at rest with AES-256-GCM)
 3. **Configure the Meta webhook** in Meta Business Suite → WhatsApp → Configuration:
    - Callback URL: `https://crm.<yourdomain>/api/webhook/whatsapp`
-   - Verify token: must match `FORGECRM_META_WEBHOOK_VERIFY_TOKEN`
+   - Verify token: must match `META_WEBHOOK_VERIFY_TOKEN`
    - Subscribe to: `messages` (covers messages + statuses + echoes + template events)
 4. **Test the wiring** — Admin Settings → Webhooks → "Send Test Webhook" with the "Incoming text message" template. A row should appear in the audit log with `processed` status, records_extracted=1.
 5. **(Optional) Enable Template Insights** in Meta Business Suite → WhatsApp Accounts → Insights → Enable. Without this, the Analytics drawer's "Refresh from Meta" returns subcode 4182004 (the UI shows a banner explaining the fix).
