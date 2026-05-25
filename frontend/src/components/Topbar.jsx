@@ -4,7 +4,7 @@ import { C, FONT } from '../constants.js';
 import { api } from '../api.js';
 
 // This project's GitHub repo — powers the star counter in the header.
-const GITHUB_REPO = 'Forgemind-git/ForgeCRM';
+const GITHUB_REPO = 'Forgemind-git/ForgeChat';
 const GITHUB_REPO_URL = `https://github.com/${GITHUB_REPO}`;
 
 export default function Topbar({ user, onLogout, onNavigate }) {
@@ -134,7 +134,7 @@ export default function Topbar({ user, onLogout, onNavigate }) {
         {/* GitHub stars — opens this project's repo */}
         <button
           onClick={() => window.open(GITHUB_REPO_URL, '_blank', 'noopener,noreferrer')}
-          title="Star ForgeCRM on GitHub"
+          title="Star ForgeChat on GitHub"
           style={{
             height: 36, borderRadius: 9, padding: '0 12px',
             background: C.headerSurface, border: `1.5px solid ${C.headerBorder}`,
