@@ -8,6 +8,7 @@
 //   POST   /users/:id/reset-password — set or generate new password, returns plaintext once
 
 const { Router } = require('express');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const pool = require('../db');
 const { adminOnly, auditLog } = require('../middleware/access');
@@ -51,7 +52,7 @@ async function loadAssignments(userIds) {
 function generatePassword(len = 12) {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%';
   let out = '';
-  for (let i = 0; i < len; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  for (let i = 0; i < len; i++) out += alphabet[crypto.randomInt(alphabet.length)];
   return out;
 }
 
