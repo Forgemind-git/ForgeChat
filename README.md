@@ -10,7 +10,8 @@
 <p align="center">
   <a href="#-what-is-forgechat">What is it?</a> •
   <a href="#-what-you-can-do">Features</a> •
-  <a href="#-deploy-it-yourself-step-by-step">Deploy</a> •
+  <a href="#-run-it-on-your-computer-windows-or-mac">Run locally</a> •
+  <a href="#-deploy-it-yourself-step-by-step">Deploy to a server</a> •
   <a href="#-connect-your-whatsapp">Connect WhatsApp</a> •
   <a href="#-everyday-use">Use it</a> •
   <a href="#-help--troubleshooting">Help</a>
@@ -88,8 +89,192 @@ It connects to the **official Meta WhatsApp Cloud API** (the real, approved What
 
 ---
 
+## 💻 Run it on your computer (Windows or Mac)
+
+No server or domain yet? Run ForgeChat on your own computer with **Docker Desktop**, and expose it to WhatsApp using a free **Cloudflare Tunnel** (no account needed). Perfect for testing, development, and demos — for real 24/7 use, follow the **[server deployment](#-deploy-it-yourself-step-by-step)** below.
+
+> You'll log in locally at **<http://localhost>** with `admin@forgechat.local` / `Admin@123456`.
+
+### 🪟 Windows
+
+**1. Install the tools**
+
+- **Git for Windows** — <https://git-scm.com/download/win> (click *Next* through the installer).
+- **Docker Desktop** — <https://www.docker.com/products/docker-desktop/> (keep **WSL 2** ticked, restart your PC, then open Docker Desktop and wait for **"Engine running"**).
+
+**2. Download ForgeChat** — open **PowerShell** and run:
+
+```powershell
+cd $env:USERPROFILE\Desktop
+git clone https://github.com/Forgemind-git/ForgeChat.git forgechat
+cd forgechat
+copy docker-compose.sample.yml docker-compose.yml
+```
+
+**3. Create your settings** — paste this whole block into PowerShell (it generates secure secrets):
+
+```powershell
+$PGPASS = -join ((48..57+65..90+97..122)|Get-Random -Count 32|%{[char]$_})
+$JWT    = -join ((48..57+65..90+97..122)|Get-Random -Count 64|%{[char]$_})
+$ENCKEY = -join ((48..57+65..90+97..122)|Get-Random -Count 64|%{[char]$_})
+$VERIFY = -join ((48..57+65..90+97..122)|Get-Random -Count 32|%{[char]$_})
+@"
+NODE_ENV=production
+PORT=3011
+POSTGRES_PASSWORD=$PGPASS
+DATABASE_URL=postgresql://postgres:$PGPASS@forgecrm-db:5432/postgres
+POSTGRES_SSL=false
+REDIS_URL=redis://redis:6379
+JWT_SECRET=$JWT
+FORGECRM_ENCRYPTION_KEY=$ENCKEY
+CORS_ORIGIN=http://localhost
+META_API_VERSION=v21.0
+META_WEBHOOK_VERIFY_TOKEN=$VERIFY
+MEDIA_DIR=/app/media
+ADMIN_EMAIL=admin@forgechat.local
+ADMIN_PASSWORD=Admin@123456
+"@ | Out-File -FilePath "backend\.env" -Encoding utf8
+Write-Host "SAVE THIS verify token (needed for WhatsApp): $VERIFY"
+```
+
+**4. Build, create the database tables, and start** — in PowerShell:
+
+```powershell
+docker compose build
+docker compose up -d forgecrm-db redis
+Start-Sleep -Seconds 10
+# apply every migration in order
+Get-ChildItem "db\migrations\*.sql" | Sort-Object Name | ForEach-Object {
+  Get-Content $_.FullName | docker exec -i forgecrm-db psql -U postgres -d postgres
+}
+docker compose up -d forgecrm-backend forgecrm-frontend
+```
+
+Open **<http://localhost>** and log in with `admin@forgechat.local` / `Admin@123456`.
+
+**5. Make it reachable by WhatsApp (Cloudflare Tunnel)** — Meta needs a public URL to deliver messages. Cloudflare Tunnel gives you a free temporary HTTPS URL with **no sign-up**:
+
+```powershell
+# one-time: install cloudflared
+winget install --id Cloudflare.cloudflared
+
+# open a NEW PowerShell window and start the tunnel — keep this window open
+& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --url http://localhost:80
+```
+
+It prints a public address like `https://some-random-words.trycloudflare.com`. Then, in another PowerShell window:
+
+1. Point ForgeChat at that address (use your real URL) and restart the backend:
+   ```powershell
+   (Get-Content backend\.env) -replace 'CORS_ORIGIN=.*', 'CORS_ORIGIN=https://some-random-words.trycloudflare.com' | Set-Content backend\.env
+   docker compose restart forgecrm-backend
+   ```
+2. Follow **[Connect your WhatsApp](#-connect-your-whatsapp)** below, but use the Cloudflare address as the **Callback URL** (`https://some-random-words.trycloudflare.com/api/webhook/whatsapp`) with the verify token from step 3.
+
+> ℹ️ The quick-tunnel URL changes each time you restart cloudflared — update `CORS_ORIGIN` and the Meta webhook URL whenever it does, and don't close the cloudflared window while testing.
+
+### 🍎 macOS
+
+**1. Install the tools**
+
+- **Docker Desktop** — <https://www.docker.com/products/docker-desktop/> (pick the **Apple Silicon** or **Intel** build to match your Mac, open it, and wait for **"Engine running"**).
+- **Git** — already ships with macOS. The first `git` command may prompt you to install the developer tools — click **Install**, or run `xcode-select --install`.
+
+**2. Download ForgeChat** — open **Terminal** and run:
+
+```bash
+cd ~/Desktop
+git clone https://github.com/Forgemind-git/ForgeChat.git forgechat
+cd forgechat
+cp docker-compose.sample.yml docker-compose.yml
+```
+
+**3. Create your settings** — paste this whole block into Terminal (it generates secure secrets):
+
+```bash
+PGPASS=$(openssl rand -hex 24)
+JWT=$(openssl rand -hex 32)
+ENCKEY=$(openssl rand -hex 32)
+VERIFY=$(openssl rand -hex 16)
+
+cat > backend/.env <<EOF
+NODE_ENV=production
+PORT=3011
+POSTGRES_PASSWORD=${PGPASS}
+DATABASE_URL=postgresql://postgres:${PGPASS}@forgecrm-db:5432/postgres
+POSTGRES_SSL=false
+REDIS_URL=redis://redis:6379
+JWT_SECRET=${JWT}
+FORGECRM_ENCRYPTION_KEY=${ENCKEY}
+CORS_ORIGIN=http://localhost
+META_API_VERSION=v21.0
+META_WEBHOOK_VERIFY_TOKEN=${VERIFY}
+MEDIA_DIR=/app/media
+ADMIN_EMAIL=admin@forgechat.local
+ADMIN_PASSWORD=Admin@123456
+EOF
+
+echo "SAVE THIS verify token (needed for WhatsApp): ${VERIFY}"
+```
+
+**4. Build, create the database tables, and start** — in Terminal:
+
+```bash
+docker compose build
+docker compose up -d forgecrm-db redis
+until [ "$(docker inspect -f '{{.State.Health.Status}}' forgecrm-db)" = healthy ]; do
+  echo "waiting for database..."; sleep 2; done
+
+# create the schema + base table, then apply every migration in order
+docker compose exec -T forgecrm-db psql -U postgres -d postgres <<'SQL'
+CREATE SCHEMA IF NOT EXISTS coexistence;
+CREATE TABLE IF NOT EXISTS coexistence.forgecrm_users (
+  id BIGSERIAL PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL UNIQUE,
+  password TEXT NOT NULL,
+  display_name TEXT,
+  role TEXT NOT NULL DEFAULT 'viewer',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+SQL
+for f in $(ls db/migrations/*.sql | sort); do
+  docker compose exec -T forgecrm-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < "$f";
+done
+
+docker compose up -d forgecrm-backend forgecrm-frontend
+```
+
+Open **<http://localhost>** and log in with `admin@forgechat.local` / `Admin@123456`.
+
+**5. Make it reachable by WhatsApp (Cloudflare Tunnel)** — Meta needs a public URL to deliver messages. Cloudflare Tunnel gives you a free temporary HTTPS URL with **no sign-up**:
+
+```bash
+# install cloudflared (needs Homebrew — https://brew.sh)
+brew install cloudflared
+
+# start the tunnel — keep this Terminal window open
+cloudflared tunnel --url http://localhost:80
+```
+
+It prints a public address like `https://some-random-words.trycloudflare.com`. Then, in another Terminal tab:
+
+1. Point ForgeChat at that address (use your real URL) and restart the backend:
+   ```bash
+   sed -i '' 's|CORS_ORIGIN=.*|CORS_ORIGIN=https://some-random-words.trycloudflare.com|' backend/.env
+   docker compose restart forgecrm-backend
+   ```
+2. Follow **[Connect your WhatsApp](#-connect-your-whatsapp)** below, but use the Cloudflare address as the **Callback URL** (`https://some-random-words.trycloudflare.com/api/webhook/whatsapp`) with the verify token from step 3.
+
+> ℹ️ The quick-tunnel URL changes each time you restart cloudflared — update `CORS_ORIGIN` and the Meta webhook URL whenever it does, and keep the cloudflared window open while testing.
+
+---
+
 ## 🚀 Deploy it yourself (step by step)
 
+> 🌐 **This is the production path** — your own server and domain, online 24/7. Just want to try it first? Use the **[local option](#-run-it-on-your-computer-windows-or-mac)** above.
+>
 > 💡 **Prefer a click-by-click version with pictures?** Follow **[DEPLOY-DIGITALOCEAN.md](./DEPLOY-DIGITALOCEAN.md)** instead — it's the same process with more detail. The steps below are the short version.
 
 ### ✅ What you'll need first
@@ -235,88 +420,6 @@ docker compose up -d forgecrm-backend forgecrm-frontend caddy
 In your browser, go to **`https://chat.yourbusiness.com`** and log in with the email and password you set in Step 6.
 
 > The first time you visit, the secure padlock (HTTPS) is set up automatically. If you see a certificate warning, wait a minute and refresh — your domain's DNS may still be updating.
-
----
-
-## 🖥️ Run on your own PC instead (Windows — for testing)
-
-No server or domain yet? You can run ForgeChat on a **Windows PC** with Docker Desktop and expose it to WhatsApp using a free **Cloudflare Tunnel** (no account needed, and no antivirus headaches). Great for testing, development, and demos — for real 24/7 use, follow the server steps above.
-
-**1. Install the tools**
-
-- **Git for Windows** — <https://git-scm.com/download/win> (click *Next* through the installer).
-- **Docker Desktop** — <https://www.docker.com/products/docker-desktop/> (keep **WSL 2** ticked, restart your PC, then open Docker Desktop and wait for **"Engine running"**).
-
-**2. Download ForgeChat** — open **PowerShell** and run:
-
-```powershell
-cd $env:USERPROFILE\Desktop
-git clone https://github.com/Forgemind-git/ForgeChat.git forgechat
-cd forgechat
-copy docker-compose.sample.yml docker-compose.yml
-```
-
-**3. Create your settings** — paste this whole block into PowerShell (it generates secure secrets):
-
-```powershell
-$PGPASS = -join ((48..57+65..90+97..122)|Get-Random -Count 32|%{[char]$_})
-$JWT    = -join ((48..57+65..90+97..122)|Get-Random -Count 64|%{[char]$_})
-$ENCKEY = -join ((48..57+65..90+97..122)|Get-Random -Count 64|%{[char]$_})
-$VERIFY = -join ((48..57+65..90+97..122)|Get-Random -Count 32|%{[char]$_})
-@"
-NODE_ENV=production
-PORT=3011
-POSTGRES_PASSWORD=$PGPASS
-DATABASE_URL=postgresql://postgres:$PGPASS@forgecrm-db:5432/postgres
-POSTGRES_SSL=false
-REDIS_URL=redis://redis:6379
-JWT_SECRET=$JWT
-FORGECRM_ENCRYPTION_KEY=$ENCKEY
-CORS_ORIGIN=http://localhost
-META_API_VERSION=v21.0
-META_WEBHOOK_VERIFY_TOKEN=$VERIFY
-MEDIA_DIR=/app/media
-ADMIN_EMAIL=admin@forgechat.local
-ADMIN_PASSWORD=Admin@123456
-"@ | Out-File -FilePath "backend\.env" -Encoding utf8
-Write-Host "SAVE THIS verify token (needed for WhatsApp): $VERIFY"
-```
-
-**4. Build, create the database tables, and start** — in PowerShell:
-
-```powershell
-docker compose build
-docker compose up -d forgecrm-db redis
-Start-Sleep -Seconds 10
-# apply every migration in order
-Get-ChildItem "db\migrations\*.sql" | Sort-Object Name | ForEach-Object {
-  Get-Content $_.FullName | docker exec -i forgecrm-db psql -U postgres -d postgres
-}
-docker compose up -d forgecrm-backend forgecrm-frontend
-```
-
-Open **<http://localhost>** and log in with `admin@forgechat.local` / `Admin@123456`.
-
-**5. Make it reachable by WhatsApp (Cloudflare Tunnel)** — Meta needs a public URL to deliver messages. Cloudflare Tunnel gives you a free temporary HTTPS URL with **no sign-up**:
-
-```powershell
-# one-time: install cloudflared
-winget install --id Cloudflare.cloudflared
-
-# open a NEW PowerShell window and start the tunnel — keep this window open
-& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --url http://localhost:80
-```
-
-It prints a public address like `https://some-random-words.trycloudflare.com`. Then, in another PowerShell window:
-
-1. Point ForgeChat at that address (use your real URL) and restart the backend:
-   ```powershell
-   (Get-Content backend\.env) -replace 'CORS_ORIGIN=.*', 'CORS_ORIGIN=https://some-random-words.trycloudflare.com' | Set-Content backend\.env
-   docker compose restart forgecrm-backend
-   ```
-2. Follow **[Connect your WhatsApp](#-connect-your-whatsapp)** below, but use the Cloudflare address as the **Callback URL** (`https://some-random-words.trycloudflare.com/api/webhook/whatsapp`) with the verify token from step 3.
-
-> ℹ️ The quick-tunnel URL changes each time you restart cloudflared — update `CORS_ORIGIN` and the Meta webhook URL whenever it does, and don't close the cloudflared window while testing.
 
 ---
 
