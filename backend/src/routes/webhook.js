@@ -359,8 +359,9 @@ router.post('/webhook/whatsapp', async (req, res) => {
     res.status(200).json({ ok: true, stored: allRecords.length });
   } catch (err) {
     console.error('[webhook] Error:', err.message);
-    // Always return 200 to n8n so it doesn't retry infinitely
-    res.status(200).json({ ok: false, error: err.message });
+    // Always return 200 to n8n so it doesn't retry infinitely. Use a static
+    // message — err.message can carry internal Postgres/schema details.
+    res.status(200).json({ ok: false, error: 'Processing error' });
   }
 });
 

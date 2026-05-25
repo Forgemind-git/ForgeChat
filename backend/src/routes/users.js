@@ -55,21 +55,25 @@ function generatePassword(len = 12) {
   return out;
 }
 
+// Client-safe validation error: its message MAY be returned to the caller.
+// Unmarked errors are treated as internal and reported with a static message.
+function badRequest(msg) { const e = new Error(msg); e.expose = true; return e; }
+
 function validateRole(role) {
   if (!VALID_ROLES.includes(role)) {
-    throw new Error(`Role must be one of: ${VALID_ROLES.join(', ')}`);
+    throw badRequest(`Role must be one of: ${VALID_ROLES.join(', ')}`);
   }
 }
 
 function validatePermissions(perms) {
   if (perms == null) return null;
   if (typeof perms !== 'object' || Array.isArray(perms)) {
-    throw new Error('permissions must be an object with optional grant[] and revoke[] arrays');
+    throw badRequest('permissions must be an object with optional grant[] and revoke[] arrays');
   }
   const out = {};
   for (const k of ['grant', 'revoke']) {
     if (perms[k] == null) continue;
-    if (!Array.isArray(perms[k])) throw new Error(`permissions.${k} must be an array`);
+    if (!Array.isArray(perms[k])) throw badRequest(`permissions.${k} must be an array`);
     const cleaned = perms[k].map(p => String(p)).filter(p => PAGES.includes(p));
     if (cleaned.length) out[k] = cleaned;
   }
@@ -171,7 +175,9 @@ router.post('/users', adminOnly, async (req, res) => {
   } catch (err) {
     console.error('[users] create error:', err.message);
     if (err.code === '23505') return res.status(409).json({ error: 'Email or username already in use' });
-    res.status(400).json({ error: err.message || 'Failed to create user' });
+    // Only surface explicit validation messages; hide unexpected internal errors.
+    if (err.expose) return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: 'Failed to create user' });
   }
 });
 
@@ -267,7 +273,8 @@ router.patch('/users/:id', adminOnly, async (req, res) => {
   } catch (err) {
     console.error('[users] update error:', err.message);
     if (err.code === '23505') return res.status(409).json({ error: 'Email or username already in use' });
-    res.status(400).json({ error: err.message || 'Failed to update user' });
+    if (err.expose) return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: 'Failed to update user' });
   }
 });
 
