@@ -6,11 +6,17 @@
 const crypto = require('crypto');
 
 const RAW = process.env.FORGECRM_ENCRYPTION_KEY || process.env.JWT_SECRET || '';
-// In production, require a dedicated encryption key — don't silently fall back
-// to JWT_SECRET (or an empty key) for access tokens stored at rest.
-if (process.env.NODE_ENV === 'production' && !process.env.FORGECRM_ENCRYPTION_KEY) {
-  console.error('[crypto] FATAL: FORGECRM_ENCRYPTION_KEY must be set in production.');
-  process.exit(1);
+// In production, require a dedicated, strong encryption key — don't fall back to
+// JWT_SECRET/empty, and reject the placeholder shipped in .env.example or any
+// low-entropy value (the source is public; a known key means stored Meta tokens
+// can be decrypted by anyone).
+if (process.env.NODE_ENV === 'production') {
+  const k = process.env.FORGECRM_ENCRYPTION_KEY;
+  const WEAK = new Set(['change-this-to-another-random-string', 'change-this-to-a-random-string', 'forgecrm-dev-secret-change-me']);
+  if (!k || WEAK.has(k) || k.length < 32) {
+    console.error('[crypto] FATAL: FORGECRM_ENCRYPTION_KEY must be a strong, unique value (>= 32 chars) in production — not blank, a placeholder, or the example value.');
+    process.exit(1);
+  }
 }
 if (!RAW) {
   console.warn('[crypto] WARNING: neither FORGECRM_ENCRYPTION_KEY nor JWT_SECRET set — encryption will use empty key');
