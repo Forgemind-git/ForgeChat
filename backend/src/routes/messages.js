@@ -216,31 +216,44 @@ router.get('/numbers', async (req, res) => {
     const unreadMap = {};
     for (const r of unreadRes.rows) unreadMap[r.wa_number] = Number(r.unread_chats) || 0;
 
-    // Enrich with team member data and display name
-    const enriched = await Promise.all(rows.map(async (row) => {
+    // Enrich with display name + team-member data. Two bulk queries for the
+    // whole set instead of two per row (was an N+1: 2*N round-trips).
+    const waNumbers = rows.map(r => r.wa_number);
+    const nameMap = {};
+    const teamMap = {};
+    if (waNumbers.length > 0) {
+      const normWa = waNumbers.map(w => String(w).replace(/\D/g, ''));
       const [nameRes, teamRes] = await Promise.all([
+        // The "self" contact (contact_number == wa_number) carries the number's
+        // display name.
         pool.query(
-          'SELECT COALESCE(name, profile_name) AS name FROM coexistence.contacts WHERE wa_number = $1 AND contact_number = $1 LIMIT 1',
-          [row.wa_number]
+          `SELECT wa_number, COALESCE(name, profile_name) AS name
+             FROM coexistence.contacts
+            WHERE contact_number = wa_number AND wa_number = ANY($1::text[])`,
+          [waNumbers]
         ),
+        // Match team members by digits-only phone number (covers '+'/exact/raw).
         pool.query(
-          `SELECT name, profile_picture_url
-           FROM coexistence.team_members
-           WHERE phone_number = $1
-              OR phone_number = $2
-              OR REPLACE(REPLACE(REPLACE(phone_number, '+', ''), '-', ''), ' ', '') = $3
-           LIMIT 1`,
-          [row.wa_number, `+${row.wa_number}`, row.wa_number.replace(/\D/g, '')]
+          `SELECT name, profile_picture_url,
+                  regexp_replace(phone_number, '[^0-9]', '', 'g') AS norm
+             FROM coexistence.team_members
+            WHERE regexp_replace(phone_number, '[^0-9]', '', 'g') = ANY($1::text[])`,
+          [normWa]
         ),
       ]);
-      const teamMember = teamRes.rows[0];
+      for (const r of nameRes.rows) nameMap[r.wa_number] = r.name;
+      // Keep the first match per normalized number (preserves prior LIMIT 1 behaviour).
+      for (const r of teamRes.rows) if (!(r.norm in teamMap)) teamMap[r.norm] = r;
+    }
+    const enriched = rows.map((row) => {
+      const teamMember = teamMap[String(row.wa_number).replace(/\D/g, '')];
       return {
         ...row,
-        display_name: teamMember?.name || nameRes.rows[0]?.name || null,
+        display_name: teamMember?.name || nameMap[row.wa_number] || null,
         profile_picture_url: teamMember?.profile_picture_url || null,
         unread_chats: unreadMap[row.wa_number] || 0,
       };
-    }));
+    });
 
     res.json(enriched);
   } catch (err) {
