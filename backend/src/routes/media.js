@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const pool = require('../db');
 const { downloadOne, MEDIA_DIR } = require('../services/mediaDownloader');
+const { assertContactAccess } = require('../middleware/access');
 
 const router = Router();
 
@@ -19,13 +20,17 @@ router.get('/media/:messageId', async (req, res) => {
     const { messageId } = req.params;
     const { rows } = await pool.query(
       `SELECT message_id, message_type, media_storage_path, media_mime_type,
-              media_status, media_filename, message_body
+              media_status, media_filename, message_body, wa_number, contact_number
          FROM coexistence.chat_history
         WHERE message_id = $1`,
       [messageId]
     );
     const row = rows[0];
     if (!row) return res.status(404).json({ error: 'Message not found' });
+    // Per-conversation access: non-admins may only stream media from
+    // conversations they're assigned to (admins bypass). Prevents downloading
+    // any message's media by guessing a message_id (IDOR).
+    if (!(await assertContactAccess(req, res, row.wa_number, row.contact_number))) return;
     if (row.media_status !== 'stored' || !row.media_storage_path) {
       return res.status(404).json({ error: 'Media not available', status: row.media_status });
     }
@@ -74,6 +79,12 @@ router.get('/media/:messageId', async (req, res) => {
 // POST /api/media/:messageId/retry — re-attempt download
 router.post('/media/:messageId/retry', async (req, res) => {
   try {
+    const { rows } = await pool.query(
+      `SELECT wa_number, contact_number FROM coexistence.chat_history WHERE message_id = $1`,
+      [req.params.messageId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Message not found' });
+    if (!(await assertContactAccess(req, res, rows[0].wa_number, rows[0].contact_number))) return;
     const result = await downloadOne(req.params.messageId);
     res.json(result);
   } catch (err) {
