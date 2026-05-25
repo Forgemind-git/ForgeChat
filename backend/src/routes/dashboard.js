@@ -20,19 +20,54 @@ const router = Router();
 
 const RANGE_DAYS = { '7d': 7, '30d': 30, '90d': 90 };
 
-// Replace /*SCOPE*/ markers with the per-user visibility clause.
+// The tag category that defines a "lead" — drives the New Leads + Open
+// Conversations KPIs. Configurable so each deployment can point at its own
+// category name instead of being locked to the literal "Lead Source".
+const LEAD_SOURCE_CATEGORY = process.env.LEAD_SOURCE_CATEGORY || 'Lead Source';
+
+// Replace /*SCOPE*/ markers with the connected-account + per-user clauses.
 //   kind 'contacts' → filters on the contacts alias `c`
-//   kind 'chat'     → EXISTS against contacts for the chat_history alias `ch`
-function applyScope(sql, params, { admin, uid, kind }) {
-  if (admin) return { sql: sql.split('/*SCOPE*/').join(''), params };
-  const p = `$${params.length + 1}`;
-  const clause = kind === 'contacts'
-    ? ` AND c.assigned_user_id = ${p}`
-    : ` AND EXISTS (SELECT 1 FROM coexistence.contacts sc
-                     WHERE sc.wa_number = ch.wa_number
-                       AND sc.contact_number = ch.contact_number
-                       AND sc.assigned_user_id = ${p})`;
-  return { sql: sql.split('/*SCOPE*/').join(clause), params: [...params, uid] };
+//   kind 'chat'     → filters on the chat_history alias `ch` (and EXISTS
+//                      against contacts for the per-user check)
+// `wa` is the single connected WhatsApp number — this product handles exactly
+// one account, so every aggregate is restricted to it; without it the
+// dashboard would also count orphaned rows from a previously-connected number.
+function applyScope(sql, params, { admin, uid, kind, wa }) {
+  const out = [...params];
+  let clause = '';
+
+  // Connected-account filter (both roles). No account → show nothing.
+  if (wa) {
+    out.push(wa);
+    const wp = `$${out.length}`;
+    clause += kind === 'contacts' ? ` AND c.wa_number = ${wp}` : ` AND ch.wa_number = ${wp}`;
+  } else {
+    clause += ' AND FALSE';
+  }
+
+  // Per-user visibility (non-admins see only their assigned contacts).
+  if (!admin) {
+    out.push(uid);
+    const up = `$${out.length}`;
+    clause += kind === 'contacts'
+      ? ` AND c.assigned_user_id = ${up}`
+      : ` AND EXISTS (SELECT 1 FROM coexistence.contacts sc
+                       WHERE sc.wa_number = ch.wa_number
+                         AND sc.contact_number = ch.contact_number
+                         AND sc.assigned_user_id = ${up})`;
+  }
+
+  return { sql: sql.split('/*SCOPE*/').join(clause), params: out };
+}
+
+// Resolve the single connected WhatsApp number (digits only), or null.
+// Mirrors getSingleAccount()'s ordering in routes/whatsappAccounts.js.
+async function getConnectedWa() {
+  const { rows } = await pool.query(
+    `SELECT display_phone_number AS wa FROM coexistence.whatsapp_accounts
+      ORDER BY is_default DESC, id ASC LIMIT 1`
+  );
+  return (rows[0]?.wa || '').replace(/\D/g, '') || null;
 }
 
 // pct change vs previous period; null when there's no baseline to compare to.
@@ -47,10 +82,11 @@ router.get('/dashboard', async (req, res) => {
     const uid = req.user.id;
     const range = RANGE_DAYS[req.query.range] ? req.query.range : '7d';
     const days = RANGE_DAYS[range];
+    const connectedWa = await getConnectedWa();
 
-    // Helper: run a scoped query.
+    // Helper: run a scoped query (restricted to the connected account).
     const q = async (sql, params, kind) => {
-      const built = applyScope(sql, params, { admin, uid, kind });
+      const built = applyScope(sql, params, { admin, uid, kind, wa: connectedWa });
       const { rows } = await pool.query(built.sql, built.params);
       return rows;
     };
@@ -60,7 +96,7 @@ router.get('/dashboard', async (req, res) => {
     // Conversations cards.
     const { rows: lsRows } = await pool.query(
       `SELECT id FROM coexistence.categories WHERE LOWER(name) = LOWER($1) ORDER BY created_at LIMIT 1`,
-      ['Lead Source']
+      [LEAD_SOURCE_CATEGORY]
     );
     const leadSourceCatId = lsRows[0]?.id || null;
 
@@ -227,12 +263,12 @@ router.get('/dashboard', async (req, res) => {
       {
         key: 'newLeads', label: 'New Leads', value: leadRow.new_in_range, unit: '',
         delta: pct(leadRow.new_in_range, leadRow.prev_new), sub: `in last ${days}d`,
-        tooltip: 'New contacts tagged under the “Lead Source” category in the selected period.',
+        tooltip: `New contacts tagged under the “${LEAD_SOURCE_CATEGORY}” category in the selected period.`,
       },
       {
         key: 'open', label: 'Open Conversations', value: openRow.open_convos, unit: '',
         delta: null, sub: 'awaiting reply',
-        tooltip: 'Conversations awaiting a reply where the contact is tagged under the “Lead Source” category.',
+        tooltip: `Conversations awaiting a reply where the contact is tagged under the “${LEAD_SOURCE_CATEGORY}” category.`,
       },
       {
         key: 'sent', label: 'Messages Sent', value: msgRow.sent, unit: '',
@@ -357,14 +393,16 @@ router.get('/dashboard/details', async (req, res) => {
     const metric = String(req.query.metric || '');
     const LIMIT = 300;
 
+    const connectedWa = await getConnectedWa();
     const q = async (sql, params, kind) => {
-      const built = applyScope(sql, params, { admin, uid, kind });
+      const built = applyScope(sql, params, { admin, uid, kind, wa: connectedWa });
       const { rows } = await pool.query(built.sql, built.params);
       return rows;
     };
     const leadCat = async () => {
       const { rows } = await pool.query(
-        `SELECT id FROM coexistence.categories WHERE LOWER(name) = LOWER('Lead Source') ORDER BY created_at LIMIT 1`
+        `SELECT id FROM coexistence.categories WHERE LOWER(name) = LOWER($1) ORDER BY created_at LIMIT 1`,
+        [LEAD_SOURCE_CATEGORY]
       );
       return rows[0]?.id || null;
     };
@@ -404,7 +442,7 @@ router.get('/dashboard/details', async (req, res) => {
         break;
       }
       case 'open': {
-        title = 'Open conversations · Lead Source';
+        title = `Open conversations · ${LEAD_SOURCE_CATEGORY}`;
         const cat = await leadCat();
         if (cat) items = await q(
           `WITH last_in AS (
