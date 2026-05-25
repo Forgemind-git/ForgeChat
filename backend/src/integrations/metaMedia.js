@@ -3,12 +3,17 @@
 // then GET <url> with bearer token to fetch the bytes.
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v21.0';
-const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || '';
+// Legacy single-account fallback. The app is multi-account, so callers should
+// pass the per-account token (from whatsapp_accounts); we fall back to this env
+// var only when no token is supplied (keeps older single-account setups working).
+const ENV_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || '';
 
-function assertToken() {
-  if (!META_ACCESS_TOKEN) {
-    throw new Error('META_ACCESS_TOKEN not configured');
+function resolveToken(accessToken) {
+  const token = accessToken || ENV_ACCESS_TOKEN;
+  if (!token) {
+    throw new Error('No WhatsApp access token for media (account token missing and META_ACCESS_TOKEN unset)');
   }
+  return token;
 }
 
 /**
@@ -16,10 +21,10 @@ function assertToken() {
  * Returns { url, mime_type, sha256, file_size, id, messaging_product }
  * The `url` is short-lived (~5 min).
  */
-async function getMediaInfo(mediaId) {
-  assertToken();
+async function getMediaInfo(mediaId, accessToken) {
+  const token = resolveToken(accessToken);
   const res = await fetch(`https://graph.facebook.com/${META_API_VERSION}/${encodeURIComponent(mediaId)}`, {
-    headers: { Authorization: `Bearer ${META_ACCESS_TOKEN}` },
+    headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -37,8 +42,10 @@ async function getMediaInfo(mediaId) {
 // Meta media URLs only ever live on these CDN hosts. Restricting to them (plus
 // refusing redirects) prevents SSRF: a forged/redirected URL can't make the
 // server fetch internal addresses (169.254.169.254, 10.x, etc.) with the Bearer
-// token attached.
-const ALLOWED_MEDIA_HOST = /(^|\.)(fbcdn\.net|whatsapp\.net|facebook\.com)$/i;
+// token attached. Note: WhatsApp serves some media (audio/voice, stickers) from
+// lookaside.fbsbx.com, so fbsbx.com must be allowed too — omitting it silently
+// breaks those media types.
+const ALLOWED_MEDIA_HOST = /(^|\.)(fbcdn\.net|whatsapp\.net|facebook\.com|fbsbx\.com)$/i;
 const MAX_MEDIA_BYTES = 100 * 1024 * 1024; // 100 MB hard cap
 
 function assertAllowedMediaUrl(url) {
@@ -50,14 +57,14 @@ function assertAllowedMediaUrl(url) {
   }
 }
 
-async function downloadMediaBinary(url) {
-  assertToken();
+async function downloadMediaBinary(url, accessToken) {
+  const token = resolveToken(accessToken);
   assertAllowedMediaUrl(url);
   const res = await fetch(url, {
     redirect: 'error', // no open-redirect pivoting to internal hosts
     headers: {
-      Authorization: `Bearer ${META_ACCESS_TOKEN}`,
-      'User-Agent': 'ForgeChat/1.0 (+https://github.com/Forgemind-git/ForgeChat)',
+      Authorization: `Bearer ${token}`,
+      'User-Agent': 'ForgeChat/1.0 (+https://github.com/Forgemind-git/Forge-Chat)',
     },
   });
   if (!res.ok) {

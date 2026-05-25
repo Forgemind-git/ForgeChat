@@ -778,7 +778,8 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
     try {
       const data = {
         name, category, language, header_type: headerType, header_text: headerText || null,
-        media_handle: mediaHandle || null, body, footer: footer || null,
+        media_handle: mediaHandle || null, header_media_library_id: headerMediaLibraryId || null,
+        body, footer: footer || null,
         buttons, samples, security_recommendation: securityRec,
         code_expiry_minutes: codeExpiry ? parseInt(codeExpiry) : null,
         allow_category_change: allowCatChange,
@@ -829,7 +830,8 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
         name: template.name,
         category, language: translationLang,
         header_type: headerType, header_text: headerText || null,
-        media_handle: mediaHandle || null, body, footer: footer || null,
+        media_handle: mediaHandle || null, header_media_library_id: headerMediaLibraryId || null,
+        body, footer: footer || null,
         buttons, samples, security_recommendation: securityRec,
         code_expiry_minutes: codeExpiry ? parseInt(codeExpiry) : null,
         allow_category_change: allowCatChange,

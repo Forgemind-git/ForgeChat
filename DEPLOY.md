@@ -44,22 +44,29 @@ PORT=3011                        # Matches docker compose port mapping
 NODE_ENV=production
 
 # Database
-POSTGRES_PASSWORD=<strong-random-password>   # also used by the db container
-DATABASE_URL=postgresql://postgres:<same-password>@forgecrm-db:5432/postgres
+DATABASE_URL=postgresql://postgres:<password>@forgecrm-db:5432/postgres
 POSTGRES_SSL=false               # true if connecting over public network
 
-# Auth — names MUST match what the app reads (see backend/.env.example).
-# In production these must be >= 32 chars and not the example placeholders.
+# Auth
 JWT_SECRET=<random-64-char-hex>              # openssl rand -hex 32
 CORS_ORIGIN=https://crm.yourdomain.com
 
-# Encryption for stored Meta access tokens (AES-256-GCM) — DIFFERENT from JWT secret
-FORGECRM_ENCRYPTION_KEY=<random-64-char-hex>  # openssl rand -hex 32
+# The auth cookie is host-only (scoped to the domain the API is served from).
+# Serve the frontend and API on the same host (as the sample Caddy/nginx setup
+# does) and no cookie-domain config is needed.
 
-# Meta webhook (verify token = the string you configure in Meta's webhook UI;
-# app secret = Meta App → Settings → Basic, used to verify inbound signatures)
+# Encryption for stored Meta access tokens (AES-256-GCM)
+FORGECRM_ENCRYPTION_KEY=<random-64-char-hex>  # openssl rand -hex 32 — DIFFERENT from JWT secret
+
+# Admin seed — REQUIRED in production (first boot only, when the users table is empty)
+ADMIN_EMAIL=admin@yourdomain.com
+ADMIN_PASSWORD=<a-strong-password>
+
+# Postgres password — must match the password in DATABASE_URL above
+POSTGRES_PASSWORD=<same-as-in-DATABASE_URL>
+
+# Meta webhook verify token (whatever string you configure in Meta's webhook settings)
 META_WEBHOOK_VERIFY_TOKEN=<your-chosen-string>
-META_APP_SECRET=<meta-app-secret>
 META_API_VERSION=v21.0
 
 # Queues / Redis
@@ -125,7 +132,7 @@ docker compose up -d forgecrm-frontend    # nginx proxies to backend
 Verify each service:
 ```bash
 docker compose ps                                 # all five should be "Up"
-curl -fsS https://crm.<yourdomain>/health     # → {"ok":true}
+curl -fsS https://crm.<yourdomain>/api/health     # → {"ok":true,"ts":...}
 docker logs forgecrm-backend | tail               # should show "Backend running on port 3011"
                                                   # + "[mediaQueue] worker started, concurrency=2"
                                                   # + "[sendQueue] worker started, concurrency=5, rate=60/1000ms"

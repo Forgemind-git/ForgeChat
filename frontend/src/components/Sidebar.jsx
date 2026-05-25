@@ -54,7 +54,7 @@ export default function Sidebar({ activePage, onPageChange, collapsed, setCollap
                 transition: 'all .15s',
                 marginBottom: 2,
                 background: active ? C.primary : 'transparent',
-                color: active ? '#fff' : '#666',
+                color: active ? '#fff' : '#111',
                 justifyContent: collapsed ? 'center' : 'flex-start',
                 fontFamily: FONT,
                 fontSize: 13,
@@ -71,7 +71,7 @@ export default function Sidebar({ activePage, onPageChange, collapsed, setCollap
               }}
               onMouseLeave={e => {
                 e.currentTarget.style.background = active ? C.primary : 'transparent';
-                e.currentTarget.style.color = active ? '#fff' : '#666';
+                e.currentTarget.style.color = active ? '#fff' : '#111';
               }}
             >
               <span style={{

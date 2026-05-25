@@ -34,23 +34,22 @@ async function loadUserSession(userId) {
 }
 
 const JWT_SECRET = process.env.JWT_SECRET || 'forgecrm-dev-secret-change-me';
-// Known-weak / placeholder secrets that must never reach production. Includes the
-// code's own dev fallback and the placeholders shipped in backend/.env.example —
-// a self-hoster who copies the example unchanged must NOT pass this guard.
+// Values that must NEVER protect a production deployment: the dev fallback plus
+// the placeholders shipped in .env.example / DEPLOY.md. The source is public, so
+// anyone could forge tokens if a self-hoster left these in place.
 const WEAK_SECRETS = new Set([
   'forgecrm-dev-secret-change-me',
   'change-this-to-a-random-string',
   'change-this-to-another-random-string',
 ]);
-// In production, refuse to start with a missing, placeholder, or low-entropy
-// signing secret — otherwise auth tokens could be forged (the source is public).
-// Dev/test keep the convenient fallback.
-if (process.env.NODE_ENV === 'production') {
-  const s = process.env.JWT_SECRET;
-  if (!s || WEAK_SECRETS.has(s) || s.length < 32) {
-    console.error('[auth] FATAL: JWT_SECRET must be a strong, unique value (>= 32 chars) in production — not blank, a placeholder, or the example value.');
-    process.exit(1);
-  }
+// In production, refuse to start with a missing, well-known, or low-entropy
+// signing secret. Dev/test keep the convenient fallback.
+if (process.env.NODE_ENV === 'production' &&
+    (!process.env.JWT_SECRET ||
+     WEAK_SECRETS.has(process.env.JWT_SECRET) ||
+     process.env.JWT_SECRET.length < 32)) {
+  console.error('[auth] FATAL: JWT_SECRET must be a strong, unique value (>=32 chars) in production. Generate one with: openssl rand -hex 32');
+  process.exit(1);
 }
 const COOKIE_NAME = 'forgecrm_token';
 const TOKEN_EXPIRY = '24h';
@@ -80,6 +79,12 @@ async function ensureTables() {
     const { rows } = await client.query('SELECT COUNT(*) FROM coexistence.forgecrm_users');
     if (parseInt(rows[0].count, 10) === 0) {
       const adminEmail = process.env.ADMIN_EMAIL || 'admin@forgemind.space';
+      // In production never auto-generate: a random password printed/written at
+      // boot is easy to lose and risky to log. Require an explicit ADMIN_PASSWORD.
+      if (!process.env.ADMIN_PASSWORD && process.env.NODE_ENV === 'production') {
+        console.error('[auth] FATAL: set ADMIN_PASSWORD to seed the first admin in production.');
+        process.exit(1);
+      }
       const generated = !process.env.ADMIN_PASSWORD;
       const adminPassword = process.env.ADMIN_PASSWORD || crypto.randomBytes(12).toString('base64url');
       const hash = await bcrypt.hash(adminPassword, 10);
@@ -89,17 +94,14 @@ async function ensureTables() {
         [adminEmail, hash]
       );
       if (generated) {
-        // Do NOT print the password to stdout — container logs are often shipped
-        // to aggregators where the credential would persist. Write it to a
-        // 0600 file the operator reads once, then deletes.
+        // Never print the generated password to stdout — log aggregators would
+        // capture it permanently. Write it to a 0600 file for one-time pickup.
         const fs = require('fs');
-        const pwFile = process.env.ADMIN_PASSWORD_FILE || 'admin-initial-password.txt';
-        try {
-          fs.writeFileSync(pwFile, `email: ${adminEmail}\npassword: ${adminPassword}\n`, { mode: 0o600 });
-          console.log(`[auth] Created admin '${adminEmail}'. One-time generated password written to ${pwFile} (mode 0600). Log in, change it via Admin Settings, then delete that file. Set ADMIN_PASSWORD to skip generation.`);
-        } catch (e) {
-          console.log(`[auth] Created admin '${adminEmail}' with a generated password, but could not write ${pwFile} (${e.message}). Set ADMIN_PASSWORD and recreate to avoid this.`);
-        }
+        const path = require('path');
+        const credPath = path.join(process.cwd(), '.admin-password');
+        fs.writeFileSync(credPath, `email: ${adminEmail}\npassword: ${adminPassword}\n`, { mode: 0o600 });
+        console.log(`[auth] Created admin '${adminEmail}'. Generated password written to ${credPath} (chmod 600).`);
+        console.log('[auth] Read it, log in, change the password, then delete that file — or set ADMIN_PASSWORD before first boot.');
       } else {
         console.log(`[auth] Created admin '${adminEmail}' from ADMIN_PASSWORD.`);
       }

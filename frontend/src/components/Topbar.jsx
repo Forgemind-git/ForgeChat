@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Bell, LogOut, User, Settings, AlertTriangle, Star, Github } from 'lucide-react';
+import { Info, LogOut, User, Settings, AlertTriangle, Star, Github } from 'lucide-react';
 import { C, FONT } from '../constants.js';
 import { api } from '../api.js';
 
@@ -147,19 +147,22 @@ export default function Topbar({ user, onLogout, onNavigate }) {
           <span style={{ minWidth: 8, textAlign: 'left' }}>{stars == null ? '—' : stars}</span>
         </button>
 
-        {/* Bell */}
-        <button style={{
-          width: 36,
-          height: 36,
-          borderRadius: 9,
-          background: C.headerSurface,
-          border: `1.5px solid ${C.headerBorder}`,
-          cursor: 'pointer',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-        }}>
-          <Bell size={16} color={C.headerText} />
+        {/* About Us */}
+        <button
+          onClick={() => onNavigate('about')}
+          title="About Us"
+          style={{
+            width: 36,
+            height: 36,
+            borderRadius: 9,
+            background: C.headerSurface,
+            border: `1.5px solid ${C.headerBorder}`,
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}>
+          <Info size={16} color={C.headerText} />
         </button>
 
         {/* User avatar */}

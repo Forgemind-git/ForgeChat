@@ -74,6 +74,6 @@ WhatsApp Cloud API.
   interpolation).
 - `helmet` and a 600 req/min/user rate limiter on the API surface.
 
-[Unreleased]: https://github.com/Forgemind-git/ForgeChat/compare/v1.0.1...HEAD
-[1.0.1]: https://github.com/Forgemind-git/ForgeChat/compare/v1.0.0...v1.0.1
-[1.0.0]: https://github.com/Forgemind-git/ForgeChat/releases/tag/v1.0.0
+[Unreleased]: https://github.com/Forgemind-git/Forge-Chat/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/Forgemind-git/Forge-Chat/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/Forgemind-git/Forge-Chat/releases/tag/v1.0.0

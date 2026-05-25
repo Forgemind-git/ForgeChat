@@ -2,9 +2,7 @@
 # Terminates TLS for the subdomain and forwards everything to the frontend
 # container (nginx), which serves the SPA and proxies /api, /uploads, /l/ to the
 # backend. Requires: DNS A record for the domain -> droplet IP, ports 80+443 open.
-#
-# ⚠️ Replace forgechat.example.com with YOUR domain before deploying, e.g.:
-#     sed -i 's/forgechat.example.com/your.domain.com/' Caddyfile
+# Replace with your own domain (and point its DNS A record at this host).
 forgechat.example.com {
     reverse_proxy forgecrm-frontend:80
 }

@@ -128,7 +128,7 @@ export default function MediaLibraryPage() {
   };
 
   return (
-    <div style={{ padding: 24, fontFamily: FONT, color: C.text, maxWidth: 1400, margin: '0 auto' }}>
+    <div style={{ padding: 24, fontFamily: FONT, color: C.text, width: '100%' }}>
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 20, gap: 16, flexWrap: 'wrap' }}>
         <div>

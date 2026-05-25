@@ -17,6 +17,9 @@ build/
 **/.env
 !.env.example
 !**/.env.example
+# First-run generated admin credential (written by the backend on first boot)
+.admin-password
+**/.admin-password
 
 # Runtime data (mounted as docker volumes in prod)
 backend/uploads/

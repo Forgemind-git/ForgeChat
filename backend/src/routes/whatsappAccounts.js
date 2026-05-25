@@ -1,15 +1,18 @@
 const { Router } = require('express');
 const pool = require('../db');
 const { encrypt, decrypt, maskSecret } = require('../util/crypto');
-// Role-gated admin guard. WhatsApp-account management (and the decrypted-token
-// `?reveal=1` path) must be restricted to admins — the system DOES have roles
-// (admin / bda_sales / viewer; see permissions.js + migration 031), so a stub
-// that only checks `req.user` would let any logged-in user read a live Meta
-// access token. The read-only list / by-phone pickers stay open to all
-// authenticated users because they return masked metadata only (no token).
-const { adminOnly } = require('../middleware/access');
 
 const router = Router();
+
+// Single-owner system: roles were removed, so the JWT no longer carries a
+// `role`. Every authenticated request is the owner (the sole admin), so gate
+// these account-management routes on authentication only.
+function adminOnly(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
 
 /**
  * Look up a phone number's human-readable number + verified business name from
