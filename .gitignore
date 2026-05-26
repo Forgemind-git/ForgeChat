@@ -69,9 +69,12 @@ docker-compose.yml
 ForgeCRM_LLD.html
 *.pdf
 
-# Local Claude memory (machine-specific)
+# Local AI-assistant / IDE scratch state (machine-specific, never commit)
 .claude/
 .CLAUDE.md
+.cursor/
+.continue/
+.aider*
 
 # Backups
 *.dump
