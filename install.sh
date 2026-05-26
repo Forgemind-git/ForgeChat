@@ -69,6 +69,31 @@ if [ "$MODE" = server ]; then
   # sed -i.bak works on both GNU (Linux) and BSD (macOS) sed
   sed -i.bak "s/forgechat\.example\.com/$DOMAIN/g" Caddyfile && rm -f Caddyfile.bak
   ok "Caddyfile pointed at $DOMAIN"
+else
+  # Local mode never starts Caddy, so nothing maps host port 80 — the frontend's
+  # internal nginx (port 80) is unreachable from the host. Inject a "80:80"
+  # mapping on the forgecrm-frontend service so http://localhost works out of
+  # the box. Idempotent: only inject if forgecrm-frontend doesn't already have
+  # that port mapping inside its own block (the sample file has "80:80" under
+  # the unrelated caddy service, so a file-wide grep would false-positive).
+  has_port=$(awk '
+    /^  forgecrm-frontend:[[:space:]]*$/ { in_block=1; next }
+    /^  [a-z][a-z0-9_-]*:[[:space:]]*$/ { in_block=0 }
+    in_block && /^[[:space:]]+- "80:80"[[:space:]]*$/ { print "yes"; exit }
+  ' docker-compose.yml)
+  if [ "$has_port" != "yes" ]; then
+    awk '
+      /^  forgecrm-frontend:[[:space:]]*$/ && !done {
+        print
+        print "    ports:"
+        print "      - \"80:80\""
+        done = 1
+        next
+      }
+      { print }
+    ' docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
+    ok "Mapped frontend on host port 80 (local mode)"
+  fi
 fi
 
 # ── 4. Secrets → backend/.env (never overwrite) ─────────────────────────────

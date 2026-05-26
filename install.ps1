@@ -39,6 +39,32 @@ if (-not $ADMIN_PASSWORD) { $ADMIN_PASSWORD = 'Admin@123456' }
 # ── 2. docker-compose.yml ───────────────────────────────────────────────────
 if (-not (Test-Path docker-compose.yml)) { Copy-Item docker-compose.sample.yml docker-compose.yml }
 
+# Local mode never starts Caddy, so nothing maps host port 80 - the frontend's
+# internal nginx (port 80) is unreachable from the host. Inject a "80:80"
+# mapping on the forgecrm-frontend service so http://localhost works out of the
+# box. Idempotent: only inject if forgecrm-frontend doesn't already have that
+# port mapping inside its own block (the sample has "80:80" under caddy, so a
+# file-wide check would false-positive).
+$composeLines = Get-Content docker-compose.yml
+$inBlock = $false
+$hasPort = $false
+foreach ($line in $composeLines) {
+  if ($line -match '^  forgecrm-frontend:\s*$') { $inBlock = $true; continue }
+  if ($line -match '^  [a-z][a-z0-9_-]*:\s*$')   { $inBlock = $false }
+  if ($inBlock -and $line -match '^\s+- "80:80"\s*$') { $hasPort = $true; break }
+}
+if (-not $hasPort) {
+  $patched = foreach ($line in $composeLines) {
+    $line
+    if ($line -match '^  forgecrm-frontend:\s*$') {
+      '    ports:'
+      '      - "80:80"'
+    }
+  }
+  Set-Content -Path docker-compose.yml -Value $patched
+  OK "Mapped frontend on host port 80"
+}
+
 # ── 3. Secrets -> backend\.env (never overwrite) ────────────────────────────
 $VERIFY = $null
 if (Test-Path "backend\.env") {
