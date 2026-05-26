@@ -110,7 +110,7 @@ export default function LoginGate({ onLogin }) {
             lineHeight: 1.6,
             marginBottom: 40,
           }}>
-            The unified team inbox for the WhatsApp Business Platform. Automate replies, build chatbots, and nurture leads — all in one place.
+            Reply to WhatsApp chats, build templates, send broadcasts, and automate responses — all from one place for your team.
           </p>
 
         </div>
