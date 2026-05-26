@@ -122,6 +122,10 @@ It's safe to re-run — it never overwrites an existing `backend/.env`.
 
 <br/>
 
+▶ **Video walkthrough:** [ForgeChat installation for Windows](https://www.youtube.com/watch?v=9g73w14CpYA) *(in Tamil — change the Audio track to English for English)*
+
+
+
 **1. Install the tools**
 
 - **Git for Windows** — <https://git-scm.com/download/win> (click *Next* through the installer).
