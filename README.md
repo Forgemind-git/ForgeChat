@@ -13,7 +13,8 @@
   <a href="#-deploy-it-yourself">Deploy</a> •
   <a href="#-connect-your-whatsapp">Connect WhatsApp</a> •
   <a href="#-everyday-use">Use it</a> •
-  <a href="#-help--troubleshooting">Help</a>
+  <a href="#-help--troubleshooting">Help</a> •
+  <a href="#-community">Community</a>
 </p>
 
 <p align="center">
@@ -442,6 +443,16 @@ crontab -e
 | **Is my data safe?** | Yes — everything lives on *your* server. WhatsApp tokens are encrypted, and access is protected by login. Just keep your backups (above). |
 
 Still stuck? Open an issue on [GitHub](https://github.com/Forgemind-git/ForgeChat/issues) and we'll help.
+
+---
+
+## 💬 Community
+
+Got a question, want help, or want to share what you've built? Join our WhatsApp community:
+
+**🟢 [Join the ForgeChat WhatsApp community](https://chat.whatsapp.com/CKa8QSOWBF0EfRnp6EaliK)**
+
+Other self-hosters hang out there, you can get help with setup or Meta WhatsApp Cloud API issues, and you'll hear about new releases first.
 
 ---
 
