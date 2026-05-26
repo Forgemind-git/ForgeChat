@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  <video controls width="720" preload="metadata" src="https://github.com/Forgemind-git/ForgeChat/releases/download/v1.0.0/ForgeChat.overview.mp4" poster="https://img.youtube.com/vi/tvYR0cGOj_4/maxresdefault.jpg">
+  <video controls width="720" preload="metadata" src="https://raw.githubusercontent.com/Forgemind-git/ForgeChat/main/docs/forgechat-overview.mp4" poster="https://img.youtube.com/vi/tvYR0cGOj_4/maxresdefault.jpg">
     <a href="https://youtu.be/tvYR0cGOj_4">▶ Watch the 30-second ForgeChat overview on YouTube</a>
   </video>
 </p>
