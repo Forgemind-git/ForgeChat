@@ -26,13 +26,11 @@
 </p>
 
 <p align="center">
-  <video controls width="720" preload="metadata" src="https://raw.githubusercontent.com/Forgemind-git/ForgeChat/main/docs/forgechat-overview.mp4" poster="https://img.youtube.com/vi/tvYR0cGOj_4/maxresdefault.jpg">
-    <a href="https://youtu.be/tvYR0cGOj_4">▶ Watch the ForgeChat video tour on YouTube</a>
-  </video>
+  <a href="https://youtu.be/tvYR0cGOj_4"><img src="docs/forgechat-overview.gif" alt="ForgeChat video tour" width="720" /></a>
 </p>
 
 <p align="center">
-  <sub>▶ Video tour — <a href="https://youtu.be/tvYR0cGOj_4">also on YouTube</a> if the embed doesn't play.</sub>
+  <sub>▶ Video tour (above, no audio) — <a href="https://youtu.be/tvYR0cGOj_4">watch the full version on YouTube</a> with narration.</sub>
 </p>
 
 ---
