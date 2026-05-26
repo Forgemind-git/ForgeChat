@@ -844,8 +844,8 @@ function WhatsappAccountsTab() {
           border: `1px dashed ${C.border}`, borderRadius: 12, color: C.textMuted, fontSize: 13,
         }}>
           <MessageSquare size={36} style={{ opacity: 0.5, marginBottom: 12 }} />
-          <div style={{ marginBottom: 6, color: C.textSecondary, fontWeight: 600 }}>No WhatsApp account connected yet</div>
-          <div>Connect your one WhatsApp account to start creating templates and broadcasts.</div>
+          <div style={{ marginBottom: 6, color: C.textSecondary, fontWeight: 600 }}>No WhatsApp Business account connected yet</div>
+          <div>Connect your WhatsApp Business account to start creating templates and broadcasts.</div>
         </div>
       ) : (
         <div style={{ background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 10, overflow: 'hidden' }}>
@@ -917,7 +917,7 @@ function WhatsappAccountsTab() {
           <div onClick={e => e.stopPropagation()} style={{ background: 'var(--c-cardBg)', borderRadius: 14, width: 520, maxHeight: '90vh', overflow: 'auto', boxShadow: C.shadowLg, padding: 24 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
               <h3 style={{ fontSize: 18, fontWeight: 700, color: C.text, margin: 0 }}>
-                {editing ? 'Edit WhatsApp account' : 'New WhatsApp account'}
+                {editing ? 'Edit WhatsApp Business account' : 'Add WhatsApp Business account'}
               </h3>
               <button onClick={() => setShowForm(false)} style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: C.textMuted }}><X size={20} /></button>
             </div>
@@ -926,7 +926,7 @@ function WhatsappAccountsTab() {
               {/* API Credentials */}
               <div>
                 <h4 style={sectionTitleStyle}>API Credentials</h4>
-                <p style={sectionSubStyle}>Enter your Meta WhatsApp Business API credentials.</p>
+                <p style={sectionSubStyle}>Enter your WhatsApp Cloud API credentials (from Meta Business Suite).</p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                   <div>
                     <label style={labelStyle}>Phone Number ID</label>

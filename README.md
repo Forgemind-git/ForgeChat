@@ -31,7 +31,7 @@
 
 **ForgeChat** is a free WhatsApp Business inbox and CRM that **you host yourself**. Instead of paying a monthly fee to a SaaS company that keeps all your customer chats on *their* servers, you run ForgeChat on your own server — so **you own your data and your customer conversations**.
 
-It connects to the **official Meta WhatsApp Cloud API** (the real, approved WhatsApp Business system — not a risky unofficial hack), and gives your whole team a clean, WhatsApp-style screen to:
+It connects to the **WhatsApp Cloud API** (part of the **WhatsApp Business Platform**, hosted by Meta) — the documented, ToS-compliant way to send and receive WhatsApp business messages — and gives your whole team a clean, chat-style screen to:
 
 - 💬 **Reply to customers** from a shared team inbox
 - 🗂️ **Keep a customer database** with tags, notes, and custom fields
@@ -224,7 +224,7 @@ It prints a public address like `https://some-random-words.trycloudflare.com`. T
 | --- | --- | --- |
 | A **server** (a small cloud computer you rent) | ~$12 / month | Where ForgeChat runs, 24/7 |
 | A **domain name** (like `chat.yourbusiness.com`) | ~$10 / year | The web address you'll open in the browser |
-| A **Meta WhatsApp Business** account | Free | To send/receive real WhatsApp messages |
+| A **WhatsApp Business Account** (managed in Meta Business Suite) | Free | To send/receive real WhatsApp messages |
 | About **15–20 minutes** | — | To follow these steps |
 
 You'll be copy-pasting commands into your server. **You won't write any code.**
@@ -368,7 +368,7 @@ In your browser, go to **`https://chat.yourbusiness.com`** and log in with the e
 
 ## 📱 Connect your WhatsApp
 
-To send and receive real messages, link your Meta WhatsApp Business account (one-time setup):
+To send and receive real messages, link your **WhatsApp Business Account** (one-time setup):
 
 1. **Log in** to ForgeChat → click **Settings** → **WhatsApp Accounts** → **Add**.
 2. Paste your details from the [Meta Business dashboard](https://business.facebook.com/): **Display Phone Number**, **Phone Number ID**, **WABA ID**, **Meta App ID**, and a **Meta access token**. (ForgeChat stores the token encrypted.)
@@ -483,6 +483,8 @@ ForgeChat is [**fair-code**](https://faircode.io) distributed under the **[Susta
 - ❌ No reselling or paid hosting as a service without permission.
 
 Copyright © 2026 **Forgemind Techhub LLP**. **Forgemind AI** is a trademark of Forgemind Techhub LLP — see **[TRADEMARK.md](./TRADEMARK.md)**.
+
+> **WhatsApp** is a trademark of WhatsApp LLC. **Meta** is a trademark of Meta Platforms, Inc. ForgeChat is an independent application that connects to the WhatsApp Cloud API (hosted by Meta), and is **not** affiliated with, endorsed by, sponsored by, or otherwise officially connected to Meta Platforms, Inc. or WhatsApp LLC.
 
 ---
 

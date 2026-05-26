@@ -69,7 +69,7 @@ router.get('/whatsapp-accounts', async (req, res) => {
     res.json(rows.map(r => publicShape(r)));
   } catch (err) {
     console.error('[whatsapp-accounts] list error:', err.message);
-    res.status(500).json({ error: 'Failed to list WhatsApp accounts' });
+    res.status(500).json({ error: 'Failed to list WhatsApp Business accounts' });
   }
 });
 
@@ -77,7 +77,7 @@ router.get('/whatsapp-accounts', async (req, res) => {
 router.get('/whatsapp-accounts/by-phone/:phone', async (req, res) => {
   try {
     const acc = await getAccountByPhoneNumber(req.params.phone);
-    if (!acc) return res.status(404).json({ error: 'No WhatsApp account registered for this phone' });
+    if (!acc) return res.status(404).json({ error: 'No WhatsApp Business account registered for this phone' });
     res.json({
       id: acc.id,
       displayName: acc.displayName,
@@ -103,7 +103,7 @@ router.get('/whatsapp-accounts/:id', adminOnly, async (req, res) => {
     res.json(publicShape(rows[0], { reveal: req.query.reveal === '1' }));
   } catch (err) {
     console.error('[whatsapp-accounts] get error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch WhatsApp account' });
+    res.status(500).json({ error: 'Failed to fetch WhatsApp Business account' });
   }
 });
 
@@ -114,10 +114,10 @@ router.post('/whatsapp-accounts', adminOnly, async (req, res) => {
       return res.status(400).json({ error: 'Phone Number ID, WhatsApp Business Account ID and Permanent Access Token are required' });
     }
 
-    // Single-account system: refuse to register a second WhatsApp account.
+    // Single-account system: refuse to register a second WhatsApp Business account.
     const { rows: existing } = await pool.query('SELECT COUNT(*)::int AS n FROM coexistence.whatsapp_accounts');
     if (existing[0].n >= 1) {
-      return res.status(409).json({ error: 'Only one WhatsApp account is allowed. Edit the existing account instead.' });
+      return res.status(409).json({ error: 'Only one WhatsApp Business account is allowed. Edit the existing account instead.' });
     }
 
     // Best-effort: resolve the human-readable number + verified business name
@@ -160,7 +160,7 @@ router.post('/whatsapp-accounts', adminOnly, async (req, res) => {
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'This Phone Number ID is already connected' });
     console.error('[whatsapp-accounts] create error:', err.message);
-    res.status(500).json({ error: 'Failed to create WhatsApp account' });
+    res.status(500).json({ error: 'Failed to create WhatsApp Business account' });
   }
 });
 
@@ -230,7 +230,7 @@ router.put('/whatsapp-accounts/:id', adminOnly, async (req, res) => {
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'This Phone Number ID is already connected' });
     console.error('[whatsapp-accounts] update error:', err.message);
-    res.status(500).json({ error: 'Failed to update WhatsApp account' });
+    res.status(500).json({ error: 'Failed to update WhatsApp Business account' });
   }
 });
 
@@ -240,7 +240,7 @@ router.delete('/whatsapp-accounts/:id', adminOnly, async (req, res) => {
     // all sends. To switch numbers, edit the existing account instead.
     const { rows: cnt } = await pool.query('SELECT COUNT(*)::int AS n FROM coexistence.whatsapp_accounts');
     if (cnt[0].n <= 1) {
-      return res.status(409).json({ error: 'Cannot delete the only WhatsApp account. Edit it to change the connected number.' });
+      return res.status(409).json({ error: 'Cannot delete the only WhatsApp Business account. Edit it to change the connected number.' });
     }
     const { rowCount } = await pool.query(
       'DELETE FROM coexistence.whatsapp_accounts WHERE id = $1',
@@ -250,7 +250,7 @@ router.delete('/whatsapp-accounts/:id', adminOnly, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('[whatsapp-accounts] delete error:', err.message);
-    res.status(500).json({ error: 'Failed to delete WhatsApp account' });
+    res.status(500).json({ error: 'Failed to delete WhatsApp Business account' });
   }
 });
 

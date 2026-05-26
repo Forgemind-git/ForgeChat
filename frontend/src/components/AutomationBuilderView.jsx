@@ -3,12 +3,7 @@ import { api } from "../api.js";
 import AutomationExecutions from "./AutomationExecutions.jsx";
 import { maskPhone } from "../constants.js";
 
-/* ══════════════════════════════════════════════════════════════════════
-   WhatsFlow AI — Premium WhatsApp Automation Builder (UI Mockup)
-   Single-file React JSX. Inline styles + DM Sans / DM Mono.
-   Design system: warm off-white #F7F7F3, white cards, WhatsApp-inspired
-   enterprise green accent (#0F6E56 / #1D9E75).
-   ══════════════════════════════════════════════════════════════════════ */
+// Automation Builder — single-file React JSX (DM Sans + DM Mono, inline styles).
 
 const fmt = (n) => "₹" + Number(n).toLocaleString("en-IN");
 
@@ -1346,7 +1341,7 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
         <div style={{ background:"#FFF8E1", border:`1px solid #FFE082`, borderRadius:10, padding:"10px 12px", marginBottom:14, display:"flex", alignItems:"flex-start", gap:9 }}>
           <span style={{ color:"#7A5C00", flexShrink:0, paddingTop:1 }}>{IC.warn(15)}</span>
           <div style={{ flex:1, fontSize:11, color:"#7A5C00", lineHeight:1.5 }}>
-            <strong>Direct messages</strong> are sent via the WhatsApp Business API without a template. They only work within the 24-hour conversation window. Outside that window, the message will fail.
+            <strong>Direct messages</strong> are sent via the WhatsApp Cloud API without a template. They only work within the 24-hour conversation window. Outside that window, the message will fail.
           </div>
         </div>
 

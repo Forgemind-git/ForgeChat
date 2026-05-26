@@ -7,10 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Brand-language pass for Meta / WhatsApp guidelines:** dropped "official … /
+  unofficial hack" framing in README, reworded the login splash to no longer
+  read as if ForgeChat *is* the WhatsApp Business Platform, switched API/account
+  naming to the documented "WhatsApp Cloud API" and "WhatsApp Business Account",
+  added a third-party trademarks section to `TRADEMARK.md`, and added an
+  affiliation disclaimer to the README footer.
+
 ## [1.0.0] - 2026-05-25
 
-Initial public release of ForgeChat — a full-stack WhatsApp CRM built on the
-Meta WhatsApp Cloud API.
+Initial public release of ForgeChat — a full-stack CRM and shared inbox for
+the WhatsApp Business Platform, built on the WhatsApp Cloud API (hosted by
+Meta).
 
 ### Added
 - **Chats** — 3-pane WhatsApp-style inbox with per-BDA filtering, media

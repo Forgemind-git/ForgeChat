@@ -75,6 +75,29 @@ right to use the **Forgemind AI** trademark, and nothing in this document
 grants any license to the source code. Trademark rights are **not** licensed
 merely because the code is shared, viewed, or forked.
 
+## Third-Party Trademarks
+
+ForgeChat is built to work with the **WhatsApp Business Platform** (Cloud API),
+and references the names and products of Meta Platforms, Inc. and its
+subsidiaries throughout this repository, its documentation, and its UI for
+purely descriptive, nominative purposes.
+
+- **WhatsApp**, the WhatsApp logo, **WhatsApp Business**, and **WhatsApp
+  Business Platform** are trademarks of WhatsApp LLC.
+- **Meta**, the Meta logo, **Meta Business Suite**, **Facebook**, and
+  **Instagram** are trademarks of Meta Platforms, Inc.
+
+ForgeChat is an **independent** application. ForgeChat (and Forgemind Techhub
+LLP) is **not** affiliated with, endorsed by, sponsored by, certified by, or
+otherwise officially connected to Meta Platforms, Inc., WhatsApp LLC, or any
+of their subsidiaries. Any references to these names are for the sole purpose
+of identifying the underlying service that ForgeChat integrates with, in
+accordance with the relevant brand guidelines.
+
+All other product names, logos, and brands are the property of their
+respective owners. Use of these names, logos, and brands does not imply
+endorsement.
+
 ## Changes
 
 Forgemind Techhub LLP may update this policy at any time. The version in the
