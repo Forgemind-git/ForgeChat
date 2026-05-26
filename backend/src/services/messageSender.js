@@ -32,8 +32,8 @@ async function resolveAccount({ accountId, fromPhoneNumber }) {
     // Single-account product: if matching by id/phone found nothing (e.g. the
     // display number isn't resolved from Meta yet), fall back to the lone account.
     if (!acc) acc = await getSingleAccount();
-    if (!acc) return { error: `No WhatsApp account registered for ${fromPhoneNumber || `id=${accountId}`}` };
-    if (!acc.isActive) return { error: `WhatsApp account "${acc.displayName}" is inactive` };
+    if (!acc) return { error: `No WhatsApp Business account registered for ${fromPhoneNumber || `id=${accountId}`}` };
+    if (!acc.isActive) return { error: `WhatsApp Business account "${acc.displayName}" is inactive` };
     if (!acc.accessToken) return { error: 'Access token missing (re-enter in Settings)' };
     return { account: acc };
   } catch (err) {

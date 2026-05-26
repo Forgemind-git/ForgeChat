@@ -510,7 +510,7 @@ function TemplateList({ templates, loading, onAdd, onEdit, onDelete, onView, onB
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, color: B.t1, margin: 0, letterSpacing: '-.02em' }}>Message Templates</h1>
-          <p style={{ fontSize: 12, color: B.t5, margin: '4px 0 0' }}>Create and manage WhatsApp Business API message templates.</p>
+          <p style={{ fontSize: 12, color: B.t5, margin: '4px 0 0' }}>Create and manage WhatsApp message templates.</p>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <button
