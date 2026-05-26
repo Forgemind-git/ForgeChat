@@ -1901,7 +1901,7 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
         icon: IC.qr, color: "#6A3FAF", bg: "#E8E0F8", border: "#B5A4DD",
         source: "wa", sourceLabel: "WhatsApp inbound message webhook",
         title: "QR code scan",
-        body: "Technically identical to a click-to-chat link — the QR encodes a wa.me URL with a pre-filled message that identifies the scan source. WhatsApp doesn't know it came from a QR; the BSP attributes it via the pre-filled text."
+        body: "Technically identical to a click-to-chat link — the QR encodes a wa.me URL with a pre-filled message that identifies the scan source. WhatsApp doesn't know it came from a QR; ForgeChat attributes it via the pre-filled text."
       },
       newContact: {
         icon: IC.user, color: C.purpleDark, bg: C.purpleBg, border: "#C7C2F4",
