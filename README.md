@@ -471,7 +471,7 @@ ForgeChat is [**fair-code**](https://faircode.io) distributed under the **[Susta
 - ✅ Share it free of charge for non-commercial purposes.
 - ❌ No reselling or paid hosting as a service without permission.
 
-Copyright © 2025 **Forgemind Techhub LLP**. "Forgemind AI" is trademarks of Forgemind — see **[TRADEMARK.md](./TRADEMARK.md)**.
+Copyright © 2026 **Forgemind Techhub LLP**. **Forgemind AI** is a trademark of Forgemind Techhub LLP — see **[TRADEMARK.md](./TRADEMARK.md)**.
 
 ---
 
