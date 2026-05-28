@@ -151,6 +151,32 @@ export const api = {
     update: (id, data) => req(`/whatsapp-accounts/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
     delete: (id) => req(`/whatsapp-accounts/${id}`, { method: 'DELETE' }),
   },
+  // Google integrations (v1: Google Sheets only; Gmail + Calendar in a later
+  // release reuse the same /google-integrations table and OAuth flow).
+  googleIntegrations: {
+    status: () => req('/google-integrations/status'),
+    list: () => req('/google-integrations'),
+    authorize: () => req('/google-integrations/authorize', { method: 'POST' }),
+    disconnect: (id) => req(`/google-integrations/${id}`, { method: 'DELETE' }),
+    listSpreadsheets: (id, q = '') =>
+      req(`/google-integrations/${id}/spreadsheets${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+    listTabs: (id, spreadsheetId) =>
+      req(`/google-integrations/${id}/spreadsheets/${encodeURIComponent(spreadsheetId)}/tabs`),
+  },
+  // AI Agents — standalone LLM-driven chat handlers bound to a WhatsApp account.
+  agents: {
+    list: () => req('/agents'),
+    get: (id, reveal = false) => req(`/agents/${id}${reveal ? '?reveal=1' : ''}`),
+    create: (data) => req('/agents', { method: 'POST', body: JSON.stringify(data) }),
+    update: (id, data) => req(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+    delete: (id) => req(`/agents/${id}`, { method: 'DELETE' }),
+    runs: (id, limit = 50) => req(`/agents/${id}/runs?limit=${limit}`),
+    run: (id, runId) => req(`/agents/${id}/runs/${runId}`),
+    addTool: (id, data) => req(`/agents/${id}/tools`, { method: 'POST', body: JSON.stringify(data) }),
+    updateTool: (id, toolId, data) =>
+      req(`/agents/${id}/tools/${toolId}`, { method: 'PUT', body: JSON.stringify(data) }),
+    removeTool: (id, toolId) => req(`/agents/${id}/tools/${toolId}`, { method: 'DELETE' }),
+  },
   pipelines: {
     list: () => req('/pipelines'),
     create: (name) => req('/pipelines', { method: 'POST', body: JSON.stringify({ name }) }),

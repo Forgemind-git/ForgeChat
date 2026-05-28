@@ -20,10 +20,16 @@ const { router: mediaRouter } = require('./routes/media');
 const { router: mediaLibraryRouter } = require('./routes/mediaLibrary');
 const mediaStorage = require('./util/pgStorage');
 const { router: whatsappAccountsRouter } = require('./routes/whatsappAccounts');
+const {
+  router: googleIntegrationsRouter,
+  publicRouter: googleIntegrationsPublicRouter,
+} = require('./routes/googleIntegrations');
+const { router: agentsRouter } = require('./routes/agents');
 const { router: dashboardRouter } = require('./routes/dashboard');
 const { router: pipelinesRouter } = require('./routes/pipelines');
 const { startWorker: startMediaWorker, shutdown: shutdownMediaQueue } = require('./queue/mediaQueue');
 const { startSendWorker, shutdownSendQueue } = require('./queue/sendQueue');
+const { startAgentWorker, shutdownAgentQueue } = require('./queue/agentQueue');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -99,6 +105,11 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 
 // Public routes (webhook from n8n — no auth)
 app.use('/api', webhookRouter);
+// Google OAuth callback is public: Google redirects the user's browser back
+// here, and we re-derive the user from the signed `state` param (see
+// routes/googleIntegrations.js). Everything else under /google-integrations is
+// auth-required and mounted further down.
+app.use('/api', googleIntegrationsPublicRouter);
 
 // Auth routes (public)
 app.use('/api', authRouter);
@@ -115,6 +126,8 @@ app.use('/api', authMiddleware, chatbotsRouter);
 app.use('/api', authMiddleware, mediaRouter);
 app.use('/api', authMiddleware, mediaLibraryRouter);
 app.use('/api', authMiddleware, whatsappAccountsRouter);
+app.use('/api', authMiddleware, googleIntegrationsRouter);
+app.use('/api', authMiddleware, agentsRouter);
 app.use('/api', authMiddleware, dashboardRouter);
 app.use('/api', authMiddleware, pipelinesRouter);
 
@@ -134,6 +147,7 @@ async function start() {
   );
   startMediaWorker();
   startSendWorker();
+  startAgentWorker();
 
   // Stale-pause sweeper: mark paused automation executions that have outlived
   // their expires_at as error. Resume already inline-checks expires_at, so
@@ -200,6 +214,7 @@ async function start() {
     server.close(() => {});
     await shutdownMediaQueue();
     await shutdownSendQueue();
+    await shutdownAgentQueue();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));

@@ -1,12 +1,13 @@
 import {
   Home, Zap, LayoutTemplate, MessageCircle, Users,
-  Megaphone, Image as ImageIcon, Info, KanbanSquare,
+  Megaphone, Image as ImageIcon, Info, KanbanSquare, Bot,
 } from 'lucide-react';
 import { C, FONT } from '../constants.js';
 
 const NAV_ITEMS = [
   { id: 'home', label: 'Home', Icon: Home },
   { id: 'chatbot-builder', label: 'Automations', Icon: Zap },
+  { id: 'ai-agent-builder', label: 'AI Agents', Icon: Bot },
   { id: 'template-builder', label: 'Template Builder', Icon: LayoutTemplate },
   { id: 'media-library', label: 'Media', Icon: ImageIcon },
   { id: 'chats', label: 'Chats', Icon: MessageCircle },
