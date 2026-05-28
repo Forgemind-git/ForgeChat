@@ -61,9 +61,16 @@ function publicShape(row) {
   };
 }
 
-/** Lightweight probe so the UI can show a helpful message when OAuth isn't set up. */
+/** Lightweight probe so the UI can show a helpful message when OAuth isn't
+ *  set up — AND so users can see the exact redirect URI they must authorize
+ *  in Google Cloud Console (mismatches here are the #1 cause of failed
+ *  consent redirects). The URI is returned even when `configured=false` so
+ *  an admin can copy it before they've finished filling in the server env. */
 router.get('/google-integrations/status', (req, res) => {
-  res.json({ configured: isConfigured() });
+  res.json({
+    configured: isConfigured(),
+    redirectUri: process.env.GOOGLE_OAUTH_REDIRECT_URI || '',
+  });
 });
 
 router.get('/google-integrations', async (req, res) => {

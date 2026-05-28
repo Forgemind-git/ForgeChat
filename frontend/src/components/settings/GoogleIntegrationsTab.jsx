@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Plug, Trash2, RefreshCw, ExternalLink, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Plug, Trash2, RefreshCw, ExternalLink, CheckCircle2, AlertCircle, Check } from 'lucide-react';
 import { api } from '../../api.js';
 import { C, FONT, MONO } from '../../constants.js';
 import DeleteConfirmModal from '../DeleteConfirmModal.jsx';
@@ -18,6 +18,7 @@ import DeleteConfirmModal from '../DeleteConfirmModal.jsx';
  */
 export default function GoogleIntegrationsTab() {
   const [configured, setConfigured] = useState(null);
+  const [redirectUri, setRedirectUri] = useState('');
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -31,6 +32,7 @@ export default function GoogleIntegrationsTab() {
     try {
       const status = await api.googleIntegrations.status();
       setConfigured(!!status.configured);
+      setRedirectUri(status.redirectUri || '');
       if (status.configured) {
         const rows = await api.googleIntegrations.list();
         setAccounts(rows);
@@ -120,6 +122,8 @@ export default function GoogleIntegrationsTab() {
           </div>
         )}
 
+        {redirectUri && <RedirectUriCard redirectUri={redirectUri} />}
+
         {configured === false && <NotConfiguredCard />}
 
         {configured === true && (
@@ -176,6 +180,67 @@ function Header({ onRefresh, loading }) {
       >
         <RefreshCw size={13} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} /> Refresh
       </button>
+    </div>
+  );
+}
+
+/**
+ * Always-visible reference card showing the exact callback URL that needs to
+ * be authorized in Google Cloud Console. Mismatches between this string and
+ * what's listed under the OAuth Client's "Authorized redirect URIs" are the
+ * single most common reason "Connect Google" fails with redirect_uri_mismatch
+ * — surfacing it here (with a copy button) removes the guesswork.
+ */
+function RedirectUriCard({ redirectUri }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(redirectUri);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {/* clipboard blocked — fall through silently */}
+  };
+  return (
+    <div style={{
+      padding: 14, borderRadius: 10, marginBottom: 16,
+      background: 'var(--c-surfaceAlt)', border: `1px solid ${C.border}`,
+      fontFamily: FONT,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+        <strong style={{ fontSize: 12, color: C.text, letterSpacing: '-.01em' }}>
+          Authorized redirect URI
+        </strong>
+        <span style={{ fontSize: 11, color: C.textMuted }}>
+          — add this to your Google Cloud OAuth Client
+        </span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <code style={{
+          flex: 1, padding: '8px 10px', borderRadius: 6,
+          background: C.cardBg, border: `1px solid ${C.border}`,
+          fontFamily: MONO, fontSize: 12, color: C.text,
+          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+          userSelect: 'all',
+        }}>
+          {redirectUri}
+        </code>
+        <button onClick={handleCopy}
+          style={{
+            padding: '8px 12px', borderRadius: 8,
+            border: `1px solid ${C.border}`, background: C.cardBg,
+            color: copied ? '#065F46' : C.text,
+            fontSize: 12, fontFamily: FONT, fontWeight: 600,
+            cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
+          }}>
+          {copied ? <><Check size={12} style={{ verticalAlign: 'middle' }} /> Copied</> : 'Copy'}
+        </button>
+      </div>
+      <div style={{ fontSize: 11, color: C.textSecondary, marginTop: 8, lineHeight: 1.45 }}>
+        Paste this <strong>exactly</strong> (including <code style={{ fontFamily: MONO }}>https://</code>) into
+        Google Cloud Console → APIs &amp; Services → Credentials → your OAuth 2.0 Client →
+        <strong> Authorized redirect URIs</strong>, then click Save. Without this, Google
+        returns <code style={{ fontFamily: MONO }}>redirect_uri_mismatch</code> on consent.
+      </div>
     </div>
   );
 }
