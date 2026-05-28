@@ -3,11 +3,12 @@ import {
   Settings, Tag, FolderOpen,
   LogOut, Trash2, FormInput, Users as UsersIcon, Shield, Copy,
   ArrowLeft, Plus, X, ChevronLeft, Eye, EyeOff, Phone, User,
-  Loader2, MessageSquare, Key, Check,
+  Loader2, MessageSquare, Key, Check, Globe,
 } from 'lucide-react';
 import { api } from '../api.js';
 import { C, FONT, MONO, maskPhone } from '../constants.js';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
+import GoogleIntegrationsTab from '../components/settings/GoogleIntegrationsTab.jsx';
 import { useTableSelection, SelectAllCheckbox, RowCheckbox, BulkDeleteButton, runBulkDelete } from '../components/TableSelection.jsx';
 
 const TABS = [
@@ -16,6 +17,7 @@ const TABS = [
   { key: 'category', label: 'Category', icon: FolderOpen },
   { key: 'fields', label: 'Fields', icon: FormInput },
   { key: 'whatsapp-accounts', label: 'WhatsApp Accounts', icon: MessageSquare },
+  { key: 'google-integrations', label: 'Google Integrations', icon: Globe },
   { key: 'users', label: 'Users', icon: UsersIcon },
 ];
 
@@ -1477,7 +1479,7 @@ const iconBtnStyle = { background: 'transparent', border: 'none', cursor: 'point
 /*  Main Page                                                          */
 /* ------------------------------------------------------------------ */
 export default function AdminSettingsPage({ onLogout, onNavigate, subParts = [], navigate, user }) {
-  const VALID_TABS = ['general', 'tags', 'category', 'fields', 'whatsapp-accounts', 'users'];
+  const VALID_TABS = ['general', 'tags', 'category', 'fields', 'whatsapp-accounts', 'google-integrations', 'users'];
   // Admins see every tab; other roles see only tabs granted by their pages
   // (e.g. Sales users get General only).
   const visibleTabs = (user?.role === 'admin' || !Array.isArray(user?.pages))
@@ -1556,6 +1558,7 @@ export default function AdminSettingsPage({ onLogout, onNavigate, subParts = [],
       );
       case 'fields': return <FieldsTab fields={fields} onRefresh={refresh} />;
       case 'whatsapp-accounts': return <WhatsappAccountsTab />;
+      case 'google-integrations': return <GoogleIntegrationsTab />;
       case 'users': return <UsersTab currentUser={user} />;
       default: return <GeneralTab onLogout={onLogout} user={user} />;
     }

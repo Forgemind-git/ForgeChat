@@ -3,6 +3,7 @@ const pool = require('../db');
 const { decrypt } = require('../util/crypto');
 const { safeEqual, verifyMetaSignature } = require('../util/webhookSignature');
 const { evaluateTriggers, resumeAutomation } = require('../engine/automationEngine');
+const agentRouter = require('../services/agentRouter');
 const { markPending, MEDIA_TYPES } = require('../services/mediaDownloader');
 const { enqueueMediaDownload } = require('../queue/mediaQueue');
 
@@ -328,7 +329,18 @@ router.post('/webhook/whatsapp', async (req, res) => {
             }
             continue; // do not also fire fresh triggers
           }
-          await evaluateTriggers(record);
+          const fired = await evaluateTriggers(record);
+          // Agent fall-through: if no keyword automation matched, hand the
+          // message to the agent bound to this WhatsApp account (if any active
+          // agent exists). evaluateTriggers returns the array of executions
+          // it created; an empty array means nothing fired.
+          if (!fired || fired.length === 0) {
+            try {
+              await agentRouter.routeIfActive(record);
+            } catch (agentErr) {
+              console.error('[webhook] Agent routing error:', agentErr.message);
+            }
+          }
         } catch (triggerErr) {
           console.error('[webhook] Trigger evaluation error:', triggerErr.message);
         }
