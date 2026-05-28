@@ -343,17 +343,13 @@ function AccountsList({ accounts, loading, onDelete }) {
             border: `1px solid ${C.border}`, fontFamily: FONT,
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, minWidth: 0, flex: 1 }}>
             <HealthDot status={a.healthStatus} />
-            <div style={{ minWidth: 0 }}>
+            <div style={{ minWidth: 0, flex: 1 }}>
               <div style={{ fontSize: 14, fontWeight: 600, color: C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                 {a.accountLabel}
               </div>
-              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2, fontFamily: MONO }}>
-                {a.scopes && a.scopes.length > 0
-                  ? a.scopes.filter(s => s.includes('googleapis.com')).map(s => s.split('/').pop()).join(' · ')
-                  : 'no scopes'}
-              </div>
+              <ScopeChips scopes={a.scopes} />
               {a.healthStatus === 'error' && a.lastErrorMessage && (
                 <div style={{ fontSize: 11, color: '#A32D2D', marginTop: 4 }}>
                   {a.lastErrorMessage}
@@ -378,6 +374,54 @@ function AccountsList({ accounts, loading, onDelete }) {
       ))}
     </div>
   );
+}
+
+/**
+ * Renders every granted scope as a small chip with a friendly label and a
+ * tooltip showing the full URL. The previous version filtered to scopes
+ * containing "googleapis.com" and only displayed the last path segment, which
+ * (a) silently dropped openid/email/profile and (b) collapsed similar names
+ * (e.g. "drive.file" became "drive.file" — fine — but "spreadsheets" gave no
+ * hint that it includes write access). Showing them all explicitly is the
+ * least surprising for an admin auditing what was actually granted.
+ */
+function ScopeChips({ scopes }) {
+  const list = Array.isArray(scopes) ? scopes : [];
+  if (list.length === 0) {
+    return <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2, fontFamily: MONO }}>no scopes granted</div>;
+  }
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+      {list.map(s => {
+        const label = friendlyScopeLabel(s);
+        return (
+          <span
+            key={s}
+            title={s}
+            style={{
+              fontSize: 10, fontWeight: 600,
+              padding: '3px 8px', borderRadius: 999,
+              background: 'var(--c-surfaceAlt)',
+              border: `1px solid ${C.border}`,
+              color: C.textSecondary,
+              fontFamily: MONO, letterSpacing: '-.005em',
+            }}
+          >
+            {label}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function friendlyScopeLabel(s) {
+  if (s === 'openid') return 'openid';
+  if (s === 'email') return 'email';
+  if (s === 'profile') return 'profile';
+  const m = s.match(/^https?:\/\/www\.googleapis\.com\/auth\/(.+)$/);
+  if (m) return m[1];
+  return s;
 }
 
 function HealthDot({ status }) {

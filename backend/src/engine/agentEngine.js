@@ -9,6 +9,7 @@ const { decrypt } = require('../util/crypto');
 const { getProvider } = require('../llm');
 const googleSheets = require('../services/googleSheets');
 const { enqueueSend } = require('../queue/sendQueue');
+const { insertPendingRow } = require('../services/messageSender');
 const { getAccountWithToken } = require('../routes/whatsappAccounts');
 
 /**
@@ -252,10 +253,30 @@ async function runAgent({ agentId, contactNumber, inboundMessageId, inboundText 
     );
 
     if (result.finalText) {
+      // Insert an optimistic chat_history row FIRST so the agent's reply shows
+      // up in the Chats UI immediately (status='sending'), then the existing
+      // sendQueue worker swaps the local id for Meta's wamid on success
+      // (markSent) or marks it failed (markFailed). Without this row, the
+      // message is delivered to WhatsApp but never appears in our own UI.
+      const account = await getAccountWithToken(agent.wa_account_id);
+      let localMessageId = null;
+      if (account && account.displayPhoneNumber) {
+        try {
+          localMessageId = await insertPendingRow({
+            account,
+            toNumber: contactNumber,
+            messageType: 'text',
+            messageBody: result.finalText,
+          });
+        } catch (e) {
+          console.error('[agentEngine] optimistic row insert failed:', e.message);
+        }
+      }
       await enqueueSend({
         kind: 'text',
         accountId: agent.wa_account_id,
         to: contactNumber,
+        localMessageId,
         payload: { body: result.finalText },
       });
     }
@@ -271,4 +292,80 @@ async function runAgent({ agentId, contactNumber, inboundMessageId, inboundText 
   }
 }
 
-module.exports = { runAgent, buildToolsForAgent, buildMessageHistory };
+/**
+ * Dry-run an agent for the in-app test chat panel. Same loading + tool
+ * execution as runAgent, but:
+ *   - Does NOT enqueue a real WhatsApp send (no chat_history write).
+ *   - Does NOT persist to agent_runs / agent_run_steps (test interactions
+ *     would otherwise pollute the run history).
+ *   - Accepts an explicit messages[] array so the operator can simulate a
+ *     multi-turn conversation without writing to chat_history.
+ *   - Returns the full step trace inline so the UI can show what the LLM
+ *     called and what tools fired.
+ *
+ * `messages` shape: [{ role: 'user'|'assistant', content: string }] — same as
+ * the runtime hydrates from chat_history in runAgent.
+ */
+async function runAgentTest({ agentId, messages }) {
+  const { rows: agentRows } = await pool.query(
+    'SELECT * FROM coexistence.agents WHERE id = $1',
+    [agentId],
+  );
+  const agent = agentRows[0];
+  if (!agent) throw new Error(`Agent id=${agentId} not found`);
+
+  const apiKey = pickApiKey(agent);
+  if (!apiKey) {
+    throw new Error(`No API key for provider '${agent.llm_provider}'. Set a per-agent key, or ${agent.llm_provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY'} in backend/.env.`);
+  }
+
+  const { tools, executors } = await buildToolsForAgent(agent.id);
+
+  const steps = [];
+  const onStep = async (step) => {
+    steps.push({
+      stepIndex: steps.length + 1,
+      stepType: step.step_type,
+      toolType: step.tool_type || null,
+      input: step.input,
+      output: step.output,
+      status: step.status,
+      latencyMs: step.latency_ms || null,
+      errorMessage: step.error_message || null,
+    });
+  };
+
+  const cleaned = Array.isArray(messages)
+    ? messages.filter(m => m && m.content && (m.role === 'user' || m.role === 'assistant'))
+    : [];
+  if (cleaned.length === 0) {
+    throw new Error('At least one message is required (role=user|assistant, non-empty content).');
+  }
+
+  const provider = getProvider(agent.llm_provider);
+  const result = await provider.runWithTools({
+    systemPrompt: agent.system_prompt,
+    messages: cleaned,
+    tools,
+    onToolCall: async ({ name, args }) => {
+      const exec = executors[name];
+      if (!exec) throw new Error(`Unknown tool '${name}'`);
+      return await exec(args);
+    },
+    onStep,
+    model: agent.llm_model,
+    apiKey,
+    maxIterations: Math.max(1, Math.min(20, agent.max_tool_iterations || 6)),
+  });
+
+  return {
+    reply: result.finalText || '',
+    status: result.capped ? 'capped' : 'completed',
+    totalInputTokens: result.totalInputTokens,
+    totalOutputTokens: result.totalOutputTokens,
+    iterations: result.iterations,
+    steps,
+  };
+}
+
+module.exports = { runAgent, runAgentTest, buildToolsForAgent, buildMessageHistory };

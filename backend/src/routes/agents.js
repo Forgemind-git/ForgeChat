@@ -338,4 +338,28 @@ router.get('/agents/:id/runs/:runId', async (req, res) => {
   }
 });
 
+/* --------------------------- Test chat (preview) ---------------------- */
+const { runAgentTest } = require('../engine/agentEngine');
+
+// POST /agents/:id/test  body: { messages: [{role:'user'|'assistant', content}] }
+//
+// In-app dry run of an agent. Runs the LLM loop with real tool execution
+// (Sheets append/read/update WILL hit the real spreadsheet — operators are
+// expected to point a test agent at a test sheet) but skips the WhatsApp send
+// and skips agent_runs persistence so the run history stays clean. Returns
+// the reply text + the per-step trace.
+router.post('/agents/:id/test', adminOnly, async (req, res) => {
+  try {
+    const messages = req.body?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages must be a non-empty array of {role,content}' });
+    }
+    const result = await runAgentTest({ agentId: req.params.id, messages });
+    res.json(result);
+  } catch (err) {
+    console.error('[agents] test error:', err.message);
+    res.status(500).json({ error: err.message || 'Agent test failed' });
+  }
+});
+
 module.exports = { router };

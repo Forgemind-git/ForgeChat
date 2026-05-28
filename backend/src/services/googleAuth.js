@@ -77,12 +77,19 @@ function verifyState(state) {
  */
 function buildAuthUrl({ userId, nonce, scopes = SHEETS_SCOPES }) {
   const client = buildOAuthClient();
+  // NOTE: `include_granted_scopes` is intentionally OFF. With it on, Google
+  // adds back every scope the user has ever granted to this OAuth Client
+  // (e.g. Gmail, Calendar, full Drive from a previous setup) on top of what
+  // we're requesting now. v1 of this feature only needs Sheets + the narrow
+  // `drive.file` scope to populate the spreadsheet picker, so we request
+  // exactly those. If the user previously granted broader scopes, they
+  // should revoke this app at https://myaccount.google.com/permissions
+  // before reconnecting to get a clean minimal-permissions consent screen.
   return client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     scope: scopes,
     state: signState({ userId, nonce }),
-    include_granted_scopes: true,
   });
 }
 

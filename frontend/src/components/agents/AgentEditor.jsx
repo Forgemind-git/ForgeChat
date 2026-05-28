@@ -5,6 +5,7 @@ import { C, FONT, MONO } from '../../constants.js';
 import DeleteConfirmModal from '../DeleteConfirmModal.jsx';
 import AgentToolsList from './AgentToolsList.jsx';
 import AgentRunsViewer from './AgentRunsViewer.jsx';
+import TestChat from './TestChat.jsx';
 
 const PROVIDERS = [
   {
@@ -303,6 +304,12 @@ export default function AgentEditor({ agentId, waAccounts, user, onDone, onCance
           <div style={{ padding: 16, background: C.surfaceAlt, borderRadius: 8, fontSize: 12, color: C.textSecondary }}>
             You'll be able to add Google Sheets tools after the initial save.
           </div>
+        </Section>
+      )}
+
+      {!isCreate && (
+        <Section title="Test chat" subtitle="Talk to the agent here to verify it works. Sheets tools will hit the real spreadsheet — point a test agent at a test sheet.">
+          <TestChat agentId={agentId} />
         </Section>
       )}
 

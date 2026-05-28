@@ -176,6 +176,11 @@ export const api = {
     updateTool: (id, toolId, data) =>
       req(`/agents/${id}/tools/${toolId}`, { method: 'PUT', body: JSON.stringify(data) }),
     removeTool: (id, toolId) => req(`/agents/${id}/tools/${toolId}`, { method: 'DELETE' }),
+    // Dry-run an agent without sending the reply to WhatsApp — used by the
+    // "Test chat" panel inside the agent editor.
+    test: (id, messages) => req(`/agents/${id}/test`, {
+      method: 'POST', body: JSON.stringify({ messages }),
+    }),
   },
   pipelines: {
     list: () => req('/pipelines'),
