@@ -930,11 +930,11 @@ function WhatsappAccountsTab() {
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                   <div>
                     <label style={labelStyle}>Phone Number ID</label>
-                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.phoneNumberId} onChange={e => setForm({ ...form, phoneNumberId: e.target.value })} placeholder="e.g. 100234567890123" autoFocus />
+                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.phoneNumberId} onChange={e => setForm({ ...form, phoneNumberId: e.target.value })} placeholder="e.g. 100234567890123" autoFocus autoComplete="off" name="wa-phone-number-id" inputMode="numeric" />
                   </div>
                   <div>
                     <label style={labelStyle}>WhatsApp Business Account ID</label>
-                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.wabaId} onChange={e => setForm({ ...form, wabaId: e.target.value })} placeholder="e.g. 100234567890456" />
+                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.wabaId} onChange={e => setForm({ ...form, wabaId: e.target.value })} placeholder="e.g. 100234567890456" autoComplete="off" name="wa-waba-id" inputMode="numeric" />
                   </div>
                   <div>
                     <label style={labelStyle}>
@@ -947,6 +947,8 @@ function WhatsappAccountsTab() {
                         value={form.accessToken}
                         onChange={e => setForm({ ...form, accessToken: e.target.value })}
                         placeholder={editing ? '••••••••' : 'Enter your access token'}
+                        autoComplete="new-password"
+                        name="wa-system-user-token"
                       />
                       <button type="button" onClick={() => setShowToken(s => !s)} style={eyeBtnStyle}>
                         {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
@@ -958,12 +960,12 @@ function WhatsappAccountsTab() {
                   </div>
                   <div>
                     <label style={labelStyle}>Webhook Verify Token</label>
-                    <input style={inpStyle} value={form.verifyToken} onChange={e => setForm({ ...form, verifyToken: e.target.value })} placeholder="Create a custom verify token" />
+                    <input style={inpStyle} value={form.verifyToken} onChange={e => setForm({ ...form, verifyToken: e.target.value })} placeholder="Create a custom verify token" autoComplete="off" name="wa-verify-token" />
                     <div style={hintRow}>A custom string you create. Must match the token you set in Meta webhook settings.</div>
                   </div>
                   <div>
                     <label style={labelStyle}>Meta App ID <span style={hintInline}>(only required for media-header templates)</span></label>
-                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.metaAppId} onChange={e => setForm({ ...form, metaAppId: e.target.value })} placeholder="e.g. 1191602295745986" />
+                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.metaAppId} onChange={e => setForm({ ...form, metaAppId: e.target.value })} placeholder="e.g. 1191602295745986 (15–16 digits)" autoComplete="off" name="meta-app-id" inputMode="numeric" />
                     <div style={hintRow}>From Meta App Dashboard → App Settings → Basic → App ID. Needed for uploading image/video/document template headers.</div>
                   </div>
                 </div>
