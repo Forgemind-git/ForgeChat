@@ -881,18 +881,6 @@ async function handleIa360LiteInteractive(record) {
       titleSuffix: flow100m.title,
       notes: `100M flow: ${record.message_body} → ${flow100m.stage}`,
     });
-    // G-G: hot lead que alcanza "Requiere Alek" debe surgir en EspoCRM aunque
-    // nunca se autoagende (si no, el lead mas caliente es invisible para Alek).
-    // Idempotente: el handoff n8n hace upsert de Contact/Opportunity/Task por nombre.
-    if (flow100m.stage === 'Requiere Alek') {
-      emitIa360N8nHandoff({
-        record,
-        eventType: 'hot_lead_requires_alek',
-        targetStage: 'Requiere Alek',
-        priority: 'high',
-        summary: `Hot lead IA360 (${flow100m.title}): "${record.message_body}". Crear/actualizar Contact + Opportunity (Qualification) + Task ALTA; preparar contexto para que Alek contacte de inmediato.`,
-      }).catch(e => console.error('[ia360-n8n] hot-lead handoff:', e.message));
-    }
     if (flow100m.buttons.length > 0) {
       await enqueueIa360Interactive({
         record,
