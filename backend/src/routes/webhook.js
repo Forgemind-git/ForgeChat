@@ -641,7 +641,7 @@ async function handleIa360FreeText(record) {
     }
 
     // OFFER SLOTS → query REAL availability for the agent's date, send list.
-    if (agent.action === 'offer_slots' && agent.date) {
+    if ((agent.action === 'offer_slots' || agent.action === 'book') && agent.date) {
       await syncIa360Deal({
         record,
         targetStageName: getIa360StageForEvent('agenda_preference_selected', 'Agenda en proceso'),
@@ -862,7 +862,7 @@ async function handleIa360LiteInteractive(record) {
     '100m_apply_later': 'aplicarlo',
     '100m_optout': 'baja',
   };
-  const flow100m = reply100m[key100mById[replyId] || answer];
+  const flow100m = reply100m[key100mById[replyId]] || reply100m[replyId] || reply100m[answer];
   if (flow100m) {
     await mergeContactIa360State({
       waNumber: record.wa_number,
@@ -881,6 +881,18 @@ async function handleIa360LiteInteractive(record) {
       titleSuffix: flow100m.title,
       notes: `100M flow: ${record.message_body} → ${flow100m.stage}`,
     });
+    // G-G: hot lead que alcanza "Requiere Alek" debe surgir en EspoCRM aunque
+    // nunca se autoagende (si no, el lead mas caliente es invisible para Alek).
+    // Idempotente: el handoff n8n hace upsert de Contact/Opportunity/Task por nombre.
+    if (flow100m.stage === 'Requiere Alek') {
+      emitIa360N8nHandoff({
+        record,
+        eventType: 'hot_lead_requires_alek',
+        targetStage: 'Requiere Alek',
+        priority: 'high',
+        summary: `Hot lead IA360 (${flow100m.title}): "${record.message_body}". Crear/actualizar Contact + Opportunity (Qualification) + Task ALTA; preparar contexto para que Alek contacte de inmediato.`,
+      }).catch(e => console.error('[ia360-n8n] hot-lead handoff:', e.message));
+    }
     if (flow100m.buttons.length > 0) {
       await enqueueIa360Interactive({
         record,
@@ -968,7 +980,9 @@ async function handleIa360LiteInteractive(record) {
     'operacion': { tag: 'interes-synapse', area: 'Operación' },
     'datos / bi': { tag: 'interes-datapower', area: 'Datos / BI' },
     'erp / crm': { tag: 'interes-erp-integraciones', area: 'ERP / CRM' },
+    'erp / bi': { tag: 'interes-erp-integraciones', area: 'ERP / CRM' },
     'gobierno ia': { tag: 'interes-gobierno-ia', area: 'Gobierno IA' },
+    'agentes ia': { tag: 'interes-gobierno-ia', area: 'Gobierno IA' },
   };
   const mapped = areaMap[replyId] || areaMap[answer];
   if (mapped) {
