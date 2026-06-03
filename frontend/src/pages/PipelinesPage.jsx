@@ -22,6 +22,7 @@ export default function PipelinesPage({ user }) {
   const [deals, setDeals] = useState([]);
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [dealsLoading, setDealsLoading] = useState(false);
 
   const [pipeMenuOpen, setPipeMenuOpen] = useState(false);
@@ -38,6 +39,7 @@ export default function PipelinesPage({ user }) {
 
   const loadPipelines = useCallback(async (keepId) => {
     setLoading(true);
+    setLoadError('');
     try {
       const data = await api.pipelines.list();
       setPipelines(data);
@@ -49,6 +51,9 @@ export default function PipelinesPage({ user }) {
       });
     } catch (err) {
       console.error(err);
+      setPipelines([]);
+      setSelectedId(null);
+      setLoadError(err?.message || 'No se pudieron cargar los pipelines');
     } finally {
       setLoading(false);
     }
@@ -169,7 +174,13 @@ export default function PipelinesPage({ user }) {
       </div>
 
       {/* Kanban */}
-      {!selected ? (
+      {loadError ? (
+        <div style={{ padding: 18, border: `1px solid ${C.primary}`, borderRadius: 12, background: '#FFF7F7', color: C.text, fontSize: 13 }}>
+          <div style={{ fontWeight: 800, marginBottom: 6 }}>No se pudieron cargar los pipelines.</div>
+          <div style={{ color: C.textSecondary, marginBottom: 12 }}>{loadError}</div>
+          <button onClick={() => loadPipelines()} style={primaryBtnStyle}>Reintentar</button>
+        </div>
+      ) : !selected ? (
         <EmptyState text="No pipeline yet." />
       ) : (
         <div style={{ display: 'flex', gap: 14, overflowX: 'auto', paddingBottom: 16, alignItems: 'flex-start' }}>

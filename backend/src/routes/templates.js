@@ -787,7 +787,7 @@ router.get('/templates/:id/payload', async (req, res) => {
 
 /**
  * POST /templates/:id/test-send
- * Body: { to: '919xxx', sampleValues?: { '1': 'John', '2': 'ORD-123' } }
+ * Body: { to: '919xxx', sampleValues?: { '1': 'John', '2': 'ORD-123' }, headerImageMediaId?: '...', headerImageLink?: 'https://...' }
  * Sends the template via the WhatsApp account linked to this template.
  */
 const { resolveAccount, insertPendingRow } = require('../services/messageSender');
@@ -795,11 +795,11 @@ const { enqueueSend } = require('../queue/sendQueue');
 
 router.post('/templates/:id/test-send', requirePermission('template-builder'), async (req, res) => {
   try {
-    const { to, sampleValues = {} } = req.body || {};
+    const { to, sampleValues = {}, headerImageMediaId = '', headerImageLink = '' } = req.body || {};
     if (!to) return res.status(400).json({ error: 'to (recipient phone) required' });
 
     const { rows } = await pool.query(
-      `SELECT id, name, language, body, whatsapp_account_id FROM coexistence.message_templates WHERE id = $1`,
+      `SELECT id, name, language, body, header_type, whatsapp_account_id FROM coexistence.message_templates WHERE id = $1`,
       [req.params.id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Template not found' });
@@ -811,9 +811,22 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
 
     // Build components from sampleValues (sorted numerically by var index)
     const keys = Object.keys(sampleValues).sort((a, b) => +a - +b);
-    const components = keys.length > 0
-      ? [{ type: 'body', parameters: keys.map(k => ({ type: 'text', text: String(sampleValues[k] || ' ') })) }]
-      : [];
+    const components = [];
+    if (tpl.header_type === 'IMAGE') {
+      if (!headerImageMediaId && !headerImageLink) {
+        return res.status(400).json({ error: 'Template has IMAGE header; provide headerImageMediaId or headerImageLink' });
+      }
+      components.push({
+        type: 'header',
+        parameters: [{
+          type: 'image',
+          image: headerImageMediaId ? { id: String(headerImageMediaId) } : { link: String(headerImageLink) },
+        }],
+      });
+    }
+    if (keys.length > 0) {
+      components.push({ type: 'body', parameters: keys.map(k => ({ type: 'text', text: String(sampleValues[k] || ' ') })) });
+    }
 
     const localId = await insertPendingRow({
       account, toNumber: to, messageType: 'template', messageBody: tpl.body || `Template: ${tpl.name}`,
