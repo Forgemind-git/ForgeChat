@@ -3,13 +3,14 @@ import {
   LayoutTemplate, Plus, ArrowLeft, Pencil, Trash2, Eye, Megaphone, Bell, Shield,
   Check, X, Copy, Braces, Search,
   Image, Video, FileText, Type, Link, Phone, Reply, KeyRound, Loader2, Send,
-  CheckCircle2, XCircle, Info,
-  Play, User,
+  CheckCircle2, XCircle,
+  Play,
   Library
 } from 'lucide-react';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
 import { useTableSelection, SelectAllCheckbox, RowCheckbox, BulkDeleteButton, runBulkDelete } from '../components/TableSelection.jsx';
 import { PhoneFrame } from '../components/WhatsAppPreview.jsx';
+import SearchableSelect from '../components/SearchableSelect.jsx';
 import { api } from '../api.js';
 import { C, FONT, maskPhone } from '../constants.js';
 
@@ -387,10 +388,15 @@ function ButtonsSection({ buttons, onAdd, onRemove, onUpdate, category, errors }
                   </div>
                   <div>
                     <Lbl>OTP Type</Lbl>
-                    <select style={{ border: '1.5px solid #D5D5D0', borderRadius: 8, padding: '7px 12px', fontSize: 12, fontFamily: FONT, width: '100%', background: 'var(--c-cardBg)', color: 'var(--c-text)', outline: 'none', cursor: 'pointer', appearance: 'none' }} value={btn.otpType || 'COPY_CODE'} onChange={e => onUpdate(i, 'otpType', e.target.value)}>
-                      <option value="COPY_CODE">Copy Code</option>
-                      <option value="ONE_TAP">One Tap (Android)</option>
-                    </select>
+                    <SearchableSelect
+                      value={btn.otpType || 'COPY_CODE'}
+                      onChange={(val) => onUpdate(i, 'otpType', val)}
+                      options={[
+                        { value: 'COPY_CODE', label: 'Copy Code' },
+                        { value: 'ONE_TAP', label: 'One Tap (Android)' },
+                      ]}
+                      triggerStyle={{ fontSize: 12, padding: '7px 12px' }}
+                    />
                   </div>
                   {btn.otpType === 'ONE_TAP' && (
                     <>
@@ -728,8 +734,8 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
   const [codeExpiry, setCodeExpiry] = useState(template?.code_expiry_minutes?.toString() || '');
   const [allowCatChange, setAllowCatChange] = useState(template?.allow_category_change !== false);
   const [status, setStatus] = useState(template?.status || 'DRAFT');
-  const [templateId, setTemplateId] = useState(template?.meta_template_id || '');
-  const [submittedAt, setSubmittedAt] = useState(template?.submitted_at || '');
+  const [templateId] = useState(template?.meta_template_id || '');
+  const [submittedAt] = useState(template?.submitted_at || '');
   const [showErrors, setShowErrors] = useState(false);
   const [showPayload, setShowPayload] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -877,7 +883,6 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
     }
   };
 
-  const st = STATUSES[status];
   const isAuth = category === 'AUTHENTICATION';
 
   const checklist = [
@@ -894,7 +899,6 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
   // Input styles
   const inpStyle = { border: '1.5px solid #D5D5D0', borderRadius: 10, padding: '9px 14px', fontSize: 13, fontFamily: FONT, width: '100%', background: 'var(--c-cardBg)', color: 'var(--c-text)', outline: 'none', transition: 'border .15s' };
   const inpErrStyle = { ...inpStyle, borderColor: B.red };
-  const selStyle = { ...inpStyle, cursor: 'pointer', appearance: 'none' };
   const taStyle = { ...inpStyle, resize: 'vertical', lineHeight: 1.65 };
   const taErrStyle = { ...taStyle, borderColor: B.red };
   const btnPriStyle = { padding: '10px 22px', background: B.accent, color: '#fff', border: 'none', borderRadius: 10, fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: FONT, transition: 'all .15s', display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' };
@@ -955,9 +959,12 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
               </div>
               <div style={{ marginBottom: 12 }}>
                 <div style={{ fontSize: 11, fontWeight: 700, color: B.t4, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '.05em' }}>Target language</div>
-                <select value={translationLang} onChange={e => setTranslationLang(e.target.value)} style={{ width: '100%', padding: '8px 12px', border: '1px solid #D5D5D0', borderRadius: 8, fontSize: 13, fontFamily: FONT, outline: 'none', background: 'var(--c-cardBg)', color: B.t2, boxSizing: 'border-box' }}>
-                  {LANGUAGES.filter(l => l.code !== template.language).map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
-                </select>
+                <SearchableSelect
+                  value={translationLang}
+                  onChange={(val) => setTranslationLang(val)}
+                  options={LANGUAGES.filter(l => l.code !== template.language).map(l => ({ value: String(l.code), label: l.label }))}
+                  searchPlaceholder="Search…"
+                />
                 <div style={{ fontSize: 11, color: B.t6, marginTop: 6 }}>
                   Creates a new DRAFT with the same content, grouped under the same template name. Edit the body to translate, then submit.
                 </div>
@@ -1096,22 +1103,17 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
               <div style={{ marginBottom: 12 }}>
                 <Lbl required>WhatsApp Account</Lbl>
                 {accounts && accounts.length > 1 ? (
-                  <div style={{ position: 'relative' }}>
-                    <select
-                      style={selStyle}
-                      value={whatsappAccountId || ''}
-                      onChange={e => setWhatsappAccountId(e.target.value ? parseInt(e.target.value, 10) : null)}
-                      disabled={readOnly || (isEdit && (status === 'SUBMITTED' || status === 'APPROVED'))}
-                    >
-                      <option value="">— Unassigned —</option>
-                      {accounts.map(a => (
-                        <option key={a.id} value={a.id}>
-                          {a.displayName} ({maskPhone(a.displayPhoneNumber)}){a.isDefault ? ' · default' : ''}{!a.isActive ? ' · inactive' : ''}
-                        </option>
-                      ))}
-                    </select>
-                    <span style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', fontSize: 10, color: B.t6 }}>▼</span>
-                  </div>
+                  <SearchableSelect
+                    value={whatsappAccountId || ''}
+                    onChange={(val) => setWhatsappAccountId(val ? parseInt(val, 10) : null)}
+                    options={[{ value: '', label: '— Unassigned —' }, ...accounts.map(a => ({
+                      value: String(a.id),
+                      label: `${a.displayName} (${maskPhone(a.displayPhoneNumber)})${a.isDefault ? ' · default' : ''}${!a.isActive ? ' · inactive' : ''}`,
+                    }))]}
+                    placeholder="— Unassigned —"
+                    searchPlaceholder="Search accounts…"
+                    disabled={readOnly || (isEdit && (status === 'SUBMITTED' || status === 'APPROVED'))}
+                  />
                 ) : accounts && accounts.length === 1 ? (
                   // Single-account system: the connected account is used automatically.
                   <div style={{ padding: '8px 12px', background: 'var(--c-cardBg)', border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 13, color: C.text, fontFamily: FONT }}>
@@ -1132,12 +1134,13 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
                 </div>
                 <div>
                   <Lbl required>Language</Lbl>
-                  <div style={{ position: 'relative' }}>
-                    <select style={selStyle} value={language} onChange={e => setLanguage(e.target.value)} disabled={readOnly || isApprovedEdit} title={isApprovedEdit ? 'Language cannot be changed on an approved template' : ''}>
-                      {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
-                    </select>
-                    <span style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', fontSize: 10, color: B.t6 }}>▼</span>
-                  </div>
+                  <SearchableSelect
+                    value={language}
+                    onChange={(val) => setLanguage(val)}
+                    options={LANGUAGES.map(l => ({ value: String(l.code), label: l.label }))}
+                    searchPlaceholder="Search languages…"
+                    disabled={readOnly || isApprovedEdit}
+                  />
                 </div>
               </div>
             </Sec>
@@ -1199,17 +1202,16 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                   <div>
                     <Lbl required>Select {headerType === 'IMAGE' ? 'Image' : headerType === 'VIDEO' ? 'Video' : 'Document'} from Media Library</Lbl>
-                    <select
+                    <SearchableSelect
                       value={headerMediaLibraryId || ''}
-                      onChange={async (e) => {
-                        const val = e.target.value;
+                      onChange={async (val) => {
                         if (!val) {
                           setHeaderMediaLibraryId(null);
                           setMediaHandle('');
                           setLibSourceName('');
                           return;
                         }
-                        if (!whatsappAccountId) { alert('Pick a WhatsApp Account first (Section 1).'); e.target.value = ''; return; }
+                        if (!whatsappAccountId) { alert('Pick a WhatsApp Account first (Section 1).'); return; }
                         const media = headerMediaItems.find(m => String(m.id) === val);
                         setHeaderMediaLibraryId(Number(val));
                         setHeaderMediaUploading(true);
@@ -1229,14 +1231,11 @@ function BuilderView({ template, onBack, onSave, readOnly, accounts }) {
                           setHeaderMediaUploading(false);
                         }
                       }}
+                      options={headerMediaItems.map(m => ({ value: String(m.id), label: m.name || m.originalName || `Media #${m.id}` }))}
+                      placeholder="— Select from library —"
+                      searchPlaceholder="Search media…"
                       disabled={readOnly || headerMediaUploading}
-                      style={{ width: '100%', padding: '8px 12px', fontSize: 13, border: `1px solid ${showErrors && errors.mediaHandle ? B.red + '55' : B.cardBorder}`, borderRadius: 8, fontFamily: FONT, background: B.card, color: B.t2, cursor: readOnly ? 'not-allowed' : 'pointer' }}
-                    >
-                      <option value="">— Select from library —</option>
-                      {headerMediaItems.map(m => (
-                        <option key={m.id} value={m.id}>{m.name || m.originalName || `Media #${m.id}`}</option>
-                      ))}
-                    </select>
+                    />
                     {headerMediaUploading && (
                       <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: B.t6, fontFamily: FONT }}>
                         <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> Uploading to Meta…
@@ -1667,7 +1666,7 @@ function TemplateLibraryPickerModal({ headerType, accountId, onClose, onPicked }
 
 
 // ─── Main Page Component ──────────────────────────────────────────────────────
-export default function TemplateBuilderPage() {
+export default function TemplateBuilderPage({ subParts = [], navigate }) {
   const [view, setView] = useState('list'); // 'list' | 'builder' | 'view'
   const [templates, setTemplates] = useState([]);
   const [accounts, setAccounts] = useState([]);
@@ -1675,6 +1674,19 @@ export default function TemplateBuilderPage() {
   const [selectedTemplate, setSelectedTemplate] = useState(null);
   const [syncingAll, setSyncingAll] = useState(false);
   const [groupByTranslation, setGroupByTranslation] = useState(true);
+
+  // Deep-link from a "Create new template" option elsewhere (#/template-builder/new):
+  // open a blank builder, then clear the /new segment so it doesn't re-fire.
+  const newIntentHandled = useRef(false);
+  useEffect(() => {
+    if (newIntentHandled.current) return;
+    if (subParts[0] === 'new') {
+      newIntentHandled.current = true;
+      setSelectedTemplate(null);
+      setView('builder');
+      if (navigate) navigate('template-builder');
+    }
+  }, [subParts, navigate]);
 
   const loadTemplates = useCallback(async () => {
     setLoading(true);

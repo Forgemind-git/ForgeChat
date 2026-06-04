@@ -4,7 +4,7 @@
 // checks against the optional per-user overrides we re-load the row.
 
 const pool = require('../db');
-const { effectivePages, isAdmin, hasPermission } = require('../permissions');
+const { isAdmin, hasPermission } = require('../permissions');
 
 // adminOnly: simple gate on req.user.role
 function adminOnly(req, res, next) {

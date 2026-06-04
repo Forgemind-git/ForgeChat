@@ -4,7 +4,7 @@ End-to-end guide to run ForgeChat on a fresh DigitalOcean Ubuntu droplet using D
 Compose + Caddy (automatic HTTPS). Stack: **PostgreSQL + Redis + backend + frontend(nginx)
 + Caddy**. No Supabase, no MinIO — media is stored in Postgres.
 
-> Repo: `https://github.com/Forgemind-git/Forge-Chat` (branch `main`). If your code lives in
+> Repo: `https://github.com/Forgemind-git/ForgeChat` (branch `main`). If your code lives in
 > a different repo (e.g. a personal fork), substitute that URL everywhere below.
 
 ---
@@ -116,7 +116,7 @@ If the repo is **public**:
 
 ```bash
 cd ~
-git clone https://github.com/Forgemind-git/Forge-Chat.git forgechat
+git clone https://github.com/Forgemind-git/ForgeChat.git forgechat
 cd forgechat
 ```
 
@@ -124,7 +124,7 @@ If the repo is **private**, create a GitHub Personal Access Token (classic, scop
 
 ```bash
 cd ~
-git clone https://<YOUR_GH_USERNAME>:<YOUR_PAT>@github.com/Forgemind-git/Forge-Chat.git forgechat
+git clone https://<YOUR_GH_USERNAME>:<YOUR_PAT>@github.com/Forgemind-git/ForgeChat.git forgechat
 cd forgechat
 cp docker-compose.sample.yml docker-compose.yml   # your real, gitignored compose
 ```

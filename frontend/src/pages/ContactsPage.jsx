@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Users, Search, Phone, User, Pencil, Trash2, Loader2, ChevronDown, X, Tag, Send, Play, Music, FileText, Image, Video, Library, Upload, FileSpreadsheet, CheckCircle2, AlertTriangle, Download } from 'lucide-react';
+import { Users, Search, Phone, User, Pencil, Trash2, Loader2, X, Send, Play, Music, FileText, Upload, FileSpreadsheet, CheckCircle2, AlertTriangle, Download } from 'lucide-react';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
 import WhatsAppPreview, { BroadcastMessagePreview } from '../components/WhatsAppPreview.jsx';
 import TagMultiSelect from '../components/TagMultiSelect.jsx';
 import { CustomFieldEditor, CustomFieldView } from '../components/CustomFieldInputs.jsx';
 import { api } from '../api.js';
-import { C, FONT, maskPhone, darkenColor } from '../constants.js';
+import { C, FONT, MONO, maskPhone, darkenColor } from '../constants.js';
 import MaskedNumber from '../components/MaskedNumber.jsx';
+import SearchableSelect from '../components/SearchableSelect.jsx';
 
 const ROLE_LABEL_MAP = { admin: 'Admin', bda_sales: 'Sales', viewer: 'Viewer' };
 
@@ -34,7 +35,7 @@ function TagBadge({ tag, onRemove }) {
   );
 }
 
-export default function ContactsPage({ user }) {
+export default function ContactsPage({ user, onNavigate }) {
   const isAdmin = user?.role === 'admin';
   const [numbers, setNumbers] = useState([]);
   const [selectedNumber, setSelectedNumber] = useState(null);
@@ -49,6 +50,8 @@ export default function ContactsPage({ user }) {
   const [users, setUsers] = useState([]); // assignable users (admin only)
 
   const [detailContact, setDetailContact] = useState(null);
+  const [detailName, setDetailName] = useState('');
+  const [detailNumber, setDetailNumber] = useState('');
   const [detailTags, setDetailTags] = useState([]);
   const [detailFields, setDetailFields] = useState({});
   const [detailAssignedUserId, setDetailAssignedUserId] = useState(null);
@@ -59,7 +62,7 @@ export default function ContactsPage({ user }) {
   const [selectedContacts, setSelectedContacts] = useState(new Set());
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
   const [broadcastModal, setBroadcastModal] = useState(false);
-  const [broadcastMessage, setBroadcastMessage] = useState('');
+  const [, setBroadcastMessage] = useState('');
   const [broadcasting, setBroadcasting] = useState(false);
   const [templates, setTemplates] = useState([]);
   const [broadcastFrom, setBroadcastFrom] = useState('');
@@ -68,8 +71,6 @@ export default function ContactsPage({ user }) {
   const [testNumber, setTestNumber] = useState('');
   const [sendingTest, setSendingTest] = useState(false);
   const [broadcastVariableMapping, setBroadcastVariableMapping] = useState({});
-  const [testNumberSearch, setTestNumberSearch] = useState('');
-  const [testNumberOpen, setTestNumberOpen] = useState(false);
   const [broadcastMessageType, setBroadcastMessageType] = useState('template');
   const [broadcastBody, setBroadcastBody] = useState('');
   const [broadcastUrl, setBroadcastUrl] = useState('');
@@ -175,6 +176,8 @@ export default function ContactsPage({ user }) {
 
   const openDetail = async (contact, mode = 'view') => {
     setDetailContact(contact);
+    setDetailName(contact.name || '');
+    setDetailNumber(contact.contact_number || '');
     setDetailTags(contact.tags || []);
     setDetailFields(contact.custom_fields || {});
     setDetailAssignedUserId(contact.assigned_user_id ?? null);
@@ -194,25 +197,42 @@ export default function ContactsPage({ user }) {
 
   const saveDetail = async () => {
     if (!detailContact) return;
+    const oldNumber = detailContact.contact_number;
+    const newNumber = String(detailNumber || '').replace(/\D/g, '');
+    const numberChanged = !!newNumber && newNumber !== String(oldNumber);
+    if (detailNumber && newNumber.length < 7) {
+      alert('Enter a valid phone number (digits only, at least 7 digits).');
+      return;
+    }
     setSavingDetail(true);
     try {
+      // If the number changed, migrate the whole conversation + history first
+      // (transactional server-side); the contact key changes, so we refetch.
+      if (numberChanged) {
+        await api.changeContactNumber(selectedNumber, oldNumber, newNumber);
+      }
+      const effectiveNumber = numberChanged ? newNumber : oldNumber;
       await api.saveContact(
-        selectedNumber, detailContact.contact_number, detailContact.name,
+        selectedNumber, effectiveNumber, detailName,
         detailTags, detailFields,
         isAdmin ? (detailAssignedUserId ?? null) : undefined,
       );
-      const assignedUser = users.find(u => String(u.id) === String(detailAssignedUserId));
-      setContacts(prev => prev.map(c =>
-        c.contact_number === detailContact.contact_number
-          ? {
-              ...c, tags: detailTags, custom_fields: detailFields,
-              ...(isAdmin ? {
-                assigned_user_id: detailAssignedUserId ?? null,
-                assigned_user_name: assignedUser?.displayName || null,
-              } : {}),
-            }
-          : c
-      ));
+      if (numberChanged) {
+        await loadContacts(true); // row key moved across tables — refetch
+      } else {
+        const assignedUser = users.find(u => String(u.id) === String(detailAssignedUserId));
+        setContacts(prev => prev.map(c =>
+          c.contact_number === oldNumber
+            ? {
+                ...c, name: detailName || c.name, tags: detailTags, custom_fields: detailFields,
+                ...(isAdmin ? {
+                  assigned_user_id: detailAssignedUserId ?? null,
+                  assigned_user_name: assignedUser?.displayName || null,
+                } : {}),
+              }
+            : c
+        ));
+      }
       setDetailContact(null);
     } catch (err) {
       alert('Failed to save: ' + err.message);
@@ -435,29 +455,16 @@ export default function ContactsPage({ user }) {
             </div>
           </div>
 
-          <div style={{ position: 'relative' }}>
-            <select
-              value={selectedNumber || ''}
-              onChange={e => setSelectedNumber(e.target.value)}
-              disabled={numbers.length === 0}
-              style={{
-                padding: '8px 32px 8px 12px', borderRadius: 8,
-                border: `1px solid ${C.border}`, fontSize: 13,
-                fontFamily: FONT, color: numbers.length === 0 ? C.textMuted : C.text,
-                background: C.cardBg,
-                cursor: numbers.length === 0 ? 'default' : 'pointer',
-                appearance: 'none',
-              }}
-            >
-              {numbers.length === 0 && <option value="">No WhatsApp number</option>}
-              {numbers.map(n => (
-                <option key={n.wa_number} value={n.wa_number}>
-                  {n.display_name || maskPhone(n.wa_number)}
-                </option>
-              ))}
-            </select>
-            <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-          </div>
+          <SearchableSelect
+            value={selectedNumber || ''}
+            onChange={(val) => setSelectedNumber(val)}
+            options={numbers.map(n => ({ value: n.wa_number, label: n.display_name || maskPhone(n.wa_number) }))}
+            placeholder="No WhatsApp number"
+            searchPlaceholder="Search numbers..."
+            disabled={numbers.length === 0}
+            style={{ minWidth: 200 }}
+            triggerStyle={{ border: `1px solid ${C.border}` }}
+          />
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 16, flexWrap: 'wrap' }}>
@@ -887,26 +894,13 @@ export default function ContactsPage({ user }) {
                 {/* From */}
                 <div>
                   <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>From (Team Member Number)</div>
-                  <div style={{ position: 'relative' }}>
-                    <select
-                      value={broadcastFrom}
-                      onChange={e => setBroadcastFrom(e.target.value)}
-                      style={{
-                        width: '100%', padding: '10px 32px 10px 12px', borderRadius: 8,
-                        border: `1.5px solid ${C.border}`, fontSize: 13,
-                        fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                        cursor: 'pointer', appearance: 'none', outline: 'none',
-                      }}
-                    >
-                      <option value="">Select team member number...</option>
-                      {numbers.map(n => (
-                        <option key={n.wa_number} value={n.wa_number}>
-                          {n.display_name || maskPhone(n.wa_number)}
-                        </option>
-                      ))}
-                    </select>
-                    <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                  </div>
+                  <SearchableSelect
+                    value={broadcastFrom}
+                    onChange={(val) => setBroadcastFrom(val)}
+                    options={numbers.map(n => ({ value: n.wa_number, label: n.display_name || maskPhone(n.wa_number) }))}
+                    placeholder="Select team member number..."
+                    searchPlaceholder="Search numbers..."
+                  />
                 </div>
 
                 {/* To */}
@@ -924,27 +918,19 @@ export default function ContactsPage({ user }) {
                 {/* Message Type */}
                 <div>
                   <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Message Type</div>
-                  <div style={{ position: 'relative' }}>
-                    <select
-                      value={broadcastMessageType}
-                      onChange={e => setBroadcastMessageType(e.target.value)}
-                      style={{
-                        width: '100%', padding: '10px 32px 10px 12px', borderRadius: 8,
-                        border: `1.5px solid ${C.border}`, fontSize: 13,
-                        fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                        cursor: 'pointer', appearance: 'none', outline: 'none',
-                      }}
-                    >
-                      <option value="template">Template Message</option>
-                      <option value="text">Text Message</option>
-                      <option value="link">Link Message</option>
-                      <option value="image">Image Message</option>
-                      <option value="video">Video Message</option>
-                      <option value="audio">Audio Message</option>
-                      <option value="document">Document Message</option>
-                    </select>
-                    <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                  </div>
+                  <SearchableSelect
+                    value={broadcastMessageType}
+                    onChange={(val) => setBroadcastMessageType(val)}
+                    options={[
+                      { value: 'template', label: 'Template Message' },
+                      { value: 'text', label: 'Text Message' },
+                      { value: 'link', label: 'Link Message' },
+                      { value: 'image', label: 'Image Message' },
+                      { value: 'video', label: 'Video Message' },
+                      { value: 'audio', label: 'Audio Message' },
+                      { value: 'document', label: 'Document Message' },
+                    ]}
+                  />
                 </div>
 
                 {/* Template Fields */}
@@ -952,24 +938,16 @@ export default function ContactsPage({ user }) {
                   <>
                     <div>
                       <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Message Template</div>
-                      <div style={{ position: 'relative' }}>
-                        <select
-                          value={broadcastTemplateId}
-                          onChange={e => { setBroadcastTemplateId(e.target.value); setBroadcastVariableMapping({}); setBroadcastMediaLibraryId(''); }}
-                          style={{
-                            width: '100%', padding: '10px 32px 10px 12px', borderRadius: 8,
-                            border: `1.5px solid ${C.border}`, fontSize: 13,
-                            fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                            cursor: 'pointer', appearance: 'none', outline: 'none',
-                          }}
-                        >
-                          <option value="">Select a template...</option>
-                          {templates.map(t => (
-                            <option key={t.id} value={t.id}>{t.name} ({t.category})</option>
-                          ))}
-                        </select>
-                        <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                      </div>
+                      <SearchableSelect
+                        value={broadcastTemplateId}
+                        onChange={(val) => { setBroadcastTemplateId(val); setBroadcastVariableMapping({}); setBroadcastMediaLibraryId(''); }}
+                        options={templates.map(t => ({ value: String(t.id), label: `${t.name} (${t.category})`, sublabel: t.language || '' }))}
+                        placeholder="Select a template..."
+                        searchPlaceholder="Search templates..."
+                        emptyText="No templates found"
+                        createLabel="Create new template"
+                        onCreate={() => onNavigate?.('template-builder', 'new')}
+                      />
                       {templates.length === 0 && (
                         <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4, fontFamily: FONT }}>No approved templates available. Create and approve a template first.</div>
                       )}
@@ -981,25 +959,14 @@ export default function ContactsPage({ user }) {
                         <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                           Header {headerMediaType} <span style={{ color: C.primary }}>*</span>
                         </div>
-                        <div style={{ position: 'relative' }}>
-                          <select
-                            value={broadcastMediaLibraryId}
-                            onChange={e => setBroadcastMediaLibraryId(e.target.value)}
-                            disabled={broadcastMediaLoading}
-                            style={{
-                              width: '100%', padding: '10px 32px 10px 12px', borderRadius: 8,
-                              border: `1.5px solid ${C.border}`, fontSize: 13,
-                              fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                              cursor: 'pointer', appearance: 'none', outline: 'none',
-                            }}
-                          >
-                            <option value="">{broadcastMediaLoading ? 'Loading...' : `— Select ${headerMediaType} —`}</option>
-                            {broadcastMediaItems.map(m => (
-                              <option key={m.id} value={m.id}>{m.name || m.originalName || `Media #${m.id}`}</option>
-                            ))}
-                          </select>
-                          <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                        </div>
+                        <SearchableSelect
+                          value={broadcastMediaLibraryId}
+                          onChange={(val) => setBroadcastMediaLibraryId(val)}
+                          disabled={broadcastMediaLoading}
+                          options={broadcastMediaItems.map(m => ({ value: String(m.id), label: m.name || m.originalName || `Media #${m.id}` }))}
+                          placeholder={broadcastMediaLoading ? 'Loading...' : `— Select ${headerMediaType} —`}
+                          searchPlaceholder="Search media..."
+                        />
                         {broadcastMediaItems.length === 0 && !broadcastMediaLoading ? (
                           <div style={{ fontSize: 11, color: '#E65100', marginTop: 4, fontFamily: FONT }}>
                             This template has a {headerMediaType} header — upload a {headerMediaType} to the Media Library first.
@@ -1027,24 +994,15 @@ export default function ContactsPage({ user }) {
                             <div key={v} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                               <span style={{ fontSize: 12, fontWeight: 600, color: C.text, fontFamily: "'DM Mono', monospace", background: 'var(--c-hover)', padding: '4px 8px', borderRadius: 4, whiteSpace: 'nowrap' }}>{'{{' + v + '}}'}</span>
                               <span style={{ fontSize: 12, color: C.textMuted }}>→</span>
-                              <div style={{ position: 'relative', flex: 1 }}>
-                                <select
-                                  value={broadcastVariableMapping[v] || ''}
-                                  onChange={e => setBroadcastVariableMapping(prev => ({ ...prev, [v]: e.target.value }))}
-                                  style={{
-                                    width: '100%', padding: '8px 28px 8px 10px', borderRadius: 6,
-                                    border: `1.5px solid ${C.border}`, fontSize: 12,
-                                    fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                                    cursor: 'pointer', appearance: 'none', outline: 'none',
-                                  }}
-                                >
-                                  <option value="">Select contact field...</option>
-                                  {contactFieldOptions.map(opt => (
-                                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                  ))}
-                                </select>
-                                <ChevronDown size={12} color={C.textMuted} style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                              </div>
+                              <SearchableSelect
+                                value={broadcastVariableMapping[v] || ''}
+                                onChange={(val) => setBroadcastVariableMapping(prev => ({ ...prev, [v]: val }))}
+                                options={contactFieldOptions}
+                                placeholder="Select contact field..."
+                                searchPlaceholder="Search fields..."
+                                style={{ flex: 1 }}
+                                triggerStyle={{ padding: '8px 28px 8px 10px', borderRadius: 6, fontSize: 12 }}
+                              />
                             </div>
                           ))}
                         </div>
@@ -1105,25 +1063,14 @@ export default function ContactsPage({ user }) {
                   <>
                     <div>
                       <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Select from Media Library</div>
-                      <div style={{ position: 'relative' }}>
-                        <select
-                          value={broadcastMediaLibraryId}
-                          onChange={e => setBroadcastMediaLibraryId(e.target.value)}
-                          disabled={broadcastMediaLoading}
-                          style={{
-                            width: '100%', padding: '10px 32px 10px 12px', borderRadius: 8,
-                            border: `1.5px solid ${C.border}`, fontSize: 13,
-                            fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                            cursor: 'pointer', appearance: 'none', outline: 'none',
-                          }}
-                        >
-                          <option value="">{broadcastMediaLoading ? 'Loading...' : `— Select ${broadcastMessageType} —`}</option>
-                          {broadcastMediaItems.map(m => (
-                            <option key={m.id} value={m.id}>{m.name || m.originalName || `Media #${m.id}`}</option>
-                          ))}
-                        </select>
-                        <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                      </div>
+                      <SearchableSelect
+                        value={broadcastMediaLibraryId}
+                        onChange={(val) => setBroadcastMediaLibraryId(val)}
+                        disabled={broadcastMediaLoading}
+                        options={broadcastMediaItems.map(m => ({ value: String(m.id), label: m.name || m.originalName || `Media #${m.id}` }))}
+                        placeholder={broadcastMediaLoading ? 'Loading...' : `— Select ${broadcastMessageType} —`}
+                        searchPlaceholder="Search media..."
+                      />
                       {broadcastMediaItems.length === 0 && !broadcastMediaLoading && (
                         <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4, fontFamily: FONT }}>
                           No {broadcastMessageType}s in the Media Library. Upload one from the Media tab first.
@@ -1431,15 +1378,49 @@ export default function ContactsPage({ user }) {
             </div>
 
             <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Name</div>
-              <div style={{ fontSize: 15, fontWeight: 600, color: C.text }}>{detailContact.name}</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: detailMode === 'edit' ? 6 : 4, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Name</div>
+              {detailMode === 'edit' ? (
+                <input
+                  value={detailName}
+                  onChange={e => setDetailName(e.target.value)}
+                  placeholder="Contact name"
+                  style={{
+                    width: '100%', padding: '8px 12px', borderRadius: 8,
+                    border: `1px solid ${C.border}`, fontSize: 14, fontFamily: FONT,
+                    color: C.text, outline: 'none', background: 'var(--c-cardBg)', boxSizing: 'border-box',
+                  }}
+                />
+              ) : (
+                <div style={{ fontSize: 15, fontWeight: 600, color: C.text }}>{detailContact.name || '—'}</div>
+              )}
             </div>
 
             <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Phone</div>
-              <div style={{ fontSize: 14, color: C.textSecondary, display: 'flex', alignItems: 'center', gap: 4 }}>
-                <Phone size={12} /> <MaskedNumber number={detailContact.contact_number} prefix="+" />
-              </div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: detailMode === 'edit' ? 6 : 4, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Phone</div>
+              {detailMode === 'edit' ? (
+                <>
+                  <input
+                    value={detailNumber}
+                    onChange={e => setDetailNumber(e.target.value)}
+                    placeholder="e.g. 919342245724"
+                    inputMode="numeric"
+                    style={{
+                      width: '100%', padding: '8px 12px', borderRadius: 8,
+                      border: `1px solid ${C.border}`, fontSize: 14, fontFamily: MONO,
+                      color: C.text, outline: 'none', background: 'var(--c-cardBg)', boxSizing: 'border-box',
+                    }}
+                  />
+                  {String(detailNumber || '').replace(/\D/g, '') !== String(detailContact.contact_number) && (
+                    <div style={{ fontSize: 11, color: '#E65100', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <AlertTriangle size={11} /> Changing the number moves the entire conversation &amp; history to it.
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{ fontSize: 14, color: C.textSecondary, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <Phone size={12} /> <MaskedNumber number={detailContact.contact_number} prefix="+" />
+                </div>
+              )}
             </div>
 
             {/* Assigned to (chat owner) — admins can (re)assign to a sales user */}
@@ -1447,16 +1428,14 @@ export default function ContactsPage({ user }) {
               <div style={{ marginBottom: 16 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: detailMode === 'edit' ? 6 : 4, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Assigned to</div>
                 {detailMode === 'edit' ? (
-                  <select
+                  <SearchableSelect
                     value={detailAssignedUserId ?? ''}
-                    onChange={e => setDetailAssignedUserId(e.target.value || null)}
-                    style={{ width: '100%', padding: '9px 12px', borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, fontFamily: FONT, color: C.text, background: C.cardBg, cursor: 'pointer' }}
-                  >
-                    <option value="">Unassigned</option>
-                    {users.filter(u => u.isActive !== false).map(u => (
-                      <option key={u.id} value={u.id}>{(u.displayName || u.username)} ({ROLE_LABEL_MAP[u.role] || u.role})</option>
-                    ))}
-                  </select>
+                    onChange={(val) => setDetailAssignedUserId(val || null)}
+                    options={[{ value: '', label: 'Unassigned' }, ...users.filter(u => u.isActive !== false).map(u => ({ value: String(u.id), label: `${u.displayName || u.username} (${ROLE_LABEL_MAP[u.role] || u.role})` }))]}
+                    placeholder="Unassigned"
+                    searchPlaceholder="Search team..."
+                    triggerStyle={{ padding: '9px 12px', border: `1px solid ${C.border}` }}
+                  />
                 ) : (
                   <div style={{ fontSize: 14, color: C.text }}>
                     {(() => {

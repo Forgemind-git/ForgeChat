@@ -61,14 +61,6 @@ scratch/
 /*.jsx
 transform.js
 
-# Local deployment compose — copy from docker-compose.sample.yml (gitignored so
-# each deployment keeps its own).
-docker-compose.yml
-
-# PDFs / large generated artifacts
-ForgeCRM_LLD.html
-*.pdf
-
 # Local AI-assistant / IDE scratch state (machine-specific, never commit)
 .claude/
 .CLAUDE.md

@@ -40,8 +40,11 @@ jobs:
         #   (MIT AND Zlib)              = both permissive (pako)
         # `buffers@0.1.1` ships no license field but is MIT per its repository,
         # so it is excluded by name.
+        # `url-template@2.0.8` (a googleapis transitive dep) declares a bare
+        # "BSD", which license-checker reports as the unrecognised "BSD*"; it is
+        # BSD-3-Clause per its repository — permissive — so excluded by name.
         run: |
           npx --yes license-checker@25.0.1 --production --summary \
             --excludePrivatePackages \
-            --excludePackages "buffers@0.1.1" \
+            --excludePackages "buffers@0.1.1;url-template@2.0.8" \
             --onlyAllow "MIT;MIT-0;ISC;Apache-2.0;BSD-2-Clause;BSD-3-Clause;0BSD;BlueOak-1.0.0;CC0-1.0;Unlicense;Python-2.0;MIT/X11;(MIT OR GPL-3.0-or-later);(MIT AND Zlib)"

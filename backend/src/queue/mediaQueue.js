@@ -1,5 +1,5 @@
-// BullMQ-backed media download queue using the shared Redis (same instance as
-// n8n, isolated by queue name / prefix). Replaces the previous in-process
+// BullMQ-backed media download queue using the shared Redis (isolated by queue
+// name / prefix). Replaces the previous in-process
 // setImmediate scheduler — gives us durability across restarts, capped
 // concurrency, and exponential backoff for transient Meta errors.
 

@@ -1,11 +1,10 @@
 import React, { useState, useRef, useEffect, useCallback, useLayoutEffect, useMemo } from "react";
 import { api } from "../api.js";
 import AutomationExecutions from "./AutomationExecutions.jsx";
+import SearchableSelect from "./SearchableSelect.jsx";
 import { maskPhone } from "../constants.js";
 
 // Automation Builder — single-file React JSX (DM Sans + DM Mono, inline styles).
-
-const fmt = (n) => "₹" + Number(n).toLocaleString("en-IN");
 
 /* ── Color tokens ─────────────────────────────────────────────────── */
 const C = {
@@ -202,7 +201,31 @@ const FormatTextarea = ({ value, onChange, style, ...p }) => {
     </div>
   );
 };
-const Select = ({ style, children, ...p }) => <select {...p} style={{ width:"100%", padding:"7px 9px", border:`1.5px solid ${C.inputBorder}`, borderRadius:8, fontSize:12, fontFamily:"'DM Sans'", outline:"none", background:"#fff", color:C.text1, ...style }}>{children}</select>;
+// Drop-in replacement for the old native <select> wrapper used throughout the
+// node-config panels: parses its <option> children into SearchableSelect options
+// and adapts onChange(e) callers by synthesizing a { target: { value } } event,
+// so every existing call site keeps working — now with the app's uniform
+// searchable dropdown (the search box auto-hides for short lists).
+const Select = ({ style, children, value, onChange, disabled, placeholder = "Select…", ...p }) => {
+  const options = React.Children.toArray(children)
+    .filter(c => c && c.type === "option")
+    .map(c => ({
+      value: c.props.value !== undefined ? c.props.value : c.props.children,
+      label: c.props.children,
+    }));
+  return (
+    <SearchableSelect
+      value={value}
+      onChange={(val) => onChange && onChange({ target: { value: val } })}
+      options={options}
+      disabled={disabled}
+      placeholder={placeholder}
+      style={style}
+      triggerStyle={{ padding: "7px 9px", fontSize: 12, ...style }}
+      {...p}
+    />
+  );
+};
 
 // ─── Variable picker (Insert {{key}} into any text input) ──────────────────
 // React Context lets the settings panel pass nodes+edges+currentNodeId once
@@ -549,28 +572,84 @@ const DIRECT_MSG_TYPES = [
 const DIRECT_MSG_LABELS = Object.fromEntries(DIRECT_MSG_TYPES.map(t => [t.key, t.label]));
 
 /* ── Condition sources ── */
+// Sources the engine's getFieldValue actually evaluates.
 const CONDITION_SOURCES = [
   { id:"system", label:"System fields" },
   { id:"custom", label:"Custom fields" },
   { id:"tags",   label:"Tags" },
-  { id:"bot",    label:"Bot context" },
-  { id:"entry",  label:"Entry source" },
-  { id:"optin",  label:"Opt-in channel" },
-  { id:"sequence",label:"Sequence" },
-  { id:"segment", label:"Segment" },
-  { id:"time",    label:"Time" },
+  { id:"bot",    label:"AI / Bot output" },
+  { id:"time",   label:"Time" },
 ];
-const WA_SYSTEM_FIELDS = ["name","first_name","last_name","email","phone","country","language","optin_status","last_active","conversation_count"];
+// System fields the engine resolves directly.
+const WA_SYSTEM_FIELDS = ["name","phone","lead_score","last_message"];
 const GENERAL_FIELDS = ["city","state","pincode","budget","timeline","bhk_type","lead_score","source","notes"];
-const OPERATORS = ["equals","does not equal","contains","does not contain","starts with","ends with","is empty","is not empty","is true","is false","is within last","is before","is after","has tag","does not have tag","is greater than","is less than"];
+// Operator strings MUST match the engine's evaluateRule() switch exactly.
+const OPERATORS = ["equals","not equals","contains","not contains","starts with","ends with","is empty","is not empty","greater than","less than","has tag","not has tag","is true","is false"];
+// Starter conditions grounded in what THIS build actually evaluates: tags
+// (real JSONB on contacts), the inbound message, IST business hours, and the
+// saved contact name. Each is a one-click template the user can tweak.
 const WA_CONDITION_PRESETS = [
-  { source:"system", field:"optin_status", op:"equals", value:"subscribed", label:"Contact is opted-in" },
-  { source:"system", field:"last_active", op:"is within last", value:"24 hours", label:"Active in last 24h" },
-  { source:"tags", field:"Hot Lead", op:"has tag", value:"Hot Lead", label:"Has tag: Hot Lead" },
-  { source:"system", field:"conversation_count", op:"is greater than", value:"0", label:"Has prior conversation" },
-  { source:"custom", field:"city", op:"equals", value:"Chennai", label:"City is Chennai" },
-  { source:"custom", field:"budget", op:"is greater than", value:"1000000", label:"Budget > ₹10L" },
+  { source:"tags",   field:"Hot Lead", op:"has tag",       label:'Has the tag "Hot Lead"' },
+  { source:"tags",   field:"Hot Lead", op:"not has tag",   label:'Doesn\'t have the tag "Hot Lead"' },
+  { source:"time",   field:"Current time", op:"equals", value:"business", label:"During business hours (Mon–Sat 9–6 IST)" },
+  { source:"system", field:"last_message", op:"contains", value:"", label:"Message contains a keyword…" },
+  { source:"system", field:"name", op:"is not empty",      label:"Contact has a saved name" },
 ];
+
+// ── Client-side condition evaluator (for "Test with a sample contact") ──
+// MIRRORS backend/src/engine/automationEngine.js getFieldValue()/evaluateRule().
+// Keep the two in sync — operator/source semantics must stay identical so the
+// preview result matches what the engine does at runtime.
+const evalConditionField = (source, field, contact, messageBody = "") => {
+  const cf = (contact && contact.custom_fields) || {};
+  if (source === "custom" || source === "system") {
+    if (field === "name") return (contact && contact.name) || "";
+    if (field === "contact_number" || field === "phone") return (contact && contact.contact_number) || "";
+    if (/^(last[_ ]?message|message)$/i.test(field)) return messageBody || "";
+    return cf[field] ?? "";
+  }
+  if (source === "tags") {
+    const names = ((contact && contact.tags) || []).map(t => (typeof t === "string" ? t : (t && t.name) || ""));
+    return names.some(n => String(n).toLowerCase() === String(field).toLowerCase()) ? field : "";
+  }
+  if (source === "time") {
+    const ist = new Date(Date.now() + (5 * 60 + 30) * 60000);
+    const weekday = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"][ist.getUTCDay()];
+    const hour = ist.getUTCHours();
+    if (/hour/i.test(field)) return hour;
+    if (/day/i.test(field)) return weekday;
+    return (weekday !== "sunday" && hour >= 9 && hour < 18) ? "business" : "after-hours";
+  }
+  if (source === "bot") {
+    if (/intent/i.test(field)) return cf["last_intent"] ?? cf["intent"] ?? "";
+    if (/state/i.test(field)) return cf["bot_state"] ?? "";
+    return cf[field] ?? "";
+  }
+  return "";
+};
+const evalConditionRule = (r, contact, messageBody = "") => {
+  const fv = evalConditionField(r.source, r.field, contact, messageBody);
+  const cv = r.value !== undefined ? r.value : "";
+  const sf = String(fv ?? "").toLowerCase();
+  const sc = String(cv).toLowerCase();
+  switch (r.op) {
+    case "equals": return sf === sc;
+    case "not equals": return sf !== sc;
+    case "contains": return sf.includes(sc);
+    case "not contains": return !sf.includes(sc);
+    case "starts with": return sf.startsWith(sc);
+    case "ends with": return sf.endsWith(sc);
+    case "is empty": return sf === "";
+    case "is not empty": return sf !== "";
+    case "greater than": return Number(fv) > Number(cv);
+    case "less than": return Number(fv) < Number(cv);
+    case "has tag": return sf !== "";
+    case "not has tag": return sf === "";
+    case "is true": return String(fv).toLowerCase() === "true" || fv === true;
+    case "is false": return String(fv).toLowerCase() === "false" || fv === false;
+    default: return false;
+  }
+};
 
 
 /* ── Interactive FlowNode with input/output handles ── */
@@ -884,9 +963,12 @@ const NodePicker = ({ x, y, onPick, onClose, mode, groups = [] }) => {
 
 
 /* ── Block Library (left sidebar of builder) ── */
-// Automations are linear keyword→message flows: the palette offers exactly two
-// blocks — a Keyword Trigger and a Send Message. (All other node types —
-// conditions, delays, actions, handoff, AI, API, sub-flows — were removed.)
+// The palette offers a Keyword Trigger, a Send Message, Logic blocks
+// (Condition + Smart Delay), and Action blocks (Add Tag + Remove Tag).
+// Condition branches the flow (yes/no) on contact data; Smart Delay pauses
+// before the next step; the tag actions mutate the contact's tags JSONB.
+// Operator/source/action-kind strings below match the backend
+// automationEngine.js evaluateRule()/executeActionNode() handlers exactly.
 const BLOCK_GROUPS = [
   { title:"Triggers", color:C.brand, items:[
     { name:"Keyword Trigger",  type:"trigger", icon:IC.zap,   desc:"User sends a keyword",
@@ -895,6 +977,18 @@ const BLOCK_GROUPS = [
   { title:"Messages", color:C.blue, items:[
     { name:"Send Message", type:"message", icon:IC.msg,   desc:"Send a WhatsApp message",
       defaults:{ templateId:"", summary:"Send a Meta-approved WhatsApp template" } },
+  ]},
+  { title:"Logic", color:C.orange, items:[
+    { name:"Condition",   type:"condition", icon:IC.branch, desc:"If / else branch",
+      defaults:{ matchMode:"all", rules:[], summary:"Branch the flow based on contact data" } },
+    { name:"Smart Delay", type:"delay",     icon:IC.clock,  desc:"Wait minutes/hours/days",
+      defaults:{ delayMode:"duration", waitValue:"10", waitUnit:"minutes", useContactTz:false, summary:"Pause the flow before continuing" } },
+  ]},
+  { title:"Actions", color:"#5B5851", items:[
+    { name:"Add Tag",    type:"action", icon:IC.tag, desc:"Tag the contact",
+      defaults:{ actions:[{ kind:"Add Tag", value:"" }], summary:"Add a tag to the contact" } },
+    { name:"Remove Tag", type:"action", icon:IC.tag, desc:"Remove a tag",
+      defaults:{ actions:[{ kind:"Remove Tag", value:"" }], summary:"Remove a tag from the contact" } },
   ]},
 ];
 
@@ -1006,10 +1100,14 @@ const TemplatePreview = ({ template }) => {
 };
 
 
-const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDeleteNode=()=>{}, onDuplicateNode=()=>{}, onSaveAndClose=()=>{}, onToggleDisable=()=>{}, onDeleteButton=()=>{}, onSelectTemplate=()=>{}, templates=[], teamMembers=[], tags=[], contactFields=[], otherAutomations=[], whatsappAccounts=[], assignableUsers=[] }) => {
+const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDeleteNode=()=>{}, onDuplicateNode=()=>{}, onSaveAndClose=()=>{}, onToggleDisable=()=>{}, onDeleteButton=()=>{}, onSelectTemplate=()=>{}, onCreateTemplate=()=>{}, templates=[], teamMembers=[], tags=[], contactFields=[], otherAutomations=[], whatsappAccounts=[], assignableUsers=[], sampleContacts=[] }) => {
   const [editingTitle, setEditingTitle] = useState(false);
   const [subflowSearch, setSubflowSearch] = useState("");
   const titleInputRef = useRef(null);
+  // Condition node "Test with a sample contact" state (reset when the node changes).
+  const [testContactIdx, setTestContactIdx] = useState("");
+  const [testResult, setTestResult] = useState(null);
+  useEffect(() => { setTestContactIdx(""); setTestResult(null); }, [node.id]);
   useEffect(() => { setEditingTitle(false); }, [node?.id]);
   useEffect(() => {
     if (editingTitle && titleInputRef.current) {
@@ -1064,16 +1162,6 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
       </button>
     );
 
-    const DirectField = ({ label, type="text", value, onChange, placeholder="", hint="" }) => (
-      <Field label={label} hint={hint}>
-        {type === "textarea" ? (
-          <Textarea value={value || ""} onChange={e => setDirect({ [label.toLowerCase().replace(/[^a-z]/g,"_")]: e.target.value })} placeholder={placeholder} style={{ fontSize:11 }}/>
-        ) : (
-          <Input value={value || ""} onChange={e => setDirect({ [label.toLowerCase().replace(/[^a-z]/g,"_")]: e.target.value })} placeholder={placeholder} style={{ padding:"6px 9px", fontSize:11 }}/>
-        )}
-      </Field>
-    );
-
     const renderDirectFields = () => {
       const dt = node.directType || "text";
       switch (dt) {
@@ -1087,16 +1175,15 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
           const filtered = mediaItems.filter(m => m.mediaType === dt);
           return <>
             <Field label="Select from Media Library">
-              <select
+              <SearchableSelect
                 value={dd.mediaLibraryId || ""}
-                onChange={e => setDirect({ mediaLibraryId: e.target.value || null, url: '' })}
-                style={{ width:'100%', padding:'6px 9px', fontSize:11, border:`1px solid ${C.inputBorder}`, borderRadius:8, fontFamily:"'DM Sans'", background:C.cardBg }}
-              >
-                <option value="">— Select {dt} —</option>
-                {filtered.map(m => (
-                  <option key={m.id} value={m.id}>{m.name || m.originalName || `Media #${m.id}`}</option>
-                ))}
-              </select>
+                onChange={(val) => setDirect({ mediaLibraryId: val || null, url: '' })}
+                options={[{ value: "", label: `— Select ${dt} —` }, ...filtered.map(m => ({ value: String(m.id), label: m.name || m.originalName || `Media #${m.id}` }))]}
+                placeholder={`— Select ${dt} —`}
+                searchPlaceholder="Search media…"
+                style={{ width:'100%' }}
+                triggerStyle={{ padding:'6px 9px', fontSize:11 }}
+              />
             </Field>
             {selected && (
               <div style={{ marginTop:8, borderRadius:10, overflow:'hidden', border:`1px solid ${C.innerBorder}`, background:C.innerBg }}>
@@ -1259,14 +1346,19 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
         </div>
 
         <Field label="WhatsApp template" hint="Only Meta-approved templates can be sent outside the 24-hour window.">
-          <Select value={tplId} onChange={(e)=>onSelectTemplate(node.id, e.target.value)}>
-            <option value="">— Select template —</option>
-            {templates.map(t => (
-              <option key={t.id} value={t.id}>
-                {t.name} · {t.category} · {t.lang || t.language || 'English'}{t.buttons ? ` · ${t.buttons.length} buttons` : ""}
-              </option>
-            ))}
-          </Select>
+          <SearchableSelect
+            value={tplId}
+            onChange={(val)=>onSelectTemplate(node.id, val)}
+            options={templates.map(t => ({
+              value: String(t.id),
+              label: `${t.name} · ${t.category} · ${t.lang || t.language || 'English'}${t.buttons ? ` · ${t.buttons.length} buttons` : ''}`,
+            }))}
+            placeholder="— Select template —"
+            searchPlaceholder="Search templates..."
+            emptyText="No templates found"
+            createLabel="Create new template"
+            onCreate={onCreateTemplate}
+          />
         </Field>
 
         {tpl ? (<>
@@ -1388,7 +1480,7 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
   }
 
   else if (node.type==="condition") {
-    const fieldsBySource = { system: WA_SYSTEM_FIELDS, custom: fieldNames, tags: tagNames, bot:["bot_version","conversation_count","last_intent","bot_state"], entry:["Meta Ads","Website Widget","wa.me link","QR Code","Direct"], optin:["Newsletter","Promo","Reminders"], sequence:["Welcome Sequence","Onboarding","Re-engagement"], segment:["Hot Leads (Chennai)","VIP Buyers","Cold Outreach"], time:["Current time","Day of week","Hour of day"] };
+    const fieldsBySource = { system: WA_SYSTEM_FIELDS, custom: fieldNames, tags: tagNames, bot:["last_intent","bot_state"], time:["Current time","Day of week","Hour of day"] };
     const rules = node.rules || [];
     const matchMode = node.matchMode || "all";
 
@@ -1436,16 +1528,13 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
         </div>
       </Field>
 
-      <Alert kind="warn">
-        <strong>WhatsApp compliance</strong>
-        <div style={{ marginTop:6, display:"flex", flexDirection:"column", gap:4 }}>
-          <div style={{ display:"flex", gap:5 }}><span>•</span><span>This contact is outside the 24-hour WhatsApp window. Use an approved template.</span></div>
-          <div style={{ display:"flex", gap:5 }}><span>•</span><span>This contact has not opted in for WhatsApp.</span></div>
-          <div style={{ display:"flex", gap:5 }}><span>•</span><span>{(matchedFirst && notMatchedFirst) ? "Both branches connected." : "This condition has no fallback path."}</span></div>
-        </div>
+      <Alert kind={(matchedFirst && notMatchedFirst) ? "info" : "warn"}>
+        {(matchedFirst && notMatchedFirst)
+          ? "Both branches are connected — contacts flow down Matched or Not-matched."
+          : "Only one branch is connected. Contacts on the other path stop here — connect both the Matched and Not-matched branches for a complete flow."}
       </Alert>
 
-      <Sec style={{ marginTop:18, marginBottom:8 }}>Quick WhatsApp presets</Sec>
+      <Sec style={{ marginTop:18, marginBottom:8 }}>Quick presets</Sec>
       <div style={{ background:C.sectionBg, border:`1px solid ${C.innerBorder}`, borderRadius:10, padding:8, marginBottom:14 }}>
         {WA_CONDITION_PRESETS.map(p=>(
           <button key={p.label} onClick={()=>addPresetAsRule(p)} className="picker-item" style={{
@@ -1471,7 +1560,13 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
         </div>
       )}
       {rules.map((r, i) => {
-        const noValueOp = r.op==="is empty" || r.op==="is not empty" || r.op==="is true" || r.op==="is false";
+        const isTags = r.source === "tags";
+        // A tag rule is a membership check: only "has tag" / "not has tag", and
+        // no value box (the tag itself is the field). Keep the tag operators out
+        // of the other sources too — "System field has tag" never made sense.
+        const opsForRule = isTags ? ["has tag", "not has tag"] : OPERATORS.filter(o => o !== "has tag" && o !== "not has tag");
+        const noValueOp = isTags || r.op==="is empty" || r.op==="is not empty" || r.op==="is true" || r.op==="is false" || r.op==="has tag" || r.op==="not has tag";
+        const opValue = opsForRule.includes(r.op) ? r.op : opsForRule[0];
         return (
           <div key={i} style={{ background:C.sectionBg, border:`1px solid ${C.innerBorder}`, borderRadius:10, padding:11, marginBottom:6 }}>
             <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:7 }}>
@@ -1482,7 +1577,7 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
               </div>
             </div>
             <div style={{ marginBottom:5 }}>
-              <Select value={r.source || "custom"} onChange={(e)=>updateRule(i, { source: e.target.value, field: (fieldsBySource[e.target.value] || GENERAL_FIELDS)[0] })} style={{ fontSize:11 }}>
+              <Select value={r.source || "custom"} onChange={(e)=>{ const ns = e.target.value; updateRule(i, { source: ns, field: (fieldsBySource[ns] || GENERAL_FIELDS)[0], op: ns === "tags" ? "has tag" : ((r.op === "has tag" || r.op === "not has tag") ? "equals" : (r.op || "equals")) }); }} style={{ fontSize:11 }}>
                 {CONDITION_SOURCES.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}
               </Select>
             </div>
@@ -1492,21 +1587,20 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
               </Select>
             </div>
             <div style={{ display:"flex", gap:5 }}>
-              <Select value={r.op || "equals"} onChange={(e)=>updateRule(i, { op: e.target.value })} style={{ width:140, fontSize:11 }}>
-                {OPERATORS.map(op=><option key={op} value={op}>{op}</option>)}
+              <Select value={opValue} onChange={(e)=>updateRule(i, { op: e.target.value })} style={{ width: noValueOp ? "100%" : 140, fontSize:11 }}>
+                {opsForRule.map(op=><option key={op} value={op}>{op}</option>)}
               </Select>
-              {(() => {
+              {!noValueOp && (() => {
                 const f = (r.field || "").toLowerCase();
                 const isNumeric = /score|budget|count|pincode|amount|points|qty|age/.test(f);
                 const isEmail   = f === "email";
                 const isPhone   = f === "phone";
                 const v = r.value || "";
                 let valid = true;
-                let hint = "";
                 if (!noValueOp && v) {
-                  if (isNumeric) { valid = /^-?\d+(\.\d+)?$/.test(v); hint = "Numeric value required"; }
-                  else if (isEmail) { valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v); hint = "Valid email required"; }
-                  else if (isPhone) { valid = /^\+?91[\s-]?\d{10}$/.test(v.replace(/\s/g,"")); hint = "Format: +91 9876543210"; }
+                  if (isNumeric) { valid = /^-?\d+(\.\d+)?$/.test(v); }
+                  else if (isEmail) { valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v); }
+                  else if (isPhone) { valid = /^\+?91[\s-]?\d{10}$/.test(v.replace(/\s/g,"")); }
                 }
                 return (<>
                   <Input
@@ -1531,26 +1625,50 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
 
       <div style={{ display:"flex", gap:6, marginTop:4 }}>
         <Btn kind="ghost" size="sm" icon={IC.plus(12)} onClick={addRule}>Add condition</Btn>
-        <Btn kind="ghost" size="sm" icon={IC.plus(12)} onClick={addRule}>Add group</Btn>
       </div>
 
-      <Sec style={{ marginTop:18, marginBottom:8 }}>Test with sample contact</Sec>
+      <Sec style={{ marginTop:18, marginBottom:8 }}>Test with a sample contact</Sec>
       <div style={{ background:C.sectionBg, border:`1px solid ${C.innerBorder}`, borderRadius:10, padding:11 }}>
-        <Select style={{ marginBottom:8, fontSize:11, fontFamily:"'DM Mono'" }}>
-          <option>— Select a sample contact —</option>
+        <Select
+          value={testContactIdx}
+          onChange={(e)=>{ setTestContactIdx(e.target.value); setTestResult(null); }}
+          style={{ marginBottom:8, fontSize:11 }}
+        >
+          <option value="">{sampleContacts.length ? "— Select a sample contact —" : "No saved contacts available to test"}</option>
+          {sampleContacts.map((c, idx) => (
+            <option key={idx} value={String(idx)}>{(c.name || "Unnamed") + " · " + maskPhone(c.contact_number)}</option>
+          ))}
         </Select>
-        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:rules.length?10:0 }}>
-          <Btn kind="dark" size="sm" icon={IC.play(11)}>Run test</Btn>
-          {rules.length > 0 && <Badge label="Matched" bg={C.brandBg} color={C.brandDark} dot style={{ padding:"4px 9px" }}/>}
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <Btn kind="dark" size="sm" icon={IC.play(11)}
+            disabled={testContactIdx === "" || rules.length === 0}
+            onClick={()=>{
+              const c = sampleContacts[Number(testContactIdx)];
+              if (!c) return;
+              const perRule = rules.map(r => ({ r, pass: evalConditionRule(r, c) }));
+              const overall = matchMode === "any" ? perRule.some(x=>x.pass) : perRule.every(x=>x.pass);
+              setTestResult({ overall, perRule });
+            }}>Run test</Btn>
+          {testResult && (
+            <Badge
+              label={testResult.overall ? "Matched" : "Not matched"}
+              bg={testResult.overall ? C.brandBg : "#FFF3E0"}
+              color={testResult.overall ? C.brandDark : "#B04E0E"}
+              dot style={{ padding:"4px 9px" }}/>
+          )}
         </div>
-        {rules.length > 0 && (
-          <div style={{ background:"#fff", border:`1px solid ${C.cardBorder}`, borderRadius:8, padding:"8px 10px" }}>
-            {rules.map((r, i)=>(
-              <div key={i} style={{ display:"flex", alignItems:"center", gap:7, padding:"4px 0", fontSize:10.5, color:C.text3, borderBottom:i===rules.length-1?"none":`1px solid ${C.rowDiv}` }}>
-                <span style={{ color:C.brand, flexShrink:0 }}>{IC.ok(11)}</span>
+        {testContactIdx !== "" && rules.length === 0 && (
+          <div style={{ fontSize:10, color:C.muted, marginTop:8, fontStyle:"italic" }}>Add at least one condition above to test.</div>
+        )}
+        {testResult && (
+          <div style={{ background:"#fff", border:`1px solid ${C.cardBorder}`, borderRadius:8, padding:"8px 10px", marginTop:10 }}>
+            {testResult.perRule.map(({ r, pass }, i)=>(
+              <div key={i} style={{ display:"flex", alignItems:"center", gap:7, padding:"4px 0", fontSize:10.5, color:C.text3, borderBottom:i===testResult.perRule.length-1?"none":`1px solid ${C.rowDiv}` }}>
+                <span style={{ color: pass ? C.brand : C.red, flexShrink:0 }}>{pass ? IC.ok(11) : IC.err(11)}</span>
                 <span style={{ flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                  <strong style={{ color:C.text2 }}>{r.field}</strong> {r.op}{r.value?" "+r.value:""}
+                  <strong style={{ color:C.text2 }}>{r.source === "tags" ? "Tag: " : ""}{r.field}</strong> {r.op}{r.value && !["has tag","not has tag","is empty","is not empty","is true","is false"].includes(r.op) ? " " + r.value : ""}
                 </span>
+                <span style={{ fontSize:9, fontWeight:700, color: pass ? C.brandDark : C.red, flexShrink:0 }}>{pass ? "PASS" : "FAIL"}</span>
               </div>
             ))}
           </div>
@@ -1590,7 +1708,7 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
       </div>
 
       <Alert kind="info">
-        Some operators only apply to certain field types. Date operators (<em>is within last</em>, <em>is before</em>) need a date/time field. Tag operators (<em>has tag</em>) need a Tags source.
+        Numeric operators (<em>greater than</em>, <em>less than</em>) work on number fields like <strong>lead_score</strong>. Tag operators (<em>has tag</em>) need the Tags source. The Time source compares against IST business hours / weekday / hour.
       </Alert>
 
       <div style={{ display:"flex", gap:6, marginTop:14 }}>
@@ -1605,7 +1723,6 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
     const delayMode = node.delayMode || "duration";
     const waitValue = node.waitValue !== undefined ? node.waitValue : "10";
     const waitUnit  = node.waitUnit  || "minutes";
-    const useContactTz = !!node.useContactTz;
     const setNumeric = (v) => onUpdateNode(node.id, { waitValue: String(v).replace(/\D/g, "") });
     content = (<>
       <Field label="Delay type">
@@ -1639,14 +1756,14 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
       )}
 
       {delayMode === "date" && (
-        <Field label="Wait until date & time">
-          <Input type="datetime-local" defaultValue="2026-02-14T09:00"/>
+        <Field label="Wait until date & time" hint="Interpreted in IST. Capped at 7 days from now.">
+          <Input type="datetime-local" value={node.untilDateTime || ""} onChange={(e)=>onUpdateNode(node.id, { untilDateTime: e.target.value })}/>
         </Field>
       )}
 
       {delayMode === "field" && (
-        <Field label="Use date from custom field">
-          <Select>
+        <Field label="Use date from custom field" hint="The flow waits until the date stored in this field (e.g. an appointment date).">
+          <Select value={node.dateField || ""} onChange={(e)=>onUpdateNode(node.id, { dateField: e.target.value })}>
             <option value="">— Select a field —</option>
             {fieldNames.map(f => <option key={f} value={f}>{f}</option>)}
           </Select>
@@ -1654,19 +1771,12 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
       )}
 
       {delayMode === "until" && (
-        <Field label="Wait until time-of-day">
-          <Input type="time" defaultValue="09:00"/>
+        <Field label="Wait until time-of-day" hint="Next occurrence of this time in IST (today if still ahead, else tomorrow).">
+          <Input type="time" value={node.untilTime || ""} onChange={(e)=>onUpdateNode(node.id, { untilTime: e.target.value })}/>
         </Field>
       )}
 
-      <Field label="Use contact's timezone" hint="Detect timezone from the contact's country code. Off = use workspace timezone.">
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-          <span style={{ fontSize:12, color:C.text3 }}>Detect from phone number country code</span>
-          <Toggle value={useContactTz} onChange={(v)=>onUpdateNode(node.id, { useContactTz: v })}/>
-        </div>
-      </Field>
-
-      <Alert kind="warn">Delays beyond <strong>24 hours</strong> may require an approved WhatsApp template to re-engage the contact.</Alert>
+      <Alert kind="warn">Delays beyond <strong>24 hours</strong> may require an approved WhatsApp template to re-engage the contact. The delay is applied to the next message send.</Alert>
 
       <div style={{ display:"flex", gap:6, marginTop:14 }}>
         <Btn kind="primary" style={{ flex:1, justifyContent:"center" }} onClick={onSaveAndClose}>Save</Btn>
@@ -3515,7 +3625,7 @@ const MiniMap = ({ nodes, transform }) => {
    AUTOMATION BUILDER VIEW — exported component
    ══════════════════════════════════════════════════════════════════════ */
 
-const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, activeTab, onTabChange, initialExecutionId }) => {
+const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, activeTab, onTabChange, initialExecutionId, onNavigate }) => {
   const [toggleBusy, setToggleBusy] = useState(false);
   const handleToggleStatus = onToggleStatus ? async (next) => {
     if (toggleBusy) return;
@@ -3529,6 +3639,7 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
   const [otherAutomations, setOtherAutomations] = useState([]);
   const [whatsappAccounts, setWhatsappAccounts] = useState([]);
   const [assignableUsers, setAssignableUsers] = useState([]);
+  const [sampleContacts,  setSampleContacts]  = useState([]);
   const [loading,         setLoading]         = useState(true);
 
   useEffect(() => {
@@ -3559,6 +3670,18 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
         setOtherAutomations((flows || []).filter(f => f.id !== automation?.id));
         setWhatsappAccounts(accs || []);
         setAssignableUsers((usrs || []).filter(u => u.isActive !== false && (u.role === 'bda_sales' || u.role === 'admin')));
+
+        // Sample contacts for the Condition node's "Test with a sample contact".
+        // Non-fatal: if it fails the selector just shows "no contacts available".
+        try {
+          const nums = await api.numbers().catch(() => []);
+          const lists = await Promise.all((nums || []).slice(0, 5).map(n =>
+            api.savedContacts(n.wa_number)
+              .then(cs => (cs || []).map(c => ({ ...c, wa_number: n.wa_number })))
+              .catch(() => [])
+          ));
+          if (alive) setSampleContacts(lists.flat().slice(0, 200));
+        } catch { /* leave sampleContacts empty */ }
       } catch (e) {
         console.error("AutomationBuilderView load error:", e);
       } finally {
@@ -4021,6 +4144,14 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
     }
   };
 
+  // "Create new template" from a node's template picker: persist the current
+  // flow first (saved as a draft so nothing is lost), then deep-link to the
+  // Template Builder's new-template editor (#/template-builder/new).
+  const handleCreateTemplate = async () => {
+    try { await handleSave(); } catch { /* handleSave already surfaces errors */ }
+    if (onNavigate) onNavigate('template-builder', 'new');
+  };
+
   // Guard the Back button: if there are unsaved edits, ask before leaving so
   // the user can save or knowingly discard (reverts to the last saved version).
   const handleBack = () => {
@@ -4138,6 +4269,7 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
                 ...n, actions: (n.actions || []).filter(a => a.id !== bid)
               }))}
               onSelectTemplate={onSelectTemplate}
+              onCreateTemplate={handleCreateTemplate}
               templates={templates}
               teamMembers={teamMembers}
               tags={tags}
@@ -4145,6 +4277,7 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
               otherAutomations={otherAutomations}
               whatsappAccounts={whatsappAccounts}
               assignableUsers={assignableUsers}
+              sampleContacts={sampleContacts}
             />
           )}
 
@@ -4190,8 +4323,8 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
             </div>
             <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
               <Btn kind="ghost" onClick={()=>setBackConfirmOpen(false)}>Cancel</Btn>
-              <Btn kind="ghost" onClick={discardAndExit}>Discard &amp; exit</Btn>
-              <Btn kind="primary" onClick={saveAndExit}>{saving ? 'Saving…' : 'Save &amp; exit'}</Btn>
+              <Btn kind="ghost" onClick={discardAndExit}>Discard & exit</Btn>
+              <Btn kind="primary" onClick={saveAndExit}>{saving ? 'Saving…' : 'Save & exit'}</Btn>
             </div>
           </div>
         </div>

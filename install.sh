@@ -1,178 +1,144 @@
 #!/usr/bin/env bash
 #
-# ForgeChat one-command installer — macOS & Linux.
+# ForgeChat - one-command server installer.
 #
-# Collapses the manual README steps into a single interactive run:
-#   generates secrets, writes backend/.env, builds the images, starts the
-#   database, applies every migration, and brings the app up.
+# Deploys ForgeChat on a public server with automatic HTTPS (Let's Encrypt via
+# the bundled Caddy). It only asks for your domain; everything else - secrets,
+# database, migrations, certificate - is handled automatically on first boot.
 #
-# Safe to re-run: it never overwrites an existing backend/.env, so your
-# secrets are preserved. Delete backend/.env first if you want fresh ones.
+# Run it from inside the cloned repo:
+#   ./install.sh                      # interactive: prompts for your domain
+#   ./install.sh chat.example.com     # non-interactive (domain as an argument)
+#   DOMAIN=chat.example.com ./install.sh
 #
-#   Local (this computer):   bash install.sh
-#   Server (your domain):    bash install.sh    # then choose "2) Server"
+# Requirements: a server with a public IP, ports 80 + 443 free, and a domain
+# whose DNS A record points at this server. (For a local/laptop run without a
+# domain, use `docker compose up -d` instead - see the README.)
 #
 set -euo pipefail
+
 cd "$(dirname "$0")"
 
-say()  { printf '\033[1;36m%s\033[0m\n' "$*"; }
-ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
-warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
-die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
 
-# ── 0. Prerequisites ────────────────────────────────────────────────────────
-if ! command -v docker >/dev/null 2>&1; then
-  if [ "$(uname -s)" = "Linux" ]; then
-    say "Docker not found — installing it via get.docker.com (needs sudo)…"
-    curl -fsSL https://get.docker.com | sh
-  else
-    die "Docker Desktop isn't installed. Get it from https://www.docker.com/products/docker-desktop/ , start it, then re-run this script."
-  fi
+# -- pretty output ------------------------------------------------------------
+if [ -t 1 ]; then
+  BOLD=$(printf '\033[1m'); RED=$(printf '\033[31m'); GRN=$(printf '\033[32m')
+  YLW=$(printf '\033[33m'); CYN=$(printf '\033[36m'); RST=$(printf '\033[0m')
+else
+  BOLD=""; RED=""; GRN=""; YLW=""; CYN=""; RST=""
 fi
-docker compose version >/dev/null 2>&1 || die "Docker Compose v2 isn't available. Update Docker, then re-run."
-command -v openssl  >/dev/null 2>&1 || die "openssl is required but not found."
-docker info >/dev/null 2>&1 || die "Docker isn't running. Start Docker (Desktop), then re-run."
+ok()   { printf '%s\xe2\x9c\x93%s %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '%s!%s %s\n' "$YLW" "$RST" "$*"; }
+die()  { printf '%s%s%s\n' "$RED" "$*" "$RST" >&2; exit 1; }
+ask_continue() {
+  printf '%s [y/N]: ' "$1"
+  read -r _r
+  case "$_r" in y|Y|yes|YES) return 0 ;; *) die "Aborted." ;; esac
+}
 
-# ── 1. Mode ─────────────────────────────────────────────────────────────────
-say "ForgeChat installer"
-echo "  1) Local   — run on this computer at http://localhost (testing & demos)"
-echo "  2) Server  — production with your own domain + automatic HTTPS (24/7)"
-read -rp "Choose [1/2]: " choice
-case "$choice" in
-  1) MODE=local  ;;
-  2) MODE=server ;;
-  *) die "Please enter 1 or 2." ;;
+printf '%sForgeChat server installer%s\n' "$BOLD" "$RST"
+printf -- '------------------------------------------------------------\n'
+
+# -- 1. prerequisites ---------------------------------------------------------
+command -v docker >/dev/null 2>&1 \
+  || die "Docker isn't installed. Install it first:  curl -fsSL https://get.docker.com | sh"
+docker compose version >/dev/null 2>&1 \
+  || die "Docker Compose v2 isn't available. Update Docker, then re-run."
+if [ ! -f docker-compose.yml ] || [ ! -f docker-compose.prod.yml ]; then
+  die "Run this from the cloned ForgeChat directory (compose files not found here)."
+fi
+ok "Docker and Compose detected"
+
+# Is our stack already running? (a re-run, e.g. to renew/update) - so we don't
+# false-alarm on "ports in use" when the busy proxy is our own Caddy.
+ALREADY_UP=""
+if "${COMPOSE[@]}" ps --services --filter status=running 2>/dev/null | grep -q '^caddy$'; then
+  ALREADY_UP=1
+fi
+
+# -- 2. domain ----------------------------------------------------------------
+DOMAIN="${1:-${DOMAIN:-}}"
+if [ -z "$DOMAIN" ]; then
+  printf '\n'
+  printf 'Enter the domain this ForgeChat will be reached at.\n'
+  printf 'It must be a domain %syou own%s (e.g. chat.yourbusiness.com) whose DNS\n' "$BOLD" "$RST"
+  printf '%sA record points at this server%s. Do not use someone else'"'"'s domain.\n' "$BOLD" "$RST"
+  printf '%sDomain:%s ' "$CYN" "$RST"
+  read -r DOMAIN
+fi
+# normalise: strip whitespace, scheme, and any trailing path
+DOMAIN="$(printf '%s' "$DOMAIN" | tr -d '[:space:]')"
+DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"; DOMAIN="${DOMAIN%%/*}"
+[ -n "$DOMAIN" ] || die "A domain is required for a server install."
+case "$DOMAIN" in
+  *.*) : ;;
+  *)   die "\"$DOMAIN\" doesn't look like a domain (need something like chat.example.com)." ;;
 esac
+ok "Domain: $DOMAIN"
 
-# ── 2. Inputs ───────────────────────────────────────────────────────────────
-if [ "$MODE" = server ]; then
-  read -rp "Your domain (e.g. chat.yourbusiness.com): " DOMAIN
-  [ -n "${DOMAIN:-}" ] || die "A domain is required for server mode."
-  CORS="https://$DOMAIN"
-  default_email="you@$DOMAIN"
-  default_pw=""
-else
-  CORS="http://localhost"
-  default_email="admin@forgechat.local"
-  default_pw="Admin@123456"
-fi
-
-read -rp "Admin email [$default_email]: " ADMIN_EMAIL
-ADMIN_EMAIL="${ADMIN_EMAIL:-$default_email}"
-read -rsp "Admin password${default_pw:+ [$default_pw]}: " ADMIN_PASSWORD; echo
-ADMIN_PASSWORD="${ADMIN_PASSWORD:-$default_pw}"
-[ -n "$ADMIN_PASSWORD" ] || die "An admin password is required."
-
-# ── 3. docker-compose.yml + Caddyfile ───────────────────────────────────────
-[ -f docker-compose.yml ] || cp docker-compose.sample.yml docker-compose.yml
-if [ "$MODE" = server ]; then
-  # sed -i.bak works on both GNU (Linux) and BSD (macOS) sed
-  sed -i.bak "s/forgechat\.example\.com/$DOMAIN/g" Caddyfile && rm -f Caddyfile.bak
-  ok "Caddyfile pointed at $DOMAIN"
-else
-  # Local mode never starts Caddy, so nothing maps host port 80 — the frontend's
-  # internal nginx (port 80) is unreachable from the host. Inject a "80:80"
-  # mapping on the forgecrm-frontend service so http://localhost works out of
-  # the box. Idempotent: only inject if forgecrm-frontend doesn't already have
-  # that port mapping inside its own block (the sample file has "80:80" under
-  # the unrelated caddy service, so a file-wide grep would false-positive).
-  has_port=$(awk '
-    /^  forgecrm-frontend:[[:space:]]*$/ { in_block=1; next }
-    /^  [a-z][a-z0-9_-]*:[[:space:]]*$/ { in_block=0 }
-    in_block && /^[[:space:]]+- "80:80"[[:space:]]*$/ { print "yes"; exit }
-  ' docker-compose.yml)
-  if [ "$has_port" != "yes" ]; then
-    awk '
-      /^  forgecrm-frontend:[[:space:]]*$/ && !done {
-        print
-        print "    ports:"
-        print "      - \"80:80\""
-        done = 1
-        next
-      }
-      { print }
-    ' docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
-    ok "Mapped frontend on host port 80 (local mode)"
+# -- 3. pre-flight: ports 80/443 free -----------------------------------------
+if [ -z "$ALREADY_UP" ] && command -v ss >/dev/null 2>&1; then
+  busy=""
+  ss -ltn 2>/dev/null | grep -qE ':80($| )'  && busy="80"
+  ss -ltn 2>/dev/null | grep -qE ':443($| )' && busy="${busy:+$busy and }443"
+  if [ -n "$busy" ]; then
+    warn "Something is already using port $busy on this server."
+    warn "ForgeChat's HTTPS proxy needs 80 and 443 free - another web server or"
+    warn "reverse proxy is probably running. Stop it, or use a clean server."
+    ask_continue "Continue anyway?"
+  else
+    ok "Ports 80 and 443 are free"
   fi
 fi
 
-# ── 4. Secrets → backend/.env (never overwrite) ─────────────────────────────
-VERIFY=""
-if [ -f backend/.env ]; then
-  warn "backend/.env already exists — keeping it (delete it first to regenerate secrets)."
+# -- 4. pre-flight: does the domain point at this server? ---------------------
+# The #1 cause of a failed HTTPS setup is the DNS A record not pointing here yet
+# - Let's Encrypt then can't verify the domain and no certificate is issued.
+myip="$(curl -fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -fsS --max-time 6 https://ifconfig.me 2>/dev/null || true)"
+domip="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')"
+if [ -n "$myip" ] && [ "$domip" = "$myip" ]; then
+  ok "$DOMAIN points at this server ($myip)"
+elif [ -n "$myip" ] && [ -n "$domip" ]; then
+  warn "$DOMAIN currently resolves to $domip, but this server is $myip."
+  warn "Add/fix the DNS A record:  $DOMAIN  ->  $myip   (then HTTPS can be issued)."
+  ask_continue "Continue anyway (the certificate will fail until DNS is fixed)?"
+elif [ -n "$myip" ]; then
+  warn "$DOMAIN doesn't resolve yet."
+  warn "Add a DNS A record:  $DOMAIN  ->  $myip   (then HTTPS can be issued)."
+  ask_continue "Continue anyway (the certificate will fail until DNS is fixed)?"
+fi
+
+# -- 5. deploy ----------------------------------------------------------------
+printf '\n%sStarting ForgeChat for %s%s - building images (first run takes a few minutes)...\n' "$BOLD" "$DOMAIN" "$RST"
+DOMAIN="$DOMAIN" "${COMPOSE[@]}" up -d --build
+
+# -- 6. wait for HTTPS, then summarise ----------------------------------------
+url="https://$DOMAIN"
+printf '\nWaiting for the HTTPS certificate (Caddy + Let'"'"'s Encrypt)...\n'
+ready=""
+for _ in $(seq 1 30); do
+  code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null || true)"
+  case "$code" in 200|30[0-9]) ready=1; break ;; esac
+  sleep 4
+done
+
+printf -- '------------------------------------------------------------\n'
+if [ -n "$ready" ]; then
+  ok "ForgeChat is live at ${BOLD}${url}${RST}"
 else
-  PGPASS=$(openssl rand -hex 24)
-  JWT=$(openssl rand -hex 32)
-  ENCKEY=$(openssl rand -hex 32)
-  VERIFY=$(openssl rand -hex 16)
-  cat > backend/.env <<EOF
-NODE_ENV=production
-PORT=3011
-POSTGRES_PASSWORD=${PGPASS}
-DATABASE_URL=postgresql://postgres:${PGPASS}@forgecrm-db:5432/postgres
-POSTGRES_SSL=false
-REDIS_URL=redis://redis:6379
-JWT_SECRET=${JWT}
-FORGECRM_ENCRYPTION_KEY=${ENCKEY}
-CORS_ORIGIN=${CORS}
-META_API_VERSION=v21.0
-META_WEBHOOK_VERIFY_TOKEN=${VERIFY}
-MEDIA_DIR=/app/media
-ADMIN_EMAIL=${ADMIN_EMAIL}
-ADMIN_PASSWORD=${ADMIN_PASSWORD}
+  warn "Containers are up, but $url didn't answer yet."
+  warn "If you just pointed DNS, give the certificate a minute, then reload."
+  warn "Watch the proxy logs:  ${COMPOSE[*]} logs -f caddy"
+fi
+cat <<EOF
+
+Next steps:
+  1. Open ${BOLD}${url}${RST} and create your admin account.
+  2. Connect WhatsApp in Settings (see the README, "Connect your WhatsApp").
+
+Manage it later from this folder:
+  ${COMPOSE[*]} ps          # status
+  ${COMPOSE[*]} logs -f     # logs
+  ${COMPOSE[*]} down        # stop
 EOF
-  chmod 600 backend/.env
-  ok "Wrote backend/.env"
-fi
-
-# ── 5. Build + database + migrations ────────────────────────────────────────
-say "Building images (first run takes a few minutes)…"
-docker compose build
-
-say "Starting database + Redis…"
-docker compose up -d forgecrm-db redis
-printf "Waiting for the database to be ready"
-until [ "$(docker inspect -f '{{.State.Health.Status}}' forgecrm-db 2>/dev/null || true)" = "healthy" ]; do
-  printf '.'; sleep 2
-done
-printf '\n'
-
-say "Creating the schema and applying all migrations…"
-docker compose exec -T forgecrm-db psql -U postgres -d postgres >/dev/null <<'SQL'
-CREATE SCHEMA IF NOT EXISTS coexistence;
-CREATE TABLE IF NOT EXISTS coexistence.forgecrm_users (
-  id BIGSERIAL PRIMARY KEY,
-  username TEXT NOT NULL UNIQUE,
-  email TEXT NOT NULL UNIQUE,
-  password TEXT NOT NULL,
-  display_name TEXT,
-  role TEXT NOT NULL DEFAULT 'viewer',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-SQL
-for f in $(ls db/migrations/*.sql | sort); do
-  docker compose exec -T forgecrm-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < "$f" >/dev/null
-done
-ok "Database ready."
-
-# ── 6. Start the app ────────────────────────────────────────────────────────
-if [ "$MODE" = server ]; then
-  docker compose up -d forgecrm-backend forgecrm-frontend caddy
-  URL="https://$DOMAIN"
-else
-  docker compose up -d forgecrm-backend forgecrm-frontend
-  URL="http://localhost"
-fi
-
-echo
-ok "ForgeChat is up!"
-echo "  Open:   $URL"
-echo "  Login:  $ADMIN_EMAIL"
-[ -n "$VERIFY" ] && echo "  Webhook verify token: $VERIFY   (save this — you'll need it when connecting WhatsApp)"
-if [ "$MODE" = local ]; then
-  echo
-  echo "To let WhatsApp reach this computer, open a Cloudflare Tunnel (no account needed):"
-  echo "  cloudflared tunnel --url http://localhost:80"
-  echo "then point CORS_ORIGIN + the Meta webhook at the https://…trycloudflare.com URL it prints."
-fi

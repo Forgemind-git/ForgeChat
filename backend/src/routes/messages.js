@@ -11,7 +11,7 @@ const { uploadMedia } = require('../integrations/metaSend');
 const { markAccountHealth, classifyMetaError } = require('../services/accountHealth');
 const storage = require('../util/pgStorage');
 const { syncMediaToAccount } = require('./mediaLibrary');
-const { userWaNumbers, assertWaAccess, assertContactAccess } = require('../middleware/access');
+const { assertWaAccess, assertContactAccess } = require('../middleware/access');
 const { isAdmin } = require('../permissions');
 const { canonicalizeMime, chatKindFor, CHAT_TYPES_MSG } = require('../util/metaMime');
 const ExcelJS = require('exceljs');
@@ -510,6 +510,65 @@ router.post('/contacts/import', sheetUpload.single('file'), async (req, res) => 
     console.error('[messages] /contacts/import error:', err.message);
     res.status(500).json({ error: 'Failed to import contacts' });
   }
+});
+
+// POST /api/contacts/change-number — change a contact's phone number, migrating
+// the whole conversation + history to the new number atomically. contact_number
+// is part of the composite key joined by many tables, so every coexistence table
+// keyed on (wa_number, contact_number) is updated in one transaction.
+router.post('/contacts/change-number', async (req, res) => {
+  const { waNumber, oldNumber } = req.body || {};
+  let { newNumber } = req.body || {};
+  if (!waNumber || !oldNumber || !newNumber) {
+    return res.status(400).json({ error: 'waNumber, oldNumber and newNumber required' });
+  }
+  // Store digits-only, matching how the webhook/import paths persist numbers.
+  newNumber = String(newNumber).replace(/\D/g, '');
+  if (newNumber.length < 7) {
+    return res.status(400).json({ error: 'Enter a valid phone number (digits only, at least 7 digits)' });
+  }
+  // BDAs may only edit a contact assigned to them; admins may edit any.
+  if (!(await assertContactAccess(req, res, waNumber, oldNumber))) return;
+
+  if (newNumber === String(oldNumber)) {
+    return res.json({ ok: true, contactNumber: newNumber, unchanged: true });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const src = await client.query(
+      'SELECT 1 FROM coexistence.contacts WHERE wa_number = $1 AND contact_number = $2',
+      [waNumber, oldNumber]
+    );
+    if (src.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Contact not found' });
+    }
+    const clash = await client.query(
+      'SELECT 1 FROM coexistence.contacts WHERE wa_number = $1 AND contact_number = $2',
+      [waNumber, newNumber]
+    );
+    if (clash.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'A contact with that number already exists for this WhatsApp number' });
+    }
+    // Migrate every table keyed on (wa_number, contact_number).
+    await client.query('UPDATE coexistence.contacts SET contact_number = $3, updated_at = NOW() WHERE wa_number = $1 AND contact_number = $2', [waNumber, oldNumber, newNumber]);
+    await client.query('UPDATE coexistence.chat_history SET contact_number = $3 WHERE wa_number = $1 AND contact_number = $2', [waNumber, oldNumber, newNumber]);
+    await client.query('UPDATE coexistence.conversation_reads SET contact_number = $3 WHERE wa_number = $1 AND contact_number = $2', [waNumber, oldNumber, newNumber]);
+    await client.query('UPDATE coexistence.message_reactions SET contact_number = $3 WHERE wa_number = $1 AND contact_number = $2', [waNumber, oldNumber, newNumber]);
+    await client.query('UPDATE coexistence.automation_executions SET contact_number = $3 WHERE wa_number = $1 AND contact_number = $2', [waNumber, oldNumber, newNumber]);
+    await client.query('UPDATE coexistence.deals SET contact_number = $3 WHERE contact_wa_number = $1 AND contact_number = $2', [waNumber, oldNumber, newNumber]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[messages] /contacts/change-number error:', err.message);
+    return res.status(500).json({ error: 'Failed to change contact number' });
+  } finally {
+    client.release();
+  }
+  res.json({ ok: true, contactNumber: newNumber });
 });
 
 // DELETE /api/contact?waNumber=xxx&contactNumber=xxx — remove the saved contact

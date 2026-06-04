@@ -3,10 +3,19 @@ const pool = require('../db');
 const { decrypt } = require('../util/crypto');
 const { safeEqual, verifyMetaSignature } = require('../util/webhookSignature');
 const { evaluateTriggers, resumeAutomation } = require('../engine/automationEngine');
+const agentRouter = require('../services/agentRouter');
 const { markPending, MEDIA_TYPES } = require('../services/mediaDownloader');
 const { enqueueMediaDownload } = require('../queue/mediaQueue');
+const bus = require('../events');
 
 const router = Router();
+
+// Monotonic ordering of a message's delivery lifecycle. Meta delivers status
+// receipts at-least-once and can reorder them (a retried 'delivered' may land
+// after 'read'), so status must only ever ADVANCE — never downgrade a blue
+// double-tick back to grey. 'failed' ranks alongside 'delivered' so it can land
+// on a sent/queued message but never overwrites a real delivered/read.
+const STATUS_RANK = { sending: 0, sent: 1, delivered: 2, read: 3, played: 3, failed: 2 };
 
 /**
  * Parse a Meta WhatsApp Cloud API webhook payload and extract message records.
@@ -180,12 +189,86 @@ function parseMetaPayload(body) {
   return records;
 }
 
+/* ------------------------------------------------------------------ *
+ * Webhook audit trail. Every raw payload is stored in webhook_events so the
+ * status reconciler (services/statusReconciler.js) can re-derive a message's
+ * true delivery/read status from the stored receipts — self-healing any tick
+ * that was missed live (e.g. a receipt that landed before markSent() swapped
+ * the local id for Meta's wamid). `payload_kind='statuses'` is what the
+ * reconciler filters on.
+ * ------------------------------------------------------------------ */
+function pickPhoneNumberId(body) {
+  return body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id || null;
+}
+
+function inferPayloadKind(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'unknown';
+  if (body.object !== 'whatsapp_business_account') return 'unknown';
+  const change = body.entry?.[0]?.changes?.[0];
+  if (!change) return 'unknown';
+  const field = change.field;
+  if (field === 'message_template_status_update') return 'template_status_update';
+  if (field === 'account_update') return 'account_update';
+  const value = change.value || {};
+  if (Array.isArray(value.message_echoes) && value.message_echoes.length > 0) return 'message_echoes';
+  if (Array.isArray(value.messages) && value.messages.length > 0) return 'messages';
+  if (Array.isArray(value.statuses) && value.statuses.length > 0) return 'statuses';
+  return field || 'unknown';
+}
+
+function inferPayloadSubtype(body) {
+  const value = body?.entry?.[0]?.changes?.[0]?.value;
+  if (!value) return null;
+  if (Array.isArray(value.messages) && value.messages.length > 0) return value.messages[0].type || null;
+  if (Array.isArray(value.statuses) && value.statuses.length > 0) return value.statuses[0].status || null;
+  if (Array.isArray(value.message_echoes) && value.message_echoes.length > 0) return value.message_echoes[0].type || null;
+  return null;
+}
+
+async function logWebhookReceived({ payload, headers, remoteIp, source }) {
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.webhook_events
+         (source, remote_ip, request_headers, payload, payload_kind, payload_subtype, meta_object, phone_number_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id`,
+      [
+        source || 'meta', remoteIp || null, JSON.stringify(headers || {}),
+        JSON.stringify(payload), inferPayloadKind(payload), inferPayloadSubtype(payload),
+        payload?.object || null, pickPhoneNumberId(payload),
+      ]
+    );
+    return rows[0].id;
+  } catch (err) {
+    console.error('[webhook-audit] insert failed:', err.message);
+    return null;
+  }
+}
+
+async function logWebhookProcessed(id, { status, recordsExtracted, error, processingMs }) {
+  if (!id) return;
+  try {
+    await pool.query(
+      `UPDATE coexistence.webhook_events
+          SET processing_status = $1, records_extracted = $2, processing_error = $3, processing_ms = $4
+        WHERE id = $5`,
+      [status, recordsExtracted || 0, error ? String(error).slice(0, 500) : null, processingMs || null, id]
+    );
+  } catch (err) {
+    console.error('[webhook-audit] update failed:', err.message);
+  }
+}
+
 /**
  * POST /api/webhook/whatsapp
- * Receives raw Meta WhatsApp webhook payloads forwarded by n8n.
- * No auth required — called by internal n8n instance.
+ * Receives raw Meta WhatsApp webhook payloads. Meta posts here directly.
+ * No auth required — this is Meta's public callback URL.
  */
 router.post('/webhook/whatsapp', async (req, res) => {
+  const startTime = Date.now();
+  const remoteIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || null;
+  const source = 'meta';
+  let auditId = null;
   try {
     // Authenticity: this endpoint is necessarily unauthenticated (public), so
     // the control is Meta's HMAC signature. When META_APP_SECRET is configured
@@ -199,12 +282,15 @@ router.post('/webhook/whatsapp', async (req, res) => {
       console.warn('[webhook] META_APP_SECRET not set — inbound webhook signature NOT verified (set it to reject forged payloads).');
     }
 
+    auditId = await logWebhookReceived({ payload: req.body, headers: req.headers, remoteIp, source });
+
     const payload = req.body;
     if (!payload) {
+      await logWebhookProcessed(auditId, { status: 'error', error: 'Empty payload', processingMs: Date.now() - startTime });
       return res.status(400).json({ error: 'Empty payload' });
     }
 
-    // Support both array of payloads (n8n batch) and single payload
+    // Support both a single payload and an array of payloads (batched)
     const payloads = Array.isArray(payload) ? payload : [payload];
     const allRecords = [];
     for (const p of payloads) {
@@ -214,10 +300,14 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
     if (allRecords.length === 0) {
       // Acknowledge non-message webhooks (e.g. verification, errors)
+      await logWebhookProcessed(auditId, { status: 'processed', recordsExtracted: 0, processingMs: Date.now() - startTime });
       return res.status(200).json({ ok: true, stored: 0 });
     }
 
     const client = await pool.connect();
+    // Status receipts whose UPDATE actually advanced a row — pushed to SSE
+    // subscribers after COMMIT so open chats flip the tick instantly.
+    const statusUpdates = [];
     try {
       await client.query('BEGIN');
 
@@ -227,10 +317,33 @@ router.post('/webhook/whatsapp', async (req, res) => {
         // produced phantom "Status: delivered" bubbles. If no matching message
         // exists (e.g. an app-sent message we don't track), this is a no-op.
         if (r.message_type === 'status') {
-          await client.query(
-            `UPDATE coexistence.chat_history SET status = $1 WHERE message_id = $2`,
-            [r.status, r.message_id]
+          // On a 'failed' receipt, capture Meta's reason (code + title) so the
+          // UI can explain WHY instead of a bare red icon.
+          let failedError = null;
+          if (r.status === 'failed' && Array.isArray(r.errors) && r.errors.length > 0) {
+            const e = r.errors[0] || {};
+            const detail = e.error_data?.details || e.title || e.message || 'Message failed to send';
+            failedError = (e.code != null ? `[${e.code}] ` : '') + detail;
+          }
+          const newRank = STATUS_RANK[r.status] ?? 0;
+          // Only ADVANCE the status — never let a reordered/duplicate receipt
+          // downgrade a higher state (the read→grey-tick bug).
+          const upd = await client.query(
+            `UPDATE coexistence.chat_history
+                SET status = $1,
+                    error_message = CASE WHEN $1 = 'failed' AND $4::text IS NOT NULL
+                                         THEN $4 ELSE error_message END
+              WHERE message_id = $2
+                AND $3 > (CASE status
+                            WHEN 'sending' THEN 0 WHEN 'sent' THEN 1 WHEN 'delivered' THEN 2
+                            WHEN 'read' THEN 3 WHEN 'played' THEN 3 WHEN 'failed' THEN 2 ELSE 0 END)
+              RETURNING wa_number, contact_number, message_id`,
+            [r.status, r.message_id, newRank, failedError]
           );
+          if (upd.rowCount > 0) {
+            const row = upd.rows[0];
+            statusUpdates.push({ waNumber: row.wa_number, contactNumber: row.contact_number, messageId: row.message_id, status: r.status });
+          }
           continue;
         }
 
@@ -293,6 +406,26 @@ router.post('/webhook/whatsapp', async (req, res) => {
         }
       }
 
+      // Self-heal the connected account's business number. If the Meta lookup at
+      // connect time failed (e.g. an invalid/expired access token), the account's
+      // display_phone_number was saved blank — which hides every chat for this
+      // number from the Chats list even though the messages are stored. The
+      // inbound webhook carries the real number (metadata.display_phone_number),
+      // so backfill it here, keyed on the stable phone_number_id. Only fills when
+      // blank, so a correct value is never overwritten.
+      const backfilled = new Set();
+      for (const r of allRecords) {
+        if (!r.phone_number_id || !r.wa_number || backfilled.has(r.phone_number_id)) continue;
+        backfilled.add(r.phone_number_id);
+        await client.query(
+          `UPDATE coexistence.whatsapp_accounts
+              SET display_phone_number = $1, updated_at = NOW()
+            WHERE phone_number_id = $2
+              AND COALESCE(display_phone_number, '') = ''`,
+          [r.wa_number, r.phone_number_id]
+        );
+      }
+
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
@@ -300,6 +433,11 @@ router.post('/webhook/whatsapp', async (req, res) => {
     } finally {
       client.release();
     }
+
+    // Push live tick updates to any open chat (after COMMIT so subscribers only
+    // ever see committed state). Best-effort — a missed push self-heals on the
+    // next 15s poll.
+    for (const u of statusUpdates) bus.emit('message-status', u);
 
     // Evaluate automation triggers
     // 1. For incoming messages (keyword, anyMessage, newContact triggers)
@@ -328,7 +466,18 @@ router.post('/webhook/whatsapp', async (req, res) => {
             }
             continue; // do not also fire fresh triggers
           }
-          await evaluateTriggers(record);
+          const fired = await evaluateTriggers(record);
+          // Agent fall-through: if no keyword automation matched, hand the
+          // message to the agent bound to this WhatsApp account (if any active
+          // agent exists). evaluateTriggers returns the array of executions
+          // it created; an empty array means nothing fired.
+          if (!fired || fired.length === 0) {
+            try {
+              await agentRouter.routeIfActive(record);
+            } catch (agentErr) {
+              console.error('[webhook] Agent routing error:', agentErr.message);
+            }
+          }
         } catch (triggerErr) {
           console.error('[webhook] Trigger evaluation error:', triggerErr.message);
         }
@@ -356,10 +505,12 @@ router.post('/webhook/whatsapp', async (req, res) => {
     }
 
     console.log(`[webhook] Stored ${allRecords.length} record(s)`);
+    await logWebhookProcessed(auditId, { status: 'processed', recordsExtracted: allRecords.length, processingMs: Date.now() - startTime });
     res.status(200).json({ ok: true, stored: allRecords.length });
   } catch (err) {
     console.error('[webhook] Error:', err.message);
-    // Always return 200 to n8n so it doesn't retry infinitely. Use a static
+    await logWebhookProcessed(auditId, { status: 'error', error: err.message, processingMs: Date.now() - startTime });
+    // Always return 200 so Meta doesn't retry infinitely. Use a static
     // message — err.message can carry internal Postgres/schema details.
     res.status(200).json({ ok: false, error: 'Processing error' });
   }
@@ -367,8 +518,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
 /**
  * GET /api/webhook/whatsapp
- * Meta webhook verification endpoint (for direct Meta → ForgeChat webhooks).
- * Not needed for n8n forwarding, but included for completeness.
+ * Meta webhook verification endpoint (hub.challenge handshake).
  */
 router.get('/webhook/whatsapp', async (req, res) => {
   const mode = req.query['hub.mode'];

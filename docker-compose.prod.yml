@@ -1,0 +1,41 @@
+# Production overlay — public HTTPS via Caddy (automatic Let's Encrypt certs).
+# WhatsApp requires a public HTTPS URL, so use this on a server with a domain.
+#
+# Point your domain's DNS A record at this server, open ports 80 + 443, then:
+#   DOMAIN=chat.example.com docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Caddy obtains/renews the certificate automatically and reverse-proxies to the
+# frontend. The webhook URL the app shows (window.location.origin) is then your
+# public https URL — paste it straight into Meta.
+
+services:
+  # In production the browser's Origin is the public https domain, so the
+  # backend must allow it — otherwise POSTs (e.g. the first-run admin setup)
+  # fail the CORS check and return 500. Deriving it from DOMAIN also lets the
+  # CSP allow wss://<domain> for live updates.
+  forgecrm-backend:
+    environment:
+      CORS_ORIGIN: https://${DOMAIN:?Set DOMAIN, e.g. DOMAIN=chat.example.com}
+
+  # Stop publishing the plain-HTTP dev port; Caddy is the only public entrypoint.
+  forgecrm-frontend:
+    ports: !reset []
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN, e.g. DOMAIN=chat.example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - forgecrm-frontend
+
+volumes:
+  caddy_data:
+  caddy_config:

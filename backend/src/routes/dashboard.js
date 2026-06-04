@@ -409,7 +409,7 @@ router.get('/dashboard/details', async (req, res) => {
     // Reusable display-name expression for a contacts alias.
     const nameExpr = (a) => `COALESCE(NULLIF(${a}.name,''), NULLIF(${a}.profile_name,''), ${a}.contact_number)`;
 
-    let title = '';
+    let title;
     let items = [];
 
     switch (metric) {

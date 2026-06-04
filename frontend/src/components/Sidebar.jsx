@@ -1,12 +1,14 @@
 import {
   Home, Zap, LayoutTemplate, MessageCircle, Users,
-  Megaphone, Image as ImageIcon, Info, KanbanSquare,
+  Megaphone, Image as ImageIcon, Info, KanbanSquare, Bot,
+  ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import { C, FONT } from '../constants.js';
 
 const NAV_ITEMS = [
   { id: 'home', label: 'Home', Icon: Home },
   { id: 'chatbot-builder', label: 'Automations', Icon: Zap },
+  { id: 'ai-agent-builder', label: 'AI Agents', Icon: Bot },
   { id: 'template-builder', label: 'Template Builder', Icon: LayoutTemplate },
   { id: 'media-library', label: 'Media', Icon: ImageIcon },
   { id: 'chats', label: 'Chats', Icon: MessageCircle },
@@ -107,11 +109,11 @@ export default function Sidebar({ activePage, onPageChange, collapsed, setCollap
           onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
           title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         >
-          <span style={{ fontSize: 13, color: '#888', fontWeight: 600, lineHeight: 1 }}>
-            {collapsed ? '›' : '‹'}
+          <span style={{ display: 'flex', alignItems: 'center', color: '#888', lineHeight: 1 }}>
+            {collapsed ? <ChevronRight size={22} strokeWidth={2.5} /> : <ChevronLeft size={22} strokeWidth={2.5} />}
           </span>
           {!collapsed && (
-            <span style={{ fontSize: 12, fontWeight: 600, color: '#888', fontFamily: FONT }}>
+            <span style={{ fontSize: 15, fontWeight: 600, color: '#888', fontFamily: FONT, lineHeight: 1 }}>
               Collapse
             </span>
           )}

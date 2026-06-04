@@ -1,29 +1,18 @@
 // AES-256-GCM symmetric encryption for sensitive secrets stored in the DB
 // (currently: Meta WhatsApp access tokens). Format: base64(iv || tag || ct)
 // where iv=12B, tag=16B, ct=variable. Derives a 32-byte key by SHA-256 of
-// FORGECRM_ENCRYPTION_KEY (falls back to JWT_SECRET so dev doesn't break).
+// FORGECRM_ENCRYPTION_KEY.
+//
+// The key is guaranteed present + strong by util/instanceSecrets.bootstrapSecrets(),
+// which runs first in index.js (resolves from env, else a persisted file, else
+// auto-generates one). So there is no boot-time guard here anymore; we only keep
+// a defensive fallback for non-standard entry points (tests/scripts).
 
 const crypto = require('crypto');
 
 const RAW = process.env.FORGECRM_ENCRYPTION_KEY || process.env.JWT_SECRET || '';
-// In production, require a dedicated encryption key — don't silently fall back
-// to JWT_SECRET (or an empty key) for access tokens stored at rest. Also reject
-// the well-known placeholders from .env.example / DEPLOY.md and low-entropy
-// values (the source is public).
-const WEAK_KEYS = new Set([
-  'change-this-to-another-random-string',
-  'change-this-to-a-random-string',
-  'forgecrm-dev-secret-change-me',
-]);
-if (process.env.NODE_ENV === 'production' &&
-    (!process.env.FORGECRM_ENCRYPTION_KEY ||
-     WEAK_KEYS.has(process.env.FORGECRM_ENCRYPTION_KEY) ||
-     process.env.FORGECRM_ENCRYPTION_KEY.length < 32)) {
-  console.error('[crypto] FATAL: FORGECRM_ENCRYPTION_KEY must be a strong, unique value (>=32 chars) in production. Generate one with: openssl rand -hex 32');
-  process.exit(1);
-}
 if (!RAW) {
-  console.warn('[crypto] WARNING: neither FORGECRM_ENCRYPTION_KEY nor JWT_SECRET set — encryption will use empty key');
+  console.warn('[crypto] WARNING: no encryption key in env — encryption will use an empty key. Run via index.js so instanceSecrets bootstraps one.');
 }
 const KEY = crypto.createHash('sha256').update(RAW).digest(); // 32 bytes
 
