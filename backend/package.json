@@ -11,9 +11,9 @@
     "test": "node --test test/"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.99.0",
+    "@anthropic-ai/sdk": "^0.100.1",
     "bcryptjs": "^2.4.3",
-    "bullmq": "^5.77.6",
+    "bullmq": "^5.78.0",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -22,10 +22,10 @@
     "express-rate-limit": "^7.3.1",
     "googleapis": "^172.0.0",
     "helmet": "^7.1.0",
-    "ioredis": "^5.11.0",
+    "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",
-    "openai": "^6.0.0",
+    "openai": "^6.42.0",
     "pg": "^8.21.0"
   },
   "devDependencies": {
