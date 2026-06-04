@@ -33,7 +33,7 @@
 </p>
 
 <p align="center">
-  <sub>Need a server to run it on? <a href="https://www.hostinger.com/in?REFERRALCODE=RZ8CONTACT7T"><strong>Get a Hostinger VPS at 20% off</strong></a> (referral link).</sub>
+  <sub>Need a server to run it on? <a href="https://www.hostinger.com/in?REFERRALCODE=RZ8CONTACT7T"><strong>Get a Hostinger VPS at 20% off</strong></a>.</sub>
 </p>
 
 ---
@@ -164,7 +164,7 @@ No config files, no secrets, no database commands — ForgeChat sets everything 
 
 This is the **production** path. To actually **send and receive WhatsApp messages**, the app needs a public web address (`https://…`) that Meta can reach — a plain `localhost` install can't receive messages.
 
-1. Rent a small server (**2 GB+ RAM**) with ports **80** and **443** free — e.g. a **[Hostinger VPS at 20% off](https://www.hostinger.com/in?REFERRALCODE=RZ8CONTACT7T)** (referral link).
+1. Rent a small server (**2 GB+ RAM**) with ports **80** and **443** free — e.g. a **[Hostinger VPS at 20% off](https://www.hostinger.com/in?REFERRALCODE=RZ8CONTACT7T)**.
 2. Register a domain you own and point its DNS **A record** at the server's IP address.
 3. Install Docker (`curl -fsSL https://get.docker.com | sh`), then clone and run the installer:
    ```bash
