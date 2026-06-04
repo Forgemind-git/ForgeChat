@@ -4,37 +4,23 @@ const pool = require('../db');
 const { requirePermission } = require('../middleware/access');
 const { resolveAccount, insertPendingRow } = require('../services/messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
+const { buildTemplateComponents, resolveTemplateText } = require('../services/templateComponents');
 
-/**
- * Build Meta template `components` array from variable_mapping + recipient ctx.
- * variable_mapping is { "1": "<source>", "2": "<source>" } where <source> is
- * either a literal string or a placeholder like "{{contact.name}}".
- */
-function buildTemplateComponents(template, variableMapping, recipient, headerMediaId) {
-  const components = [];
-
-  // Header component. Media headers (IMAGE/VIDEO/DOCUMENT) require the header
-  // media as a runtime parameter (resolved to a per-account Meta media id);
-  // omitting it causes Meta error 132012. TEXT headers only need a parameter
-  // when they contain a {{1}} variable. Static TEXT / NONE need no header param.
-  const ht = String(template.header_type || 'NONE').toUpperCase();
-  if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(ht) && headerMediaId) {
-    const key = ht.toLowerCase(); // image | video | document
-    components.push({ type: 'header', parameters: [{ type: key, [key]: { id: headerMediaId } }] });
-  }
-
-  const bodyVars = Object.keys(variableMapping || {}).sort((a, b) => +a - +b);
-  if (bodyVars.length > 0) {
-    const parameters = bodyVars.map(k => {
-      let val = String(variableMapping[k] || '');
-      val = val.replace(/\{\{contact\.name\}\}/g, recipient.name || '');
-      val = val.replace(/\{\{contact\.number\}\}/g, recipient.contact_number || '');
-      return { type: 'text', text: val || ' ' };
-    });
-    components.push({ type: 'body', parameters });
-  }
-
-  return components;
+// Load per-recipient context (name + custom_fields + tags) so field-mapped
+// template variables (custom_fields.X / category_tag.X) resolve to each
+// contact's real value. Keyed by digits-only phone number.
+async function loadContactContext(numbers) {
+  const map = new Map();
+  const list = [...new Set((numbers || []).map(n => String(n).replace(/\D/g, '')).filter(Boolean))];
+  if (list.length === 0) return map;
+  const { rows } = await pool.query(
+    `SELECT regexp_replace(contact_number, '\\D', '', 'g') AS num, name, custom_fields, tags
+       FROM coexistence.contacts
+      WHERE regexp_replace(contact_number, '\\D', '', 'g') = ANY($1::text[])`,
+    [list]
+  );
+  for (const r of rows) { if (!map.has(r.num)) map.set(r.num, r); }
+  return map;
 }
 
 async function enqueueBroadcastRecipient({ broadcast, template, account, recipient, broadcastLogId, resolvedMediaId }) {
@@ -43,15 +29,28 @@ async function enqueueBroadcastRecipient({ broadcast, template, account, recipie
   // ── Template ──────────────────────────────────────────────────────────
   if (msgType === 'template') {
     // resolvedMediaId doubles as the header image for media-header templates.
-    const components = buildTemplateComponents(template, broadcast.variable_mapping, recipient, resolvedMediaId);
+    const components = buildTemplateComponents({
+      template,
+      values: broadcast.variable_mapping,
+      headerMediaId: resolvedMediaId,
+      recipient,
+    });
+    // Store the RESOLVED body ({{1}} → the recipient's real value) so the Chats
+    // view shows the actual message, exactly like WhatsApp — not raw {{1}}.
+    const resolvedBody = resolveTemplateText(
+      template.body, broadcast.variable_mapping, template.samples, recipient,
+    );
     const localId = await insertPendingRow({
       account,
       toNumber: recipient.contact_number,
       messageType: 'template',
-      messageBody: template.body || `Template: ${template.name}`,
+      messageBody: resolvedBody || `Template: ${template.name}`,
       templateMeta: {
         header_type: template.header_type || 'NONE',
         header_text: template.header_text || null,
+        // Stable pointer to the header image so the Chats bubble renders the
+        // real picture instead of a grey "Image header" placeholder.
+        header_media_library_id: broadcast.media_library_id || null,
         footer: template.footer || null,
         buttons: Array.isArray(template.buttons) ? template.buttons : (template.buttons || []),
       },
@@ -232,8 +231,6 @@ async function getBroadcastWithLogs(id) {
 router.get('/broadcasts', async (req, res) => {
   try {
     const { status } = req.query;
-    const params = [];
-    const conditions = [];
 
     const { rows } = await pool.query(
       `WITH base AS (
@@ -428,7 +425,7 @@ router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (re
   try {
     const { rows: bRows } = await pool.query(
       `SELECT b.*, t.id AS t_id, t.name AS t_name, t.language AS t_language, t.body AS t_body,
-              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons
+              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples
          FROM coexistence.broadcasts b
          LEFT JOIN coexistence.message_templates t ON t.id = b.template_id
         WHERE b.id = $1`,
@@ -438,7 +435,7 @@ router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (re
     const broadcast = bRows[0];
     const template = broadcast.message_type === 'template'
       ? { id: broadcast.t_id, name: broadcast.t_name, language: broadcast.t_language, body: broadcast.t_body,
-          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons }
+          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples }
       : null;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: broadcast.from_number });
@@ -446,6 +443,13 @@ router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (re
 
     const recipients = Array.isArray(broadcast.recipient_numbers) ? broadcast.recipient_numbers : [];
     if (recipients.length === 0) return res.status(400).json({ error: 'No recipients selected' });
+
+    // For template broadcasts, preload each recipient's contact context so
+    // field-mapped variables (name / custom_fields / category_tag) resolve to
+    // real per-contact values.
+    const contactCtx = broadcast.message_type === 'template'
+      ? await loadContactContext(recipients.map(r => (typeof r === 'string' ? r : r.contact_number)))
+      : new Map();
 
     // Resolve media once for media-type broadcasts
     let resolvedMediaId = null;
@@ -487,7 +491,14 @@ router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (re
 
     let enqueued = 0;
     for (const r of recipients) {
-      const recipient = typeof r === 'string' ? { contact_number: r, name: '' } : r;
+      const base = typeof r === 'string' ? { contact_number: r, name: '' } : r;
+      const ctx = contactCtx.get(String(base.contact_number || '').replace(/\D/g, '')) || {};
+      const recipient = {
+        ...base,
+        name: base.name || ctx.name || '',
+        custom_fields: ctx.custom_fields || base.custom_fields || {},
+        tags: Array.isArray(ctx.tags) ? ctx.tags : (Array.isArray(base.tags) ? base.tags : []),
+      };
       const { rows: logRows } = await pool.query(
         `INSERT INTO coexistence.broadcast_logs (broadcast_id, action, sent_to, status)
          VALUES ($1, 'BROADCAST', $2, 'PENDING') RETURNING id`,
@@ -527,7 +538,7 @@ router.post('/broadcasts/:id/test', requirePermission('bulk-message'), async (re
 
     const { rows: bRows } = await pool.query(
       `SELECT b.*, t.id AS t_id, t.name AS t_name, t.language AS t_language, t.body AS t_body,
-              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons
+              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples
          FROM coexistence.broadcasts b
          LEFT JOIN coexistence.message_templates t ON t.id = b.template_id
         WHERE b.id = $1`,
@@ -537,7 +548,7 @@ router.post('/broadcasts/:id/test', requirePermission('bulk-message'), async (re
     const broadcast = bRows[0];
     const template = broadcast.message_type === 'template'
       ? { id: broadcast.t_id, name: broadcast.t_name, language: broadcast.t_language, body: broadcast.t_body,
-          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons }
+          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples }
       : null;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: broadcast.from_number });

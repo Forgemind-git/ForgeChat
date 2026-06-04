@@ -373,6 +373,7 @@ export default function ChatbotBuilderPage({ subParts = [], navigate }) {
         activeTab={builderTab}
         onTabChange={setBuilderTab}
         initialExecutionId={routeExecutionId}
+        onNavigate={navigate}
       />
     );
   }

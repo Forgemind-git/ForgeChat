@@ -2,12 +2,14 @@ import { useState, useEffect } from 'react';
 import {
   Settings, Tag, FolderOpen,
   LogOut, Trash2, FormInput, Users as UsersIcon, Shield, Copy,
-  ArrowLeft, Plus, X, ChevronLeft, Eye, EyeOff, Phone, User,
-  Loader2, MessageSquare, Key, Check,
+  ArrowLeft, Plus, X, ChevronLeft, Eye, EyeOff,
+  Loader2, MessageSquare, Key, Check, Globe,
 } from 'lucide-react';
 import { api } from '../api.js';
 import { C, FONT, MONO, maskPhone } from '../constants.js';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
+import SearchableSelect from '../components/SearchableSelect.jsx';
+import IntegrationsTab from '../components/settings/IntegrationsTab.jsx';
 import { useTableSelection, SelectAllCheckbox, RowCheckbox, BulkDeleteButton, runBulkDelete } from '../components/TableSelection.jsx';
 
 const TABS = [
@@ -16,6 +18,7 @@ const TABS = [
   { key: 'category', label: 'Category', icon: FolderOpen },
   { key: 'fields', label: 'Fields', icon: FormInput },
   { key: 'whatsapp-accounts', label: 'WhatsApp Accounts', icon: MessageSquare },
+  { key: 'integrations', label: 'Integrations', icon: Globe },
   { key: 'users', label: 'Users', icon: UsersIcon },
 ];
 
@@ -91,13 +94,14 @@ function GeneralTab({ onLogout, user }) {
           <div style={{ fontSize: 13, fontWeight: 600, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 12 }}>
             Timezone
           </div>
-          <select value={timezone} onChange={e => setTimezone(e.target.value)} style={{
-            width: '100%', maxWidth: 360, padding: '10px 12px', borderRadius: 8,
-            border: `1px solid ${C.border}`, fontSize: 14, fontFamily: FONT,
-            color: C.text, background: 'var(--c-cardBg)', outline: 'none', cursor: 'pointer',
-          }}>
-            {TIMEZONES.map(tz => <option key={tz} value={tz}>{tz}</option>)}
-          </select>
+          <SearchableSelect
+            value={timezone}
+            onChange={(val) => setTimezone(val)}
+            options={TIMEZONES.map(tz => ({ value: String(tz), label: tz }))}
+            searchPlaceholder="Search timezones…"
+            style={{ width: '100%', maxWidth: 360 }}
+            triggerStyle={{ padding: '10px 32px 10px 12px', fontSize: 14 }}
+          />
         </div>
 
         <div style={{ marginBottom: 32 }}>
@@ -115,7 +119,6 @@ function GeneralTab({ onLogout, user }) {
             </button>
 
             {/* Single-owner system: the owner manages their own account. */}
-            {true && (
             <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 16, marginTop: 6 }}>
               <button onClick={handleDeleteClick} style={{
                 width: 'fit-content', display: 'flex', alignItems: 'center', gap: 8,
@@ -140,7 +143,6 @@ function GeneralTab({ onLogout, user }) {
                 </div>
               )}
             </div>
-            )}
           </div>
         </div>
       </div>
@@ -235,20 +237,15 @@ function TagsTab({ categories, tags, onRefresh }) {
       }}>
         <h1 style={{ fontSize: 22, fontWeight: 700, color: C.text, margin: 0, letterSpacing: '-.02em', fontFamily: FONT }}>Tags</h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <select
+          <SearchableSelect
             value={filterCategoryId}
-            onChange={e => setFilterCategoryId(e.target.value)}
-            title="Filter by category"
-            style={{
-              padding: '8px 12px', borderRadius: 8,
-              border: `1px solid ${C.border}`, fontSize: 13, fontFamily: FONT,
-              color: filterCategoryId ? C.text : C.textSecondary, background: 'var(--c-cardBg)',
-              outline: 'none', cursor: 'pointer', maxWidth: 220,
-            }}
-          >
-            <option value="">All categories</option>
-            {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
+            onChange={(val) => setFilterCategoryId(val)}
+            options={[{ value: '', label: 'All categories' }, ...categories.map(c => ({ value: String(c.id), label: c.name }))]}
+            placeholder="All categories"
+            searchPlaceholder="Search categories…"
+            style={{ maxWidth: 220 }}
+            triggerStyle={{ padding: '8px 32px 8px 12px' }}
+          />
           <BulkDeleteButton sel={sel} label="tag" onConfirm={handleBulkDelete} />
           <button onClick={openAdd} style={{
             display: 'flex', alignItems: 'center', gap: 6,
@@ -379,14 +376,15 @@ function TagsTab({ categories, tags, onRefresh }) {
 
             <div style={{ marginBottom: 20 }}>
               <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Category</label>
-              <select value={categoryId} onChange={e => setCategoryId(e.target.value)} style={{
-                width: '100%', padding: '10px 12px', borderRadius: 8,
-                border: `1px solid ${C.border}`, fontSize: 14, fontFamily: FONT,
-                color: C.text, background: 'var(--c-cardBg)', outline: 'none', cursor: 'pointer',
-              }}>
-                <option value="">Select category…</option>
-                {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
+              <SearchableSelect
+                value={categoryId}
+                onChange={(val) => setCategoryId(val)}
+                options={categories.map(c => ({ value: String(c.id), label: c.name }))}
+                placeholder="Select category…"
+                searchPlaceholder="Search categories…"
+                style={{ width: '100%' }}
+                triggerStyle={{ fontSize: 14 }}
+              />
             </div>
 
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
@@ -1169,14 +1167,14 @@ function FieldsTab({ fields, onRefresh }) {
 
             <div style={{ marginBottom: 16 }}>
               <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Type</label>
-              <select value={fieldType} onChange={e => setFieldType(e.target.value)}
-                style={{
-                  width: '100%', padding: '10px 12px', borderRadius: 8,
-                  border: `1px solid ${C.border}`, fontSize: 14, fontFamily: FONT,
-                  color: C.text, outline: 'none', background: 'var(--c-cardBg)', cursor: 'pointer',
-                }}>
-                {FIELD_TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
+              <SearchableSelect
+                value={fieldType}
+                onChange={(val) => setFieldType(val)}
+                options={FIELD_TYPE_OPTIONS.map(o => ({ value: String(o.value), label: o.label }))}
+                searchPlaceholder="Search types…"
+                style={{ width: '100%' }}
+                triggerStyle={{ fontSize: 14 }}
+              />
             </div>
 
             <div style={{ marginBottom: 22 }}>
@@ -1414,9 +1412,13 @@ function UsersTab({ currentUser }) {
               </div>
               <div>
                 <label style={labelStyle}>Role</label>
-                <select value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} style={{ ...inputStyle, cursor: 'pointer' }}>
-                  {ROLE_OPTIONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
-                </select>
+                <SearchableSelect
+                  value={form.role}
+                  onChange={(val) => setForm({ ...form, role: val })}
+                  options={ROLE_OPTIONS.map(r => ({ value: String(r.value), label: r.label }))}
+                  triggerStyle={{ padding: '10px 32px 10px 12px', fontSize: 14 }}
+                />
+
               </div>
             </div>
             <div style={{ marginBottom: 14 }}>
@@ -1479,7 +1481,9 @@ const iconBtnStyle = { background: 'transparent', border: 'none', cursor: 'point
 /*  Main Page                                                          */
 /* ------------------------------------------------------------------ */
 export default function AdminSettingsPage({ onLogout, onNavigate, subParts = [], navigate, user }) {
-  const VALID_TABS = ['general', 'tags', 'category', 'fields', 'whatsapp-accounts', 'users'];
+  // 'google-integrations' kept as a back-compat deep link (old bookmarks /
+  // any cached OAuth redirects) — it maps onto Integrations → Google below.
+  const VALID_TABS = ['general', 'tags', 'category', 'fields', 'whatsapp-accounts', 'integrations', 'google-integrations', 'users'];
   // Admins see every tab; other roles see only tabs granted by their pages
   // (e.g. Sales users get General only).
   const visibleTabs = (user?.role === 'admin' || !Array.isArray(user?.pages))
@@ -1522,11 +1526,6 @@ export default function AdminSettingsPage({ onLogout, onNavigate, subParts = [],
     setCategoryDetailId(null);
   };
 
-  const handleRequestAddCategory = () => {
-    setShowCategoryAddForm(true);
-    setActiveTab('category');
-  };
-
   const renderTab = () => {
     if (loading) {
       return (
@@ -1558,6 +1557,10 @@ export default function AdminSettingsPage({ onLogout, onNavigate, subParts = [],
       );
       case 'fields': return <FieldsTab fields={fields} onRefresh={refresh} />;
       case 'whatsapp-accounts': return <WhatsappAccountsTab />;
+      case 'integrations': return <IntegrationsTab subParts={subParts} navigate={navigate} />;
+      // Back-compat: old #/admin-settings/google-integrations links land on the
+      // Google detail view inside the renamed Integrations tab.
+      case 'google-integrations': return <IntegrationsTab subParts={['integrations', 'google']} navigate={navigate} />;
       case 'users': return <UsersTab currentUser={user} />;
       default: return <GeneralTab onLogout={onLogout} user={user} />;
     }

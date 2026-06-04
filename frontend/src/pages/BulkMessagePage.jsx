@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo } from 'react';
-import { Send, ArrowLeft, Trash2, Loader2, Clock, Users, Phone, FileText, Repeat, X, CheckCircle, Eye, Search, ChevronDown, Filter, Plus, Play, Library, Music } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Send, ArrowLeft, Trash2, Loader2, Clock, Users, Phone, FileText, Repeat, X, CheckCircle, Eye, Search, Plus, Play, Music } from 'lucide-react';
 import { api } from '../api.js';
 import { C, FONT, formatDate, formatTime, maskPhone, darkenColor } from '../constants.js';
 import MaskedNumber from '../components/MaskedNumber.jsx';
@@ -7,6 +7,7 @@ import WhatsAppPreview from '../components/WhatsAppPreview.jsx';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
 import TagMultiSelect from '../components/TagMultiSelect.jsx';
 import { useTableSelection, SelectAllCheckbox, RowCheckbox, BulkDeleteButton, runBulkDelete } from '../components/TableSelection.jsx';
+import SearchableSelect from '../components/SearchableSelect.jsx';
 
 const FILTER_TABS = [
   { key: 'all', label: 'All' },
@@ -249,7 +250,7 @@ function formatSentTo(log) {
   return `${count} recipients`;
 }
 
-export default function BulkMessagePage() {
+export default function BulkMessagePage({ onNavigate }) {
   const [view, setView] = useState('list'); // 'list' | 'detail'
   const [broadcasts, setBroadcasts] = useState([]);
   const [filterStatus, setFilterStatus] = useState('all');
@@ -272,15 +273,18 @@ export default function BulkMessagePage() {
   const [newBroadcasting, setNewBroadcasting] = useState(false);
   const [newBroadcastSendingTest, setNewBroadcastSendingTest] = useState(false);
   const [newBroadcastVariableMapping, setNewBroadcastVariableMapping] = useState({});
+  // Per-variable "custom text" mode: when true the user types a literal value
+  // (e.g. a static business name) instead of mapping to a contact field.
+  const [customVarMode, setCustomVarMode] = useState({});
   const [newBroadcastMessageType, setNewBroadcastMessageType] = useState('template');
   const [newBroadcastBody, setNewBroadcastBody] = useState('');
   const [newBroadcastUrl, setNewBroadcastUrl] = useState('');
   const [newBroadcastMediaLibraryId, setNewBroadcastMediaLibraryId] = useState('');
   const [newBroadcastMediaItems, setNewBroadcastMediaItems] = useState([]);
   const [newBroadcastCaption, setNewBroadcastCaption] = useState('');
-  const [newBroadcastMediaLoading, setNewBroadcastMediaLoading] = useState(false);
-  const [newTestNumberSearch, setNewTestNumberSearch] = useState('');
-  const [newTestNumberOpen, setNewTestNumberOpen] = useState(false);
+  const [, setNewBroadcastMediaLoading] = useState(false);
+  const [, setNewTestNumberSearch] = useState('');
+  const [, setNewTestNumberOpen] = useState(false);
 
   const [numbers, setNumbers] = useState([]);
   const [selectedNumber, setSelectedNumber] = useState('');
@@ -371,6 +375,7 @@ export default function BulkMessagePage() {
     setNewBroadcastName('');
     setNewBroadcastTestNumber('');
     setNewBroadcastVariableMapping({});
+    setCustomVarMode({});
     setNewBroadcastMessageType('template');
     setNewBroadcastBody('');
     setNewBroadcastUrl('');
@@ -580,11 +585,6 @@ export default function BulkMessagePage() {
 
   // ─── New Broadcast Modal Helpers ────────────────────────────────────────────
   // Extract template variables {{1}}, {{2}}, etc.
-  const extractVars = (t) => {
-    const m = [...(t || '').matchAll(/\{\{(\d+)\}\}/g)];
-    return [...new Set(m.map(x => x[1]))].sort((a, b) => +a - +b);
-  };
-
   // Resolve template variables using mapping + first selected contact for live preview
   const resolvePreviewText = (text, mapping, contact) => {
     if (!text || !contact) return text || '';
@@ -602,7 +602,8 @@ export default function BulkMessagePage() {
         const tag = contact.tags?.find(t => t.category_id == catId);
         return tag?.name || `{{${v}}}`;
       }
-      return `{{${v}}}`;
+      // Anything else the user typed is literal "Custom text" — show it as-is.
+      return field || `{{${v}}}`;
     });
   };
 
@@ -615,33 +616,30 @@ export default function BulkMessagePage() {
     return ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(ht) ? ht.toLowerCase() : null;
   })();
   const selectedRecipients = contacts.filter(c => selectedContactNumbers.has(c.contact_number));
+
+  // Contact-field options for mapping template variables (Name, Phone, each
+  // category, each custom field). The broadcast variable UI also offers a
+  // "Custom text…" sentinel so a variable can be a fixed value for everyone.
+  const contactFieldOptions = [
+    { value: 'name', label: 'Contact Name' },
+    { value: 'contact_number', label: 'Phone Number' },
+    ...categories.map(cat => ({ value: `category_tag.${cat.id}`, label: cat.name })),
+    ...contactFields.map(f => ({ value: `custom_fields.${f.id}`, label: f.name })),
+  ];
+  // Distinct {{n}} variables referenced by the selected template (body + TEXT header).
+  const templateVars = selectedTemplate
+    ? [...new Set([
+        ...(String(selectedTemplate.body || '').match(/\{\{\s*\d+\s*\}\}/g) || []),
+        ...(selectedTemplate.header_type === 'TEXT'
+          ? (String(selectedTemplate.header_text || '').match(/\{\{\s*\d+\s*\}\}/g) || []) : []),
+      ].map(s => s.replace(/[^\d]/g, '')))].sort((a, b) => Number(a) - Number(b))
+    : [];
+
   const previewTemplate = selectedTemplate ? {
     ...selectedTemplate,
     body: resolvePreviewText(selectedTemplate.body, newBroadcastVariableMapping, selectedRecipients[0]),
     header_text: selectedTemplate.header_type === 'TEXT' ? resolvePreviewText(selectedTemplate.header_text, newBroadcastVariableMapping, selectedRecipients[0]) : selectedTemplate.header_text,
   } : null;
-
-  const templateVars = useMemo(() => {
-    if (!selectedTemplate) return [];
-    const bodyVars = extractVars(selectedTemplate.body);
-    const headerVars = selectedTemplate.header_type === 'TEXT' ? extractVars(selectedTemplate.header_text) : [];
-    return [...new Set([...headerVars, ...bodyVars])].sort((a, b) => +a - +b);
-  }, [selectedTemplate]);
-
-  // Available contact fields for variable mapping
-  const contactFieldOptions = useMemo(() => {
-    const opts = [
-      { value: 'name', label: 'Contact Name' },
-      { value: 'contact_number', label: 'Phone Number' },
-    ];
-    categories.forEach(cat => {
-      opts.push({ value: `category_tag.${cat.id}`, label: cat.name });
-    });
-    contactFields.forEach(f => {
-      opts.push({ value: `custom_fields.${f.id}`, label: f.name });
-    });
-    return opts;
-  }, [categories, contactFields]);
 
   const filteredContacts = contacts.filter(c => {
     const matchesSearch = !contactSearch ||
@@ -697,9 +695,16 @@ export default function BulkMessagePage() {
       };
       if (newBroadcastMessageType === 'template') {
         payload.template_id = selectedTemplate.id;
+        payload.variable_mapping = newBroadcastVariableMapping;
       } else if (newBroadcastMessageType === 'text') {
         payload.body = newBroadcastBody;
+      } else if (newBroadcastMessageType === 'url') {
+        payload.url = newBroadcastUrl;
+      } else {
+        payload.caption = newBroadcastCaption;
       }
+      // Header image (template media header) / media-type broadcast attachment.
+      if (newBroadcastMediaLibraryId) payload.media_library_id = newBroadcastMediaLibraryId;
       const broadcast = await api.broadcasts.create(payload);
       await api.broadcasts.test(broadcast.id, newBroadcastTestNumber.trim());
       alert(`Test message sent to ${newBroadcastTestNumber.trim()}`);
@@ -726,9 +731,16 @@ export default function BulkMessagePage() {
       };
       if (newBroadcastMessageType === 'template') {
         payload.template_id = selectedTemplate.id;
+        payload.variable_mapping = newBroadcastVariableMapping;
       } else if (newBroadcastMessageType === 'text') {
         payload.body = newBroadcastBody;
+      } else if (newBroadcastMessageType === 'url') {
+        payload.url = newBroadcastUrl;
+      } else {
+        payload.caption = newBroadcastCaption;
       }
+      // Header image (template media header) / media-type broadcast attachment.
+      if (newBroadcastMediaLibraryId) payload.media_library_id = newBroadcastMediaLibraryId;
       const broadcast = await api.broadcasts.create(payload);
       if (status === 'SENT') {
         await api.broadcasts.send(broadcast.id);
@@ -947,26 +959,13 @@ export default function BulkMessagePage() {
                   {/* From */}
                   <div>
                     <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>From (Team Member Number)</div>
-                    <div style={{ position: 'relative' }}>
-                      <select
-                        value={newBroadcastFrom}
-                        onChange={e => { setNewBroadcastFrom(e.target.value); setSelectedNumber(e.target.value); setNewBroadcastTemplateId(''); }}
-                        style={{
-                          width: '100%', padding: '10px 32px 10px 12px', borderRadius: 8,
-                          border: `1.5px solid ${C.border}`, fontSize: 13,
-                          fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                          cursor: 'pointer', appearance: 'none', outline: 'none',
-                        }}
-                      >
-                        <option value="">Select team member number...</option>
-                        {numbers.map(n => (
-                          <option key={n.wa_number} value={n.wa_number}>
-                            {n.display_name || maskPhone(n.wa_number)}
-                          </option>
-                        ))}
-                      </select>
-                      <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                    </div>
+                    <SearchableSelect
+                      value={newBroadcastFrom}
+                      onChange={(val) => { setNewBroadcastFrom(val); setSelectedNumber(val); setNewBroadcastTemplateId(''); }}
+                      options={numbers.map(n => ({ value: String(n.wa_number), label: n.display_name || maskPhone(n.wa_number) }))}
+                      placeholder="Select team member number..."
+                      searchPlaceholder="Search numbers..."
+                    />
                     {/* Linked account status — shown once the lookup resolves */}
                     {newBroadcastFrom && accountLookupDone && (
                       linkedAccount ? (
@@ -1000,22 +999,15 @@ export default function BulkMessagePage() {
                   {/* Message Type */}
                   <div>
                     <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Message Type</div>
-                    <div style={{ position: 'relative' }}>
-                      <select
-                        value={newBroadcastMessageType}
-                        onChange={e => setNewBroadcastMessageType(e.target.value)}
-                        style={{
-                          width: '100%', padding: '10px 32px 10px 12px', borderRadius: 8,
-                          border: `1.5px solid ${C.border}`, fontSize: 13,
-                          fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                          cursor: 'pointer', appearance: 'none', outline: 'none',
-                        }}
-                      >
-                        <option value="template">Template Message</option>
-                        <option value="text">Text Message</option>
-                      </select>
-                      <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                    </div>
+                    <SearchableSelect
+                      value={newBroadcastMessageType}
+                      onChange={(val) => setNewBroadcastMessageType(val)}
+                      options={[
+                        { value: 'template', label: 'Template Message' },
+                        { value: 'text', label: 'Text Message' },
+                      ]}
+                      placeholder="Select message type..."
+                    />
                   </div>
 
                   {/* Template Fields */}
@@ -1023,24 +1015,16 @@ export default function BulkMessagePage() {
                     <>
                       <div>
                         <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Message Template</div>
-                        <div style={{ position: 'relative' }}>
-                          <select
-                            value={newBroadcastTemplateId}
-                            onChange={e => setNewBroadcastTemplateId(e.target.value)}
-                            style={{
-                              width: '100%', padding: '10px 32px 10px 12px', borderRadius: 8,
-                              border: `1.5px solid ${C.border}`, fontSize: 13,
-                              fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)',
-                              cursor: 'pointer', appearance: 'none', outline: 'none',
-                            }}
-                          >
-                            <option value="">Select a template...</option>
-                            {eligibleTemplates.map(t => (
-                              <option key={t.id} value={t.id}>{t.name} ({t.category})</option>
-                            ))}
-                          </select>
-                          <ChevronDown size={14} color={C.textMuted} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
-                        </div>
+                        <SearchableSelect
+                          value={newBroadcastTemplateId}
+                          onChange={(val) => setNewBroadcastTemplateId(val)}
+                          options={eligibleTemplates.map(t => ({ value: String(t.id), label: `${t.name} (${t.category})`, sublabel: t.language || '' }))}
+                          placeholder="Select a template..."
+                          searchPlaceholder="Search templates..."
+                          emptyText="No templates found"
+                          createLabel="Create new template"
+                          onCreate={() => onNavigate?.('template-builder', 'new')}
+                        />
                         {!newBroadcastFrom ? (
                           <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4, fontFamily: FONT }}>Pick a sending number first.</div>
                         ) : !linkedAccount && accountLookupDone ? (
@@ -1050,6 +1034,61 @@ export default function BulkMessagePage() {
                         ) : null}
                       </div>
 
+                      {/* Variable Mapping — map each {{n}} to a contact field, or type custom text */}
+                      {templateVars.length > 0 && (
+                        <div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Variable Mapping</div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            {templateVars.map(v => {
+                              const fieldVals = new Set(contactFieldOptions.map(o => o.value));
+                              const curVal = newBroadcastVariableMapping[v] || '';
+                              const isCustom = customVarMode[v] || (curVal !== '' && !fieldVals.has(curVal));
+                              return (
+                                <div key={v} style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                                  <span style={{ fontSize: 12, fontWeight: 600, color: C.text, fontFamily: "'DM Mono', monospace", background: 'var(--c-surfaceAlt)', padding: '4px 8px', borderRadius: 4, whiteSpace: 'nowrap' }}>{'{{' + v + '}}'}</span>
+                                  <span style={{ fontSize: 12, color: C.textMuted }}>→</span>
+                                  <div style={{ flex: 1, minWidth: 160 }}>
+                                    <SearchableSelect
+                                      value={isCustom ? '__custom__' : curVal}
+                                      onChange={(val) => {
+                                        if (val === '__custom__') {
+                                          setCustomVarMode(prev => ({ ...prev, [v]: true }));
+                                          setNewBroadcastVariableMapping(prev => ({ ...prev, [v]: '' }));
+                                        } else {
+                                          setCustomVarMode(prev => ({ ...prev, [v]: false }));
+                                          setNewBroadcastVariableMapping(prev => ({ ...prev, [v]: val }));
+                                        }
+                                      }}
+                                      options={[
+                                        ...contactFieldOptions.map(opt => ({ value: opt.value, label: opt.label })),
+                                        { value: '__custom__', label: 'Custom text…' },
+                                      ]}
+                                      placeholder="Select contact field..."
+                                      searchPlaceholder="Search fields..."
+                                    />
+                                  </div>
+                                  {isCustom && (
+                                    <input
+                                      type="text"
+                                      value={curVal}
+                                      onChange={e => setNewBroadcastVariableMapping(prev => ({ ...prev, [v]: e.target.value }))}
+                                      placeholder={`Type the value for {{${v}}}`}
+                                      style={{
+                                        flexBasis: '100%', padding: '8px 10px', borderRadius: 6,
+                                        border: `1.5px solid ${C.primary}`, fontSize: 12,
+                                        fontFamily: FONT, color: C.text, background: 'var(--c-cardBg)', outline: 'none',
+                                      }}
+                                    />
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6, fontFamily: FONT }}>
+                            Map each variable to a contact field, or choose <strong>Custom text…</strong> to type a fixed value (same for every recipient).
+                          </div>
+                        </div>
+                      )}
                     </>
                   )}
 

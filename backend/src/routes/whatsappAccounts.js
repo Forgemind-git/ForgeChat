@@ -1,18 +1,10 @@
 const { Router } = require('express');
 const pool = require('../db');
 const { encrypt, decrypt, maskSecret } = require('../util/crypto');
+const { adminOnly } = require('../middleware/access');
+const { isAdmin } = require('../permissions');
 
 const router = Router();
-
-// Single-owner system: roles were removed, so the JWT no longer carries a
-// `role`. Every authenticated request is the owner (the sole admin), so gate
-// these account-management routes on authentication only.
-function adminOnly(req, res, next) {
-  if (!req.user) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-}
 
 /**
  * Look up a phone number's human-readable number + verified business name from
@@ -33,19 +25,18 @@ async function fetchPhoneMeta(phoneNumberId, accessToken) {
   return body; // { display_phone_number, verified_name, id }
 }
 
-function publicShape(row, { reveal = false } = {}) {
+// Serialise an account row for the API. Secrets — the masked access token and
+// the webhook verify token — are ONLY included for admins (`includeSecrets`).
+// The full (decrypted) access token is never sent over the API at all.
+function publicShape(row, { includeSecrets = false } = {}) {
   if (!row) return null;
-  const token = decrypt(row.access_token_encrypted);
-  return {
+  const out = {
     id: row.id,
     displayName: row.display_name,
     displayPhoneNumber: row.display_phone_number,
     phoneNumberId: row.phone_number_id,
     wabaId: row.waba_id,
     metaAppId: row.meta_app_id,
-    accessTokenMasked: maskSecret(token),
-    accessToken: reveal ? token : undefined,
-    verifyToken: row.verify_token_encrypted ? decrypt(row.verify_token_encrypted) : '',
     isDefault: row.is_default,
     isActive: row.is_active,
     healthStatus: row.health_status || 'unknown',
@@ -55,6 +46,11 @@ function publicShape(row, { reveal = false } = {}) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+  if (includeSecrets) {
+    out.accessTokenMasked = maskSecret(decrypt(row.access_token_encrypted));
+    out.verifyToken = row.verify_token_encrypted ? decrypt(row.verify_token_encrypted) : '';
+  }
+  return out;
 }
 
 // List all accounts (any authenticated user — needed for template/broadcast pickers)
@@ -66,7 +62,8 @@ router.get('/whatsapp-accounts', async (req, res) => {
         ORDER BY is_default DESC, display_name ASC`,
       [req.query.activeOnly === 'true' ? true : null]
     );
-    res.json(rows.map(r => publicShape(r)));
+    const includeSecrets = isAdmin(req.user);
+    res.json(rows.map(r => publicShape(r, { includeSecrets })));
   } catch (err) {
     console.error('[whatsapp-accounts] list error:', err.message);
     res.status(500).json({ error: 'Failed to list WhatsApp Business accounts' });
@@ -92,7 +89,8 @@ router.get('/whatsapp-accounts/by-phone/:phone', async (req, res) => {
   }
 });
 
-// Get one — admins see the decrypted token (?reveal=1)
+// Get one — admin only; returns the masked token + verify token (never the
+// full access token).
 router.get('/whatsapp-accounts/:id', adminOnly, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -100,7 +98,7 @@ router.get('/whatsapp-accounts/:id', adminOnly, async (req, res) => {
       [req.params.id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    res.json(publicShape(rows[0], { reveal: req.query.reveal === '1' }));
+    res.json(publicShape(rows[0], { includeSecrets: true }));
   } catch (err) {
     console.error('[whatsapp-accounts] get error:', err.message);
     res.status(500).json({ error: 'Failed to fetch WhatsApp Business account' });
@@ -130,7 +128,14 @@ router.post('/whatsapp-accounts', adminOnly, async (req, res) => {
       if (meta.verified_name) displayName = meta.verified_name;
       if (meta.display_phone_number) displayPhoneNumber = String(meta.display_phone_number).replace(/\D/g, '');
     } catch (e) {
-      console.warn('[whatsapp-accounts] Meta phone lookup failed (saving anyway):', e.message);
+      // Don't save a half-working account. The lookup doubles as a credential
+      // check, so a failure here means the Phone Number ID + token combination
+      // can't talk to Meta (wrong ID, wrong app, or an expired token — a Meta
+      // *test number*'s token expires every 24h). Surface Meta's reason.
+      console.warn('[whatsapp-accounts] Meta credential check failed:', e.message);
+      return res.status(400).json({
+        error: `Couldn't verify this WhatsApp number with Meta. Double-check your Phone Number ID and access token (a test number's token expires every 24 hours). Meta said: ${e.message}`,
+      });
     }
 
     const client = await pool.connect();
@@ -150,7 +155,7 @@ router.post('/whatsapp-accounts', adminOnly, async (req, res) => {
         ]
       );
       await client.query('COMMIT');
-      res.status(201).json(publicShape(rows[0]));
+      res.status(201).json(publicShape(rows[0], { includeSecrets: true }));
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
@@ -193,7 +198,14 @@ router.put('/whatsapp-accounts/:id', adminOnly, async (req, res) => {
           if (meta.verified_name) displayName = meta.verified_name;
           if (meta.display_phone_number) displayPhoneNumber = String(meta.display_phone_number).replace(/\D/g, '');
         } catch (e) {
-          console.warn('[whatsapp-accounts] Meta phone lookup failed on update (keeping previous):', e.message);
+          // Same credential check as on connect: if the changed number/token
+          // can't reach Meta, refuse the update and tell the user why instead
+          // of silently keeping stale values.
+          console.warn('[whatsapp-accounts] Meta credential check failed on update:', e.message);
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            error: `Couldn't verify this WhatsApp number with Meta. Double-check your Phone Number ID and access token (a test number's token expires every 24 hours). Meta said: ${e.message}`,
+          });
         }
       }
 
@@ -220,7 +232,7 @@ router.put('/whatsapp-accounts/:id', adminOnly, async (req, res) => {
         params
       );
       await client.query('COMMIT');
-      res.json(publicShape(rows[0]));
+      res.json(publicShape(rows[0], { includeSecrets: true }));
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;

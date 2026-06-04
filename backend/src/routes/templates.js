@@ -709,11 +709,6 @@ router.post('/templates/bulk-submit', requirePermission('template-builder'), asy
     const results = [];
     for (const id of ids) {
       try {
-        const fakeReq = { params: { id }, body: {} };
-        const fakeRes = { _status: 200, _body: null,
-          status(c) { this._status = c; return this; },
-          json(b) { this._body = b; return this; },
-        };
         // Re-invoke the existing /:id/submit handler logic inline by calling it
         await new Promise((resolve) => {
           submitOneInline(id).then(out => {
@@ -792,6 +787,7 @@ router.get('/templates/:id/payload', async (req, res) => {
  */
 const { resolveAccount, insertPendingRow } = require('../services/messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
+const { buildTemplateComponents, resolveTemplateText } = require('../services/templateComponents');
 
 router.post('/templates/:id/test-send', requirePermission('template-builder'), async (req, res) => {
   try {
@@ -799,7 +795,9 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
     if (!to) return res.status(400).json({ error: 'to (recipient phone) required' });
 
     const { rows } = await pool.query(
-      `SELECT id, name, language, body, whatsapp_account_id FROM coexistence.message_templates WHERE id = $1`,
+      `SELECT id, name, language, header_type, header_text, body, buttons, samples,
+              media_handle, header_media_library_id, whatsapp_account_id
+         FROM coexistence.message_templates WHERE id = $1`,
       [req.params.id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Template not found' });
@@ -809,14 +807,36 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
     const { account, error } = await resolveAccount({ accountId: tpl.whatsapp_account_id });
     if (error) return res.status(400).json({ error });
 
-    // Build components from sampleValues (sorted numerically by var index)
-    const keys = Object.keys(sampleValues).sort((a, b) => +a - +b);
-    const components = keys.length > 0
-      ? [{ type: 'body', parameters: keys.map(k => ({ type: 'text', text: String(sampleValues[k] || ' ') })) }]
-      : [];
+    // Resolve a per-account Meta media id for media-header templates, so the
+    // required header parameter can be supplied (omitting it → Meta #131008).
+    let headerMediaId = null;
+    const ht = String(tpl.header_type || 'NONE').toUpperCase();
+    if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(ht) && tpl.header_media_library_id) {
+      try {
+        const { syncMediaToAccount } = require('./mediaLibrary');
+        const sync = await syncMediaToAccount(tpl.header_media_library_id, account.id);
+        headerMediaId = sync?.metaMediaId || null;
+      } catch (e) {
+        console.error('[templates] test-send media resolve failed:', e.message);
+      }
+    }
+
+    // Complete component set: header (media/text-var), body vars (falling back
+    // to the template's stored samples), and dynamic buttons (copy-code/URL).
+    const components = buildTemplateComponents({ template: tpl, values: sampleValues, headerMediaId });
 
     const localId = await insertPendingRow({
-      account, toNumber: to, messageType: 'template', messageBody: tpl.body || `Template: ${tpl.name}`,
+      account, toNumber: to, messageType: 'template',
+      // Resolved body (sample values) + full template_meta so the test message
+      // renders the real card in Chats — filled text, header image, buttons.
+      messageBody: resolveTemplateText(tpl.body, sampleValues, tpl.samples, null) || `Template: ${tpl.name}`,
+      templateMeta: {
+        header_type: tpl.header_type || 'NONE',
+        header_text: tpl.header_text || null,
+        header_media_library_id: tpl.header_media_library_id || null,
+        footer: tpl.footer || null,
+        buttons: Array.isArray(tpl.buttons) ? tpl.buttons : (tpl.buttons || []),
+      },
     });
     await enqueueSend({
       kind: 'template',

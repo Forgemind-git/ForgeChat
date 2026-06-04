@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { api } from '../api.js';
 import { C, FONT, MONO, maskPhone } from '../constants.js';
+import SearchableSelect from '../components/SearchableSelect.jsx';
 
 const TYPE_META = {
   image:    { Icon: ImageIcon, label: 'Image',    color: '#3B82F6' },
@@ -140,18 +141,18 @@ export default function MediaLibraryPage() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           {accounts.length > 1 && (
-            <select
+            <SearchableSelect
               value={selectedAccountId || ''}
-              onChange={e => setSelectedAccountId(e.target.value || null)}
-              title="Connected account"
-              style={{ padding: '9px 12px', borderRadius: 8, border: `1px solid ${C.border}`, fontFamily: FONT, fontSize: 13, background: C.cardBg, color: C.text, cursor: 'pointer' }}
-            >
-              {accounts.map(a => (
-                <option key={a.id} value={a.id}>
-                  {(a.displayName || maskPhone(a.displayPhoneNumber) || `Account ${a.id}`)}{a.isDefault ? ' · default' : ''}
-                </option>
-              ))}
-            </select>
+              onChange={val => setSelectedAccountId(val || null)}
+              options={accounts.map(a => ({
+                value: String(a.id),
+                label: `${(a.displayName || maskPhone(a.displayPhoneNumber) || `Account ${a.id}`)}${a.isDefault ? ' · default' : ''}`,
+              }))}
+              placeholder="Connected account"
+              searchPlaceholder="Search accounts…"
+              style={{ width: 220 }}
+              triggerStyle={{ padding: '9px 32px 9px 12px', fontSize: 13 }}
+            />
           )}
           <button
             onClick={() => setUploadOpen(true)}

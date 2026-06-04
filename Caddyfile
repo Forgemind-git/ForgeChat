@@ -1,8 +1,9 @@
 # Caddy reverse proxy with automatic HTTPS (Let's Encrypt).
-# Terminates TLS for the subdomain and forwards everything to the frontend
-# container (nginx), which serves the SPA and proxies /api, /uploads, /l/ to the
-# backend. Requires: DNS A record for the domain -> droplet IP, ports 80+443 open.
-# Replace with your own domain (and point its DNS A record at this host).
-forgechat.example.com {
+# The domain comes from the DOMAIN environment variable (set on the caddy
+# service in docker-compose.prod.yml) — no manual editing needed. Caddy
+# terminates TLS and forwards to the frontend (nginx), which serves the SPA and
+# proxies /api, /uploads, /l/ to the backend.
+# Requires: DNS A record for $DOMAIN -> this host, ports 80 + 443 open.
+{$DOMAIN} {
     reverse_proxy forgecrm-frontend:80
 }

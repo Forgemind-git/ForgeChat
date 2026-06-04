@@ -1,11 +1,17 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Search, Loader2, MoreVertical, Phone, Pencil, X, Send, Lock, Paperclip, Image as ImageIcon, FileText, Video, Music, Library, RefreshCw, CheckCircle2, AlertTriangle, Mic, Square, Trash2, User, Download, Forward, Reply, Tag, UserPlus, Check } from 'lucide-react';
 import { usePolling } from '../hooks/usePolling.js';
+import { useServerEvents } from '../hooks/useServerEvents.js';
 import { api } from '../api.js';
 import { C, FONT, MONO, maskPhone, darkenColor } from '../constants.js';
 import MessageBubble, { quoteSnippet } from './MessageBubble.jsx';
 import MaskedNumber from './MaskedNumber.jsx';
 import { CustomFieldEditor } from './CustomFieldInputs.jsx';
+
+// Monotonic delivery lifecycle — mirror of the backend STATUS_RANK. Used to
+// merge a live SSE tick onto the polled status without ever downgrading.
+const STATUS_RANK = { sending: 0, sent: 1, delivered: 2, read: 3, played: 3, failed: 2 };
+const higherStatus = (a, b) => ((STATUS_RANK[b] ?? -1) > (STATUS_RANK[a] ?? -1) ? b : a);
 
 // Forward a message to another contact on the same WhatsApp number.
 function ForwardModal({ waNumber, message, onClose }) {
@@ -126,6 +132,23 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
   const [replyTo, setReplyTo] = useState(null); // message being quote-replied to
   const [myReactions, setMyReactions] = useState({}); // messageId -> emoji ('' = removed), optimistic
   const [starOverrides, setStarOverrides] = useState({}); // messageId -> bool, optimistic
+  const [statusOverrides, setStatusOverrides] = useState({}); // wamid -> 'delivered'|'read'|… live SSE tick updates
+
+  // Real-time delivery/read ticks: when a webhook advances an outbound message's
+  // status the backend pushes a `message-status` SSE event; apply it instantly
+  // (monotonically) so the tick turns blue without waiting for the 15s poll.
+  const onServerEvent = useCallback((ev) => {
+    if (ev.type !== 'message-status') return;
+    const d = ev.data || {};
+    const digits = (s) => String(s || '').replace(/\D/g, '');
+    if (digits(d.waNumber) !== digits(waNumber) || digits(d.contactNumber) !== digits(contactNumber)) return;
+    if (!d.messageId || !d.status) return;
+    setStatusOverrides(prev => ({ ...prev, [d.messageId]: higherStatus(prev[d.messageId] || 'sent', d.status) }));
+  }, [waNumber, contactNumber]);
+  useServerEvents(onServerEvent);
+
+  // Drop stale overrides when switching conversations.
+  useEffect(() => { setStatusOverrides({}); }, [waNumber, contactNumber]);
 
   // Send/remove our reaction to a message. Optimistic; reverts on failure.
   const handleReact = async (msg, emoji) => {
@@ -673,6 +696,15 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
     }
     const star = starOverrides[m.message_id];
     if (star !== undefined) out = { ...out, starred: star };
+    // Live tick: merge any SSE status update, monotonically (never downgrade
+    // the polled status — e.g. a late 'delivered' SSE can't undo a polled 'read').
+    if (m.direction === 'outgoing' && m.message_id) {
+      const live = statusOverrides[m.message_id];
+      if (live) {
+        const merged = higherStatus(out.status || 'sent', live);
+        if (merged !== out.status) out = { ...out, status: merged };
+      }
+    }
     return out;
   };
   const messages = [...(data?.messages || []), ...optimisticMessages]
@@ -1474,7 +1506,6 @@ function LibraryPickerModal({ waNumber, sending, onClose, onSend }) {
 
   const handleSendClick = () => {
     if (!selected) return;
-    const meta = TYPE_META[selected.mediaType] || TYPE_META.document;
     onSend({
       mediaLibraryId: Number(selected.id),
       caption: caption.trim(),

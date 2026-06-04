@@ -419,8 +419,6 @@ router.put('/deals/:id', adminOnly, async (req, res) => {
     // If the stage changes, recompute status / won_at / lost_at.
     let stageId = ex.stage_id;
     let status = ex.status;
-    let wonClause = '';
-    let lostClause = '';
     if (b.stageId != null && Number(b.stageId) !== Number(ex.stage_id)) {
       const stage = await getStageInPipeline(b.stageId, ex.pipeline_id);
       if (!stage) return res.status(400).json({ error: 'Stage does not belong to this deal\'s pipeline' });

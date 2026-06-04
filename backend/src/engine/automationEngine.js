@@ -101,16 +101,41 @@ function resolveTemplateVariables(templateBody, bindings, context) {
 
 // ─── Condition Evaluation ────────────────────────────────────────────
 
+// Current weekday + hour in IST (UTC+5:30), for the Time condition source.
+function istNow() {
+  const ist = new Date(Date.now() + (5 * 60 + 30) * 60000);
+  const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  return { weekday: days[ist.getUTCDay()], hour: ist.getUTCHours() };
+}
+
 function getFieldValue(source, field, context) {
   const contact = context.contact || {};
+  const cf = contact.custom_fields || {};
   if (source === 'custom' || source === 'system') {
     if (field === 'name') return contact.name || '';
     if (field === 'contact_number' || field === 'phone') return contact.contact_number || context.contact_number || '';
-    return (contact.custom_fields || {})[field] ?? '';
+    if (/^(last[_ ]?message|message)$/i.test(field)) return context.message_body || '';
+    // Everything else (incl. lead_score) lives in the custom_fields JSONB, keyed by name.
+    return cf[field] ?? '';
   }
   if (source === 'tags') {
-    const tags = contact.tags || [];
-    return tags.includes(field) ? field : '';
+    // contact.tags is an array of {id,name,...} objects (the shape the rest of
+    // the app stores); also tolerate legacy plain-string entries. Match by name,
+    // case-insensitive — `includes(field)` on the raw objects never matched.
+    const names = (contact.tags || []).map(t => (typeof t === 'string' ? t : (t && t.name) || ''));
+    return names.some(n => String(n).toLowerCase() === String(field).toLowerCase()) ? field : '';
+  }
+  if (source === 'time') {
+    const { weekday, hour } = istNow();
+    if (/hour/i.test(field)) return hour;
+    if (/day/i.test(field)) return weekday;
+    // "Current time" → business hours = Mon–Sat 09:00–18:00 IST.
+    return (weekday !== 'sunday' && hour >= 9 && hour < 18) ? 'business' : 'after-hours';
+  }
+  if (source === 'bot') {
+    if (/intent/i.test(field)) return cf['last_intent'] ?? cf['intent'] ?? '';
+    if (/state/i.test(field)) return cf['bot_state'] ?? '';
+    return cf[field] ?? '';
   }
   return '';
 }
@@ -233,7 +258,7 @@ async function executeTriggerNode(client, executionId, node, context) {
 
 async function executeMessageNode(client, executionId, node, context) {
   const mode = node.messageMode || 'template';
-  let output = {};
+  let output;
 
   if (mode === 'template') {
     const { rows: tplRows } = await client.query(
@@ -1026,14 +1051,18 @@ async function executeSubflowNode(client, executionId, node, context) {
   return logStep(client, executionId, node, {}, output, 'success');
 }
 
-// Automations are linear keyword→message flows. The only executable node types
-// are the Keyword Trigger and Send Message. Any other (legacy) node type is
-// skipped by the walker. The condition/delay/action/handoff/ai/api/subflow
-// handlers above are retained but intentionally unreferenced (dead code) so
-// older execution-log rows still resolve their names.
+// Executable node types. Trigger + Send Message are the linear core; Condition
+// (yes/no branch), Smart Delay (non-blocking send delay), and Action (Add Tag /
+// Remove Tag etc.) are dispatched by the walker too — see walkFrom for how a
+// Condition's matched result selects the 'yes'/'no' outgoing edge.
+// handoff/ai/api/subflow handlers remain defined but unwired (not in the
+// builder palette); an unknown type is skipped by the walker, not failed.
 const NODE_HANDLERS = {
   trigger: executeTriggerNode,
   message: executeMessageNode,
+  condition: executeConditionNode,
+  delay: executeDelayNode,
+  action: executeActionNode,
 };
 
 // ─── Graph Walker ────────────────────────────────────────────────────
@@ -1106,28 +1135,42 @@ async function walkFrom(client, executionId, nodes, edges, startNodeId, context,
     if (!node) break;
 
     const handler = NODE_HANDLERS[node.type];
+    let step = null;
     if (handler) {
-      const step = await handler(client, executionId, node, context);
+      step = await handler(client, executionId, node, context);
       // A Message node with waitForReply pauses the execution; exit cleanly —
       // the handler already flipped the execution row to status='paused'.
       if (step && step.__pauseExecution) {
         return { paused: true };
       }
     } else {
-      // Legacy / unsupported node type (condition, delay, action, etc.).
-      // Automations are now linear keyword→message only, so we skip it and
-      // continue down the chain instead of failing the run.
+      // Unknown / unwired node type (e.g. handoff/ai/api/subflow — defined but
+      // not in the builder palette). Skip it and continue down the chain rather
+      // than failing the whole run.
       await logStep(
         client, executionId, node, {},
-        { note: `Skipped unsupported node type "${node.type}" — automations are linear keyword→message only.` },
+        { note: `Skipped unsupported node type "${node.type}".` },
         'skipped'
       );
     }
 
-    // Linear flow: follow the default outgoing edge (fall back to the first
-    // edge so a legacy node that only has branch handles still moves forward).
+    // Pick the outgoing edge. A Condition node routes to its 'yes' (matched) or
+    // 'no' (not-matched) handle based on the evaluated result logged by
+    // executeConditionNode; every other node follows its default edge (falling
+    // back to the first edge so a node with only a branch handle still moves on).
+    let fromHandle = 'default';
+    if (node.type === 'condition' && step && step.output_data) {
+      fromHandle = step.output_data.matched ? 'yes' : 'no';
+    }
     const fromEdges = edges.filter(e => e.from === currentNodeId);
-    const nextEdge = fromEdges.find(e => !e.fromHandle || e.fromHandle === 'default') || fromEdges[0] || null;
+    let nextEdge;
+    if (fromHandle === 'default') {
+      nextEdge = fromEdges.find(e => !e.fromHandle || e.fromHandle === 'default') || fromEdges[0] || null;
+    } else {
+      // A branch with no connected edge ends the flow (no fallback to default —
+      // that would wrongly send the not-matched path down the matched branch).
+      nextEdge = fromEdges.find(e => e.fromHandle === fromHandle) || null;
+    }
     currentNodeId = nextEdge ? nextEdge.to : null;
   }
   return { paused: false };

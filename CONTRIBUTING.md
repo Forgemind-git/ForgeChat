@@ -28,7 +28,7 @@ By participating in this project, you agree to abide by our
 
 ## Ways to Contribute
 
-- **Report a bug** — open a [GitHub issue](https://github.com/Forgemind-git/Forge-Chat/issues)
+- **Report a bug** — open a [GitHub issue](https://github.com/Forgemind-git/ForgeChat/issues)
   with steps to reproduce, expected vs. actual behaviour, your environment
   (OS, Node version, browser), and logs or screenshots where relevant.
 - **Propose a feature** — open an issue describing the problem you want solved
@@ -47,7 +47,7 @@ By participating in this project, you agree to abide by our
 ## Repository Structure
 
 ```
-Forge-Chat/
+ForgeChat/
 ├── backend/              # Node.js 20 + Express 4 API (pg, BullMQ)
 │   ├── src/
 │   │   ├── index.js            # bootstrap, middleware, route mounting
@@ -91,9 +91,9 @@ External contributors should **fork** the repository, then clone their fork and
 add this repo as the `upstream` remote so you can keep your branch in sync:
 
 ```bash
-git clone https://github.com/<your-username>/Forge-Chat.git
-cd Forge-Chat
-git remote add upstream https://github.com/Forgemind-git/Forge-Chat.git
+git clone https://github.com/<your-username>/ForgeChat.git
+cd ForgeChat
+git remote add upstream https://github.com/Forgemind-git/ForgeChat.git
 ```
 
 ### 2. Start PostgreSQL and Redis
@@ -276,7 +276,7 @@ assignment or CLA is required.
    or `docs/<topic>`.
 3. **Commit** in small, logical, signed-off steps using Conventional Commits.
 4. **Push** to your fork and **open a pull request** against
-   `Forgemind-git/Forge-Chat:main`. Fill in the description: what changed, why,
+   `Forgemind-git/ForgeChat:main`. Fill in the description: what changed, why,
    how you tested it, and any related issue (`Closes #123`).
 5. **Respond to review.** Please address requested changes or reply within
    **14 days** — stale PRs may be closed, but you're welcome to reopen them once
@@ -304,7 +304,7 @@ Before requesting review, confirm:
 
 ## Getting Help
 
-- Open a [GitHub issue](https://github.com/Forgemind-git/Forge-Chat/issues) for
+- Open a [GitHub issue](https://github.com/Forgemind-git/ForgeChat/issues) for
   questions, bugs, or feature discussion.
 - New to the project? Look for issues labelled **good first issue**, and feel
   free to add yourself to [`AUTHORS.md`](./AUTHORS.md) in your first PR.

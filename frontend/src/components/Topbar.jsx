@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Info, LogOut, User, Settings, AlertTriangle, Star, Github } from 'lucide-react';
+import { Info, LogOut, Settings, AlertTriangle, Star, Github } from 'lucide-react';
 import { C, FONT } from '../constants.js';
 import { api } from '../api.js';
 
