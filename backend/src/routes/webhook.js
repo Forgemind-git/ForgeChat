@@ -357,6 +357,36 @@ async function enqueueIa360Interactive({ record, label, messageBody, interactive
   return true;
 }
 
+// FlowWire: build a WhatsApp Flow (type:'flow') interactive and enqueue it through the
+// existing IA360 interactive path. metaSend.sendInteractive forwards `interactive` verbatim,
+// so a flow object is sent as-is. Returns the bool from enqueueIa360Interactive
+// (true once enqueued; downstream Meta rejection is NOT observable here).
+async function enqueueIa360FlowMessage({ record, flowId, screen, cta, bodyText, mediaUrl, flowToken, label, footer = 'IA360' }) {
+  const interactive = {
+    type: 'flow',
+    header: { type: 'image', image: { link: mediaUrl } },
+    body: { text: bodyText },
+    footer: { text: footer },
+    action: {
+      name: 'flow',
+      parameters: {
+        flow_message_version: '3',
+        flow_token: flowToken,
+        flow_id: flowId,
+        flow_cta: cta,
+        flow_action: 'navigate',
+        flow_action_payload: { screen },
+      },
+    },
+  };
+  return enqueueIa360Interactive({
+    record,
+    label: label || `ia360_flow_${flowToken}`,
+    messageBody: `IA360 Flow: ${cta}`,
+    interactive,
+  });
+}
+
 async function enqueueIa360Text({ record, label, body }) {
   const resolved = await resolveIa360Outbound(record);
   if (resolved.duplicate || resolved.error) return false;
@@ -547,10 +577,19 @@ async function getActiveNonTerminalIa360Deal(record) {
   // Reschedule intent: a prospect with an already-booked meeting who wants to move it
   // SHOULD reach the agent (we explicitly invite "escríbeme por aquí" in the confirmation).
   const wantsReschedule = /reagend|reprogram|mover|mu[eé]v|cambi|otro d[ií]a|otra hora|otro horario|otra fecha|posponer|recorr|adelantar|cancel|anul|ya no (podr|voy|asist)/.test(txt);
+  // MULTI-CITA: un prospecto YA agendado puede querer una SEGUNDA reunión. Ese mensaje
+  // ("y otra para el miércoles", "necesito otra reunión") NO es reagendar ni pasivo, así
+  // que también debe llegar al agente. Sin esto el gate lo silenciaba (return null).
+  const wantsBooking = /reuni[oó]n|cita|agend|coordin|horario|disponib|otra (para|cita|reuni)|una m[aá]s|otra m[aá]s|necesito una|quiero (una|agendar)|me gustar[ií]a (una|agendar)/i.test(txt);
+  // LIST intent ("¿cuáles tengo?", "qué citas tengo", "mis reuniones"): un prospecto YA
+  // agendado que quiere CONSULTAR sus citas debe llegar al agente (list_bookings). Sin
+  // esto el gate lo silenciaba estando en "Reunión agendada".
+  const wantsList = /(cu[aá]l|cu[aá]nt|qu[eé]).{0,14}(tengo|hay|agend|cita|reuni)|mis (citas|reuni)|ver (mis )?(citas|reuni)|tengo .{0,10}(agend|cita|reuni)/i.test(txt);
   // Always-terminal = won/lost → never auto-answer.
   if (deal.stage_type === 'won' || deal.stage_type === 'lost' || deal.stage_name === 'Ganado' || deal.stage_name === 'Perdido / no fit') return null;
-  // "Reunión agendada" only passes for reschedule intent (avoids spurious re-fire on every "gracias").
-  if (deal.stage_name === 'Reunión agendada' && !wantsReschedule) return null;
+  // "Reunión agendada" pasa solo para reagendar, cancelar o un NUEVO agendamiento
+  // (evita re-disparar en mensajes pasivos: "gracias", "ok", smalltalk → siguen en null).
+  if (deal.stage_name === 'Reunión agendada' && !wantsReschedule && !wantsBooking && !wantsList) return null;
   return deal;
 }
 
@@ -585,16 +624,395 @@ async function callIa360Agent({ record, stageName }) {
   }
 }
 
+// ── IA360 Human-in-the-loop (owner notify + cancelar conversacional) ─────────
+// Owner = Alek. HOY su numero es el MISMO que el prospecto de prueba, asi que la
+// rama owner discrimina por PREFIJO de id de boton ('owner_'), NO por numero.
+const IA360_OWNER_NUMBER = '5213322638033';
+
+// Envia un interactivo al OWNER (Alek), no al record.contact_number. Construye la
+// fila + encola apuntando a IA360_OWNER_NUMBER. NO pasa por resolveIa360Outbound
+// (su dedup es por contact_number+ia360_handler_for; aqui el destino es otro
+// numero, no colisiona). try/catch propio: nunca tumba el webhook.
+async function sendOwnerInteractive({ record, interactive, label, messageBody }) {
+  try {
+    const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
+    if (error || !account) { console.error('[ia360-owner] account resolve failed:', error || 'unknown'); return false; }
+    const localId = await insertPendingRow({
+      account,
+      toNumber: IA360_OWNER_NUMBER,
+      messageType: 'interactive',
+      messageBody: messageBody || 'IA360 owner',
+      templateMeta: { ux: 'ia360_owner', label, ia360_handler_for: `${record.message_id}:owner:${label}`, source: 'webhook_owner_notify' },
+    });
+    await enqueueSend({ kind: 'interactive', accountId: account.id, to: IA360_OWNER_NUMBER, localMessageId: localId, payload: { interactive } });
+    return true;
+  } catch (err) {
+    console.error('[ia360-owner] sendOwnerInteractive error:', err.message);
+    return false;
+  }
+}
+
+// Envia texto libre a un numero ARBITRARIO (p.ej. el contacto cuya cita se cancela
+// desde la rama owner, donde record.contact_number es Alek, no el prospecto).
+async function sendIa360DirectText({ record, toNumber, body, label }) {
+  try {
+    const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
+    if (error || !account) { console.error('[ia360-owner] direct text account resolve failed:', error || 'unknown'); return false; }
+    const localId = await insertPendingRow({
+      account,
+      toNumber,
+      messageType: 'text',
+      messageBody: body,
+      templateMeta: { ux: 'ia360_owner', label, ia360_handler_for: `${record.message_id}:direct:${toNumber}`, source: 'webhook_owner_direct' },
+    });
+    await enqueueSend({ kind: 'text', accountId: account.id, to: toNumber, localMessageId: localId, payload: { body, previewUrl: false } });
+    return true;
+  } catch (err) {
+    console.error('[ia360-owner] sendIa360DirectText error:', err.message);
+    return false;
+  }
+}
+
+// POST al workflow n8n de cancelar (borra Calendar + Zoom). Requiere User-Agent
+// tipo Chrome por Cloudflare (los otros helpers n8n no lo necesitan; este SI).
+async function cancelIa360Booking({ calendarEventId, zoomMeetingId }) {
+  const url = process.env.N8N_IA360_CANCEL_WEBHOOK_URL || 'https://n8n.geekstudio.dev/webhook/ia360-calendar-cancel';
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({ calendarEventId: calendarEventId || '', zoomMeetingId: zoomMeetingId || '' }),
+    });
+    const text = await res.text().catch(() => '');
+    if (!res.ok) { console.error('[ia360-cancel] webhook failed:', res.status, text); return { ok: false, status: res.status }; }
+    return { ok: true, body: text };
+  } catch (err) {
+    console.error('[ia360-cancel] webhook error:', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+// ── MULTI-CITA: helpers de lista de reservas ─────────────────────────────────
+// Un contacto puede tener VARIAS reuniones. La fuente de verdad es el customField
+// `ia360_bookings` = array JSON de {start, event_id, zoom_id}. Los campos sueltos
+// (ia360_booking_event_id/zoom_id/start) se conservan por compat pero ya NO mandan.
+
+// Lee el array de reservas de un contacto. Si `ia360_bookings` esta vacio pero hay
+// campos sueltos legacy (una cita previa al multi-cita), sintetiza un array de 1
+// elemento para que el cancelar siga funcionando sobre data preexistente.
+async function loadIa360Bookings(contactNumber) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT custom_fields->'ia360_bookings'             AS arr,
+              custom_fields->>'ia360_booking_event_id'    AS evt,
+              custom_fields->>'ia360_booking_zoom_id'     AS zoom,
+              custom_fields->>'ia360_booking_start'       AS start
+         FROM coexistence.contacts WHERE contact_number=$1
+        ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+      [contactNumber]
+    );
+    if (!rows.length) return [];
+    let arr = rows[0].arr;
+    if (typeof arr === 'string') { try { arr = JSON.parse(arr); } catch (_) { arr = null; } }
+    if (Array.isArray(arr) && arr.length) {
+      return arr.filter(b => b && (b.event_id || b.zoom_id));
+    }
+    // Fallback legacy: una sola cita en campos sueltos.
+    if (rows[0].evt || rows[0].zoom) {
+      return [{ start: rows[0].start || '', event_id: rows[0].evt || '', zoom_id: rows[0].zoom || '' }];
+    }
+    return [];
+  } catch (err) {
+    console.error('[ia360-multicita] loadIa360Bookings error:', err.message);
+    return [];
+  }
+}
+
+// Append idempotente: agrega una cita al array `ia360_bookings` (read-modify-write).
+// Dedup por event_id (case-insensitive). Conserva los campos sueltos por compat.
+async function appendIa360Booking({ waNumber, contactNumber, booking }) {
+  const current = await loadIa360Bookings(contactNumber);
+  const eid = String(booking.event_id || '').toLowerCase();
+  const next = current.filter(b => String(b.event_id || '').toLowerCase() !== eid || !eid);
+  next.push({ start: booking.start || '', event_id: booking.event_id || '', zoom_id: booking.zoom_id || '' });
+  console.log('[ia360-multicita] append event=%s -> %d cita(s)', booking.event_id || '-', next.length);
+  await mergeContactIa360State({
+    waNumber,
+    contactNumber,
+    customFields: { ia360_bookings: next },
+  });
+  return next;
+}
+
+// Formato corto CDMX para filas/copy: "Jue 4 jun 5:00pm".
+function fmtIa360Short(startRaw) {
+  if (!startRaw) return 'la fecha agendada';
+  try {
+    const d = new Date(startRaw);
+    const wd = new Intl.DateTimeFormat('es-MX', { timeZone: 'America/Mexico_City', weekday: 'short' }).format(d).replace('.', '');
+    const day = new Intl.DateTimeFormat('es-MX', { timeZone: 'America/Mexico_City', day: 'numeric' }).format(d);
+    const mon = new Intl.DateTimeFormat('es-MX', { timeZone: 'America/Mexico_City', month: 'short' }).format(d).replace('.', '');
+    let time = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Mexico_City', hour: 'numeric', minute: '2-digit', hour12: true }).format(d).toLowerCase().replace(/\s/g, '');
+    if (time.endsWith(':00am') || time.endsWith(':00pm')) time = time.replace(':00', '');
+    const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+    return `${cap(wd)} ${day} ${mon} ${time}`;
+  } catch (_) { return 'la fecha agendada'; }
+}
+
+// Formato medio CDMX (para confirmaciones largas).
+function fmtIa360Medium(startRaw) {
+  if (!startRaw) return 'la fecha agendada';
+  try {
+    return new Intl.DateTimeFormat('es-MX', { timeZone: 'America/Mexico_City', dateStyle: 'medium', timeStyle: 'short' }).format(new Date(startRaw));
+  } catch (_) { return 'la fecha agendada'; }
+}
+
+// Fecha LOCAL CDMX (YYYY-MM-DD) de un start UTC, para filtrar por dia. NO comparar
+// el ISO UTC directo: 2026-06-05T01:00Z es 4-jun en CDMX.
+function ymdIa360CDMX(startRaw) {
+  if (!startRaw) return '';
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(startRaw));
+  } catch (_) { return ''; }
+}
+
+// Nombra un dia (recibido como 'YYYY-MM-DD', p.ej. el date pedido por el prospecto)
+// en CDMX con dia de semana + dia + mes: "miércoles 10 de junio". OJO: un
+// 'YYYY-MM-DD' pelon se parsea como medianoche UTC; en CDMX (UTC-6/-5) eso "retrocede"
+// al dia anterior. Anclamos a mediodia UTC (12:00Z) para que el dia de calendario
+// quede fijo sin importar el offset. Devuelve '' si la fecha es invalida.
+function fmtIa360DiaPedido(ymd) {
+  if (!ymd || !/^\d{4}-\d{2}-\d{2}$/.test(String(ymd))) return '';
+  try {
+    const d = new Date(String(ymd) + 'T12:00:00Z');
+    const s = new Intl.DateTimeFormat('es-MX', { timeZone: 'America/Mexico_City', weekday: 'long', day: 'numeric', month: 'long' }).format(d);
+    // es-MX devuelve "miércoles, 10 de junio" → quitamos la coma tras el dia de semana.
+    return s.replace(',', '');
+  } catch (_) { return ''; }
+}
+
+// Formato largo CDMX para LISTAR reuniones del contacto: "Jueves 9 jun, 10:00 a.m.".
+// Dia de semana COMPLETO + dia + mes corto + hora con a.m./p.m. (estilo MX). Usa el
+// start UTC real de la cita (no un YYYY-MM-DD), asi que NO necesita el ancla de mediodia.
+function fmtIa360Listado(startRaw) {
+  if (!startRaw) return 'la fecha agendada';
+  try {
+    const d = new Date(startRaw);
+    const wd = new Intl.DateTimeFormat('es-MX', { timeZone: 'America/Mexico_City', weekday: 'long' }).format(d);
+    const day = new Intl.DateTimeFormat('es-MX', { timeZone: 'America/Mexico_City', day: 'numeric' }).format(d);
+    const mon = new Intl.DateTimeFormat('es-MX', { timeZone: 'America/Mexico_City', month: 'short' }).format(d).replace('.', '');
+    let time = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Mexico_City', hour: 'numeric', minute: '2-digit', hour12: true }).format(d).toLowerCase();
+    time = time.replace(/\s*am$/, ' a.m.').replace(/\s*pm$/, ' p.m.');
+    const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+    return `${cap(wd)} ${day} ${mon}, ${time}`;
+  } catch (_) { return 'la fecha agendada'; }
+}
+
+// Notifica al OWNER (Alek) para aprobar la cancelacion de UNA cita concreta. El
+// boton "Aprobar" lleva el event_id de ESA cita (owner_cancel_yes:<event_id>) para
+// que la rama owner cancele exactamente esa. "Llamarlo"/"Mantener" llevan el numero
+// del contacto (no necesitan event_id). El copy incluye la fecha/hora CDMX de la cita.
+async function notifyOwnerCancelForBooking({ record, contactNumber, booking }) {
+  const startFmt = fmtIa360Medium(booking.start);
+  return sendOwnerInteractive({
+    record,
+    label: 'owner_cancel_request',
+    messageBody: `IA360: ${contactNumber} pidió cancelar`,
+    interactive: {
+      type: 'button',
+      header: { type: 'text', text: 'Cancelación solicitada' },
+      body: { text: `Alek, un contacto (${contactNumber}) pidió cancelar su reunión del ${startFmt} (CDMX). ¿Qué hago?` },
+      footer: { text: 'IA360 · humano en el bucle' },
+      action: { buttons: [
+        { type: 'reply', reply: { id: `owner_cancel_yes:${booking.event_id}`, title: 'Aprobar' } },
+        { type: 'reply', reply: { id: `owner_cancel_call:${contactNumber}`, title: 'Llamarlo' } },
+        { type: 'reply', reply: { id: `owner_cancel_keep:${contactNumber}`, title: 'Mantener' } },
+      ] },
+    },
+  });
+}
+
+// Resuelve una cita por event_id (case-insensitive) a traves de TODOS los contactos.
+// En la rama owner, `record` es Alek; el boton solo trae el event_id, asi que este
+// lateral join nos da el contacto duenno + los datos de la cita de un tiro.
+async function findBookingByEventId(eventId) {
+  if (!eventId) return null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT c.contact_number AS contact_number,
+              c.wa_number      AS wa_number,
+              elem->>'event_id' AS event_id,
+              elem->>'zoom_id'  AS zoom_id,
+              elem->>'start'    AS start
+         FROM coexistence.contacts c,
+              LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(c.custom_fields->'ia360_bookings')='array'
+                     THEN c.custom_fields->'ia360_bookings' ELSE '[]'::jsonb END
+              ) elem
+        WHERE lower(elem->>'event_id') = lower($1)
+        ORDER BY c.updated_at DESC NULLS LAST
+        LIMIT 1`,
+      [eventId]
+    );
+    if (rows.length) return rows[0];
+    // Fallback legacy: cita en campos sueltos (sin array).
+    const { rows: legacy } = await pool.query(
+      `SELECT contact_number, wa_number,
+              custom_fields->>'ia360_booking_event_id' AS event_id,
+              custom_fields->>'ia360_booking_zoom_id'  AS zoom_id,
+              custom_fields->>'ia360_booking_start'    AS start
+         FROM coexistence.contacts
+        WHERE lower(custom_fields->>'ia360_booking_event_id') = lower($1)
+        ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+      [eventId]
+    );
+    return legacy[0] || null;
+  } catch (err) {
+    console.error('[ia360-multicita] findBookingByEventId error:', err.message);
+    return null;
+  }
+}
+
+// Quita una cita (por event_id, case-insensitive) del array `ia360_bookings` de un
+// contacto y reescribe el array. Devuelve el array resultante (puede quedar vacio).
+async function removeIa360Booking({ waNumber, contactNumber, eventId }) {
+  const current = await loadIa360Bookings(contactNumber);
+  const eid = String(eventId || '').toLowerCase();
+  const next = current.filter(b => String(b.event_id || '').toLowerCase() !== eid);
+  console.log('[ia360-multicita] remove event=%s -> %d cita(s)', String(eventId || '-'), next.length);
+  const extra = { ia360_bookings: next };
+  // Si la cita removida era la "ultima" reflejada en campos sueltos, limpialos.
+  extra.ia360_booking_event_id = next.length ? (next[next.length - 1].event_id || '') : '';
+  extra.ia360_booking_zoom_id = next.length ? (next[next.length - 1].zoom_id || '') : '';
+  extra.ia360_booking_start = next.length ? (next[next.length - 1].start || '') : '';
+  await mergeContactIa360State({ waNumber, contactNumber, customFields: extra });
+  return next;
+}
+
+// Mensaje "pasivo": cortesías/cierres que NO ameritan fallback ni alerta al owner
+// (responderlos con "déjame revisarlo con Alek" sería ruido). Si un mensaje pasivo
+// no se respondió, se deja pasar en silencio (es lo correcto).
+function isIa360PassiveMessage(body) {
+  const t = String(body || '').trim();
+  if (!t) return true;
+  return /^(gracias|ok|okay|va|perfecto|listo|nos vemos|de acuerdo|sale|vale)\b/i.test(t);
+}
+
+// ── PRODUCTION-HARDENING: fallback universal + log + alerta al owner ──────────
+// Se dispara cuando un mensaje ACCIONABLE (dentro del embudo IA360) no se resolvió,
+// o cuando una excepción tumbó el handler. Hace 3 cosas, todo defensivo (un fallo
+// aquí NUNCA debe re-lanzar ni dejar al contacto en silencio):
+//   1) INSERT una fila en coexistence.ia360_bot_failures (status 'abierto') → id.
+//   2) Manda al CONTACTO el fallback "Recibí tu mensaje…" (si no se le respondió ya).
+//   3) ALERTA al owner (Alek, free-form) con 3 botones: Lo tomo / Comentar / Ignorar,
+//      cada uno cargando el <id> de la fila para cerrar el loop después.
+// `reason` = 'no-manejado' (accionable sin resolver) o 'error: <msg>' (excepción).
+// `alreadyResponded` evita doble-texto si el flujo ya le dijo algo al contacto.
+async function handleIa360BotFailure({ record, reason, alreadyResponded = false }) {
+  const fallbackBody = 'Recibí tu mensaje. Déjame revisarlo con Alek y te contacto en breve.';
+  let failureId = null;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.ia360_bot_failures
+         (contact_number, contact_message, reason, bot_fallback, status)
+       VALUES ($1, $2, $3, $4, 'abierto')
+       RETURNING id`,
+      [record.contact_number || null, record.message_body || null, reason || 'no-manejado', fallbackBody]
+    );
+    failureId = rows[0]?.id || null;
+  } catch (dbErr) {
+    console.error('[ia360-failure] insert error:', dbErr.message);
+  }
+  // 2) Fallback al contacto (nunca silencio). Solo si no se le respondió ya.
+  if (!alreadyResponded) {
+    try {
+      await enqueueIa360Text({ record, label: 'ia360_fallback_no_silence', body: fallbackBody });
+    } catch (sendErr) {
+      console.error('[ia360-failure] contact fallback send error:', sendErr.message);
+    }
+  }
+  // 3) Alerta al owner con botones para cerrar el loop (solo si tenemos id).
+  if (failureId != null) {
+    try {
+      const reasonShort = String(reason || 'no-manejado').slice(0, 80);
+      await sendOwnerInteractive({
+        record,
+        label: 'owner_bot_failure',
+        messageBody: `IA360: el bot no resolvió un mensaje de ${record.contact_number || 'desconocido'}`,
+        interactive: {
+          type: 'button',
+          body: { text: `Alek, el bot no resolvió un mensaje de ${record.contact_number || 'desconocido'}: "${String(record.message_body || '').slice(0, 300)}" (${reasonShort}). ¿Qué hago?` },
+          action: {
+            buttons: [
+              { type: 'reply', reply: { id: `owner_take_fail:${failureId}`, title: 'Lo tomo' } },
+              { type: 'reply', reply: { id: `owner_comment_fail:${failureId}`, title: 'Comentar' } },
+              { type: 'reply', reply: { id: `owner_ignore_fail:${failureId}`, title: 'Ignorar' } },
+            ],
+          },
+        },
+      });
+    } catch (ownerErr) {
+      console.error('[ia360-failure] owner alert error:', ownerErr.message);
+    }
+  }
+  return failureId;
+}
+
 async function handleIa360FreeText(record) {
+  // PRODUCTION-HARDENING (fallback universal — cero silencio): estos dos flags viven a
+  // nivel de FUNCION (no del try) para que el catch terminal pueda verlos.
+  //  - responded: se pone true cada vez que enviamos ALGO al contacto/owner.
+  //  - dealFound: true SOLO cuando el contacto está dentro del embudo IA360 activo
+  //    (pasó el guard `!deal`). El fallback/alerta SOLO aplica a deals existentes
+  //    no-resueltos (la misión: "deal en estado no-match"), NUNCA a desconocidos sin
+  //    deal (esos los maneja evaluateTriggers en paralelo; doblar respuesta = ruido).
+  let responded = false;
+  let dealFound = false;
   try {
     if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return;
     if (!record.message_body || !String(record.message_body).trim()) return;
     const deal = await getActiveNonTerminalIa360Deal(record);
     if (!deal) return; // only inside an active, non-terminal IA360 funnel
+    dealFound = true;
     const agent = await callIa360Agent({ record, stageName: deal.stage_name });
     if (!agent || !agent.reply) {
       // Agent unavailable (n8n down / webhook unregistered) → holding reply, never silence.
       await enqueueIa360Text({ record, label: 'ia360_ai_holding', body: 'Déjame revisar esto y te confirmo en un momento.' }).catch(() => {});
+      responded = true;
+      // D) ALERTA AL OWNER si el cerebro del bot (n8n) está caído/timeout. Además del
+      //    holding-reply de arriba (el contacto ya quedó atendido → alreadyResponded:true),
+      //    logueamos en ia360_bot_failures + alertamos a Alek, para que se entere de que el
+      //    agente IA no respondió (no solo silencio operativo).
+      await handleIa360BotFailure({
+        record,
+        reason: 'agente IA no disponible (n8n caído o timeout)',
+        alreadyResponded: true,
+      }).catch(e => console.error('[ia360-failure] agent-down alert error:', e.message));
+      return;
+    }
+
+    // C) LISTAR REUNIONES DEL CONTACTO ("¿cuáles tengo?"). VA ANTES del bloque
+    // "Reunión agendada": casi todo el que pregunta esto YA tiene cita → está en esa
+    // etapa, y ahí abajo caería al branch de reagendar. Es read-only (solo lee
+    // ia360_bookings), por eso es seguro responder y returnear sin tocar el estado.
+    console.log('[ia360-agent] contact=%s stage=%s action=%s intent=%s', record.contact_number, deal.stage_name, agent.action || '-', agent.intent || '-');
+    if (agent.action === 'list_bookings' || agent.intent === 'list_bookings') {
+      const bookings = await loadIa360Bookings(record.contact_number);
+      console.log('[ia360-list] contact=%s bookings=%d', record.contact_number, bookings.length);
+      let body;
+      if (!bookings.length) {
+        body = 'Por ahora no tienes reuniones agendadas. ¿Quieres que agendemos una?';
+      } else {
+        const lines = bookings.map((b, i) => `${i + 1}) ${fmtIa360Listado(b.start)}`).join(String.fromCharCode(10));
+        const n = bookings.length;
+        const plural = n === 1 ? 'reunión agendada' : 'reuniones agendadas';
+        body = `Tienes ${n} ${plural}:${String.fromCharCode(10)}${lines}`;
+      }
+      await enqueueIa360Text({ record, label: 'ia360_ai_list_bookings', body });
+      responded = true;
       return;
     }
 
@@ -604,22 +1022,123 @@ async function handleIa360FreeText(record) {
     // calendarEventId/zoomMeetingId per contact (not persisted yet). Cheap, coherent
     // guard: acknowledge + hand off to Alek (Task), let him move/cancel the real event.
     if (deal.stage_name === 'Reunión agendada') {
-      const isCancel = /cancel|anul|ya no (podr|voy|asist)/i.test(String(record.message_body || ''));
-      await enqueueIa360Text({
-        record,
-        label: isCancel ? 'ia360_ai_cancel_request' : 'ia360_ai_reschedule_request',
-        body: isCancel
-          ? 'Entendido, le aviso a Alek para cancelar la reunión. Te confirma en breve por aquí.'
-          : 'Va, le paso a Alek que quieres mover la reunión. Él te confirma el nuevo horario por aquí en un momento.',
-      });
-      emitIa360N8nHandoff({
-        record,
-        eventType: isCancel ? 'meeting_cancel_requested' : 'meeting_reschedule_requested',
-        targetStage: 'Reunión agendada',
-        priority: 'high',
-        summary: `El contacto pidió ${isCancel ? 'CANCELAR' : 'REPROGRAMAR'} su reunión ya agendada. Mensaje: "${record.message_body || ''}". ${agent.date ? 'Fecha sugerida: ' + agent.date + '. ' : ''}Acción humana: ${isCancel ? 'cancelar el evento Calendar/Zoom existente' : 'mover el evento Calendar/Zoom existente a la nueva fecha (NO crear uno nuevo)'} y confirmar al contacto.`,
-      }).catch(e => console.error('[ia360-n8n] reschedule/cancel handoff:', e.message));
-      return;
+      const isCancel = agent.action === 'cancel'
+        || /cancel|anul|ya no (podr|voy|asist)/i.test(String(record.message_body || ''));
+
+      // ── CANCELAR INTELIGENTE (multi-cita): resolvemos QUE cita cancelar.
+      //   - cancelDate = agent.date (YYYY-MM-DD CDMX, puede venir null si fue vago).
+      //   - candidates = citas de ESE dia (si hay date) o TODAS (si no hubo date).
+      //   - 1 candidato  -> notificar al OWNER directo para esa cita (no re-preguntar).
+      //   - >1 candidato -> mandar al CONTACTO una lista de esas citas (pickcancel:).
+      //   - 0 candidatos -> avisar al contacto (segun si habia date o no habia ninguna).
+      // Todo va dentro del try/catch terminal de handleIa360FreeText.
+      if (isCancel) {
+        const bookings = await loadIa360Bookings(record.contact_number);
+
+        // SIN ninguna cita guardada → NO molestar al owner. Responder al contacto.
+        if (!bookings.length) {
+          await enqueueIa360Text({
+            record,
+            label: 'ia360_ai_cancel_no_meeting',
+            body: 'No tienes reuniones activas a tu nombre para cancelar.',
+          });
+          responded = true;
+          return;
+        }
+
+        const cancelDate = agent.date && /^\d{4}-\d{2}-\d{2}$/.test(String(agent.date)) ? String(agent.date) : null;
+        const candidates = cancelDate
+          ? bookings.filter(b => ymdIa360CDMX(b.start) === cancelDate)
+          : bookings;
+
+        // 0 candidatos con fecha pedida → no hay cita ese dia (pero si hay otras).
+        if (candidates.length === 0) {
+          await enqueueIa360Text({
+            record,
+            label: 'ia360_ai_cancel_no_match',
+            body: 'No encuentro una reunión para esa fecha. ¿Me confirmas qué día era la que quieres cancelar?',
+          });
+          responded = true;
+          return;
+        }
+
+        // >1 candidato → el CONTACTO elige cual cancelar (lista interactiva).
+        if (candidates.length > 1) {
+          await enqueueIa360Interactive({
+            record,
+            label: 'ia360_ai_cancel_pick',
+            messageBody: 'IA360: ¿cuál reunión cancelar?',
+            interactive: {
+              type: 'list',
+              header: { type: 'text', text: 'Cancelar reunión' },
+              body: { text: 'Tienes varias reuniones agendadas. ¿Cuál quieres cancelar?' },
+              footer: { text: 'IA360 · lo confirmo con Alek' },
+              action: {
+                button: 'Ver reuniones',
+                sections: [{
+                  title: 'Tus reuniones',
+                  rows: candidates.slice(0, 10).map(b => ({
+                    id: `pickcancel:${b.event_id}`,
+                    title: String(fmtIa360Short(b.start)).slice(0, 24),
+                    description: 'Toca para solicitar cancelarla',
+                  })),
+                }],
+              },
+            },
+          });
+          responded = true;
+          return;
+        }
+
+        // 1 candidato → notificar al OWNER directo para ESA cita (sin re-preguntar).
+        const target = candidates[0];
+        await enqueueIa360Text({
+          record,
+          label: 'ia360_ai_cancel_request',
+          body: 'Dame un momento, lo confirmo con Alek.',
+        });
+        responded = true;
+        emitIa360N8nHandoff({
+          record,
+          eventType: 'meeting_cancel_requested',
+          targetStage: 'Reunión agendada',
+          priority: 'high',
+          summary: `El contacto pidió CANCELAR su reunión del ${fmtIa360Medium(target.start)} (CDMX). Mensaje: "${record.message_body || ''}". Acción humana: aprobar/cancelar el evento Calendar/Zoom existente y confirmar al contacto.`,
+        }).catch(e => console.error('[ia360-n8n] cancel handoff:', e.message));
+        try {
+          await notifyOwnerCancelForBooking({ record, contactNumber: record.contact_number, booking: target });
+        } catch (ownerErr) {
+          console.error('[ia360-owner] notify on cancel failed:', ownerErr.message);
+        }
+        return;
+      }
+
+      // ── NUEVO AGENDAMIENTO (multi-cita): el prospecto ya agendado pide OTRA reunión.
+      // NO es reagendar (no mueve la existente): debe CAER al handler de offer_slots de
+      // abajo, que consulta disponibilidad real y ofrece el menú multi-día. Por eso NO
+      // hacemos return aquí — solo seguimos el flujo. El cfm_ posterior hará append a
+      // ia360_bookings (segunda cita), sin tocar la primera.
+      if (agent.action === 'offer_slots' || agent.action === 'book') {
+        // fall-through: el control sale del bloque "Reunión agendada" y continúa al
+        // handler de offer_slots/book más abajo (no return).
+      } else {
+        // ── REAGENDAR (u otra intención no-agendamiento): conserva ack + handoff (Alek
+        // mueve el evento a mano via la tarea de EspoCRM). NO se ofrece "Aprobar".
+        await enqueueIa360Text({
+          record,
+          label: 'ia360_ai_reschedule_request',
+          body: 'Va, le paso a Alek que quieres mover la reunión. Él te confirma el nuevo horario por aquí en un momento.',
+        });
+        responded = true;
+        emitIa360N8nHandoff({
+          record,
+          eventType: 'meeting_reschedule_requested',
+          targetStage: 'Reunión agendada',
+          priority: 'high',
+          summary: `El contacto pidió REPROGRAMAR su reunión ya agendada. Mensaje: "${record.message_body || ''}". ${agent.date ? 'Fecha sugerida: ' + agent.date + '. ' : ''}Acción humana: mover el evento Calendar/Zoom existente a la nueva fecha (NO crear uno nuevo) y confirmar al contacto.`,
+        }).catch(e => console.error('[ia360-n8n] reschedule handoff:', e.message));
+        return;
+      }
     }
 
     await mergeContactIa360State({
@@ -637,67 +1156,538 @@ async function handleIa360FreeText(record) {
     if (agent.action === 'optout' || agent.intent === 'optout') {
       await syncIa360Deal({ record, targetStageName: 'Perdido / no fit', titleSuffix: 'Opt-out (texto libre)', notes: `Opt-out por texto libre: ${record.message_body}` });
       await enqueueIa360Text({ record, label: 'ia360_ai_optout', body: agent.reply });
+      responded = true;
       return;
     }
 
-    // OFFER SLOTS → query REAL availability for the agent's date, send list.
-    if ((agent.action === 'offer_slots' || agent.action === 'book') && agent.date) {
-      await syncIa360Deal({
-        record,
-        targetStageName: getIa360StageForEvent('agenda_preference_selected', 'Agenda en proceso'),
-        titleSuffix: 'Agenda (texto libre)',
-        notes: `Solicitó agenda por texto libre (${record.message_body}); fecha interpretada ${agent.date}; se consulta Calendar real`,
-      });
-      // Single outbound only (resolveIa360Outbound dedups per inbound message_id):
-      // fold the agent reply into the slot-list body below instead of a separate text.
-      // Availability node accepts an explicit ISO `date` override (NOT `day`).
-      const url = process.env.N8N_IA360_AVAILABILITY_WEBHOOK_URL;
-      let availability = null;
-      if (url) {
-        try {
-          const r = await fetch(url, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ source: 'forgechat-ia360-webhook', date: agent.date, workStartHour: 10, workEndHour: 18, slotMinutes: 60 }),
+    // OFFER SLOTS / BOOK → consulta disponibilidad REAL y ofrece horarios.
+    // E2: desatorado. Antes el guard exigia `&& agent.date` y, sin fecha, caia al
+    // reply vago. Ahora la intencion de agendar SIEMPRE dispara disponibilidad:
+    //  - con fecha: consulta ese dia; si 0 slots, cae al spread next-available.
+    //  - sin fecha (o "¿cuando si hay?"): spread multi-dia desde manana (ignora el
+    //    date del LLM, que a veces viene mal). El menu ya trae el dia en cada fila.
+    if (agent.action === 'offer_slots' || agent.action === 'book') {
+      try {
+        const url = process.env.N8N_IA360_AVAILABILITY_WEBHOOK_URL;
+        // Sanitiza el date del LLM: solo una fecha ISO real (YYYY-MM-DD) es usable. A
+        // veces el modelo devuelve un placeholder sin resolver ("<miércoles ...>") o
+        // basura; en ese caso lo descartamos y caemos al barrido multi-día (no se
+        // intenta consultar disponibilidad con una fecha inválida).
+        const reqDate = agent.date && /^\d{4}-\d{2}-\d{2}$/.test(String(agent.date)) ? String(agent.date) : null;
+        await syncIa360Deal({
+          record,
+          targetStageName: getIa360StageForEvent('agenda_preference_selected', 'Agenda en proceso'),
+          titleSuffix: 'Agenda (texto libre)',
+          notes: `Solicitó agenda por texto libre (${record.message_body}); fecha interpretada ${reqDate || 'sin fecha → próximos días'}; se consulta Calendar real`,
+        });
+        // helper: una llamada al webhook de disponibilidad con payload arbitrario.
+        const callAvail = async (payload) => {
+          if (!url) return null;
+          try {
+            const r = await fetch(url, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ source: 'forgechat-ia360-webhook', workStartHour: 10, workEndHour: 18, slotMinutes: 60, ...payload }),
+            });
+            return r.ok ? await r.json() : null;
+          } catch (e) { console.error('[ia360-agent] availability error:', e.message); return null; }
+        };
+        // helper: emite la lista interactiva de WhatsApp (max 10 filas, title <=24).
+        const sendSlotList = async (rows, intro) => {
+          await enqueueIa360Interactive({
+            record,
+            label: 'ia360_ai_available_slots',
+            messageBody: 'IA360: horarios disponibles',
+            interactive: {
+              type: 'list',
+              header: { type: 'text', text: 'Horarios libres' },
+              body: { text: (agent.reply ? agent.reply + String.fromCharCode(10) + String.fromCharCode(10) : '') + intro },
+              footer: { text: 'Se revalida antes de reservar' },
+              action: {
+                button: 'Elegir hora',
+                sections: [{ title: 'Disponibles', rows: rows.slice(0, 10).map((slot) => ({ id: slot.id, title: String(slot.title).slice(0, 24), description: slot.description })) }],
+              },
+            },
           });
-          availability = r.ok ? await r.json() : null;
-        } catch (e) { console.error('[ia360-agent] availability error:', e.message); }
-      }
-      const slots = (availability && availability.slots) || [];
-      if (slots.length === 0) {
-        await enqueueIa360Text({ record, label: 'ia360_ai_no_slots', body: 'Revisé la agenda real de Alek para ese día y no hay espacios de 1 hora libres. ¿Quieres que te ofrezca otro día?' });
+        };
+
+        // 1) Si el usuario nombro un dia concreto (ISO válido), intenta ESE dia primero.
+        // A) reqDate con slots -> ofrece ESE dia (no el barrido). reqDate sin slots o
+        //    consulta fallida -> cae al spread. dayQueryOk distingue "el dia salio VACIO"
+        //    (lleno de verdad) de "la consulta FALLO" (null/timeout): no afirmamos "ya
+        //    está lleno" cuando en realidad no pudimos consultar ese dia.
+        let dayQueryOk = false;
+        if (reqDate) {
+          const dayAvail = await callAvail({ date: reqDate });
+          dayQueryOk = !!(dayAvail && Array.isArray(dayAvail.slots));
+          const daySlots = (dayAvail && dayAvail.slots) || [];
+          if (daySlots.length > 0) {
+            await sendSlotList(daySlots, `Estos espacios de 1 hora estan libres (${dayAvail.date}, hora CDMX). Elige uno y lo confirmo con Calendar + Zoom.`);
+            responded = true;
+            return;
+          }
+          // dia lleno (o consulta fallida) → cae al spread multi-dia (next-available) abajo.
+        }
+
+        // 2) Spread multi-dia: proximos dias habiles con slots, ~2 por dia, dia en el titulo.
+        const spread = await callAvail({ nextAvailable: true });
+        const spreadSlots = (spread && spread.slots) || [];
+        if (spreadSlots.length === 0) {
+          await enqueueIa360Text({ record, label: 'ia360_ai_no_slots', body: 'Revisé la agenda real de Alek y no encontré espacios de 1 hora libres en los próximos días hábiles. ¿Te late que le pase a Alek que te contacte para cuadrar un horario?' });
+          responded = true;
+          return;
+        }
+        // B) Si pidió un dia ESPECIFICO y de verdad salió lleno (consulta OK pero sin
+        //    slots, y distinto al primer dia del barrido), NOMBRA ese dia con su dia de
+        //    semana en CDMX: "El miércoles 10 de junio ya está lleno." Solo cuando la
+        //    consulta del dia fue exitosa-pero-vacia (dayQueryOk); si falló, NO afirmamos
+        //    que está lleno (sería falso) y ofrecemos el barrido sin esa frase.
+        let fullDay = '';
+        if (reqDate && dayQueryOk && reqDate !== spread.date) {
+          const diaNombre = fmtIa360DiaPedido(reqDate);
+          fullDay = diaNombre
+            ? `El ${diaNombre} ya está lleno. `
+            : `Ese día ya está lleno. `;
+        }
+        await sendSlotList(spreadSlots, `${fullDay}Te paso opciones de los próximos días (hora CDMX). Elige una y la confirmo con Calendar + Zoom.`);
+        responded = true;
+        return;
+      } catch (e) {
+        console.error('[ia360-agent] offer_slots/book handler error:', e.message);
+        await enqueueIa360Text({ record, label: 'ia360_ai_holding', body: 'Déjame revisar la agenda y te confirmo opciones en un momento.' }).catch(() => {});
+        responded = true;
         return;
       }
-      await enqueueIa360Interactive({
-        record,
-        label: 'ia360_ai_available_slots',
-        messageBody: `IA360: horarios disponibles ${availability.date}`,
-        interactive: {
-          type: 'list',
-          header: { type: 'text', text: 'Horarios libres' },
-          body: { text: (agent.reply ? agent.reply + String.fromCharCode(10) + String.fromCharCode(10) : '') + `Estos espacios de 1 hora estan libres (${availability.date}, hora CDMX). Elige uno y lo confirmo con Calendar + Zoom.` },
-          footer: { text: 'Se revalida antes de reservar' },
-          action: {
-            button: 'Elegir hora',
-            sections: [{ title: 'Disponibles', rows: slots.slice(0, 10).map((slot) => ({ id: slot.id, title: slot.title, description: slot.description })) }],
-          },
-        },
-      });
-      return;
     }
 
     // DEFAULT → just send the agent's coherent reply (ask_pain / provide_info / smalltalk / other).
     if (agent.action === 'advance_pain' || agent.intent === 'ask_pain') {
       await syncIa360Deal({ record, targetStageName: 'Dolor calificado', titleSuffix: 'Dolor (texto libre)', notes: `Dolor por texto libre: ${record.message_body}${agent.extracted && agent.extracted.area_operacion ? ' (área: ' + agent.extracted.area_operacion + ')' : ''}` });
     }
-    await enqueueIa360Text({ record, label: 'ia360_ai_reply', body: agent.reply });
+    const sentReply = await enqueueIa360Text({ record, label: 'ia360_ai_reply', body: agent.reply });
+    if (sentReply) responded = true;
   } catch (err) {
     console.error('[ia360-agent] handleIa360FreeText error:', err.message);
+    // FALLBACK UNIVERSAL (catch): un error NUNCA debe dejar al contacto en silencio.
+    // Solo si el contacto estaba dentro del embudo IA360 (dealFound) — un fallo antes
+    // de saberlo NO debe responder ni alertar (lo cubre evaluateTriggers en paralelo).
+    if (dealFound) {
+      await handleIa360BotFailure({
+        record,
+        reason: 'error: ' + (err && err.message ? String(err.message).slice(0, 120) : 'desconocido'),
+        alreadyResponded: responded,
+      }).catch(e => console.error('[ia360-failure] catch fallback error:', e.message));
+    }
+    return;
+  }
+
+  // FALLBACK UNIVERSAL (fin del handler): si llegamos al final SIN haber respondido y
+  // el contacto está en el embudo IA360 (dealFound) y el mensaje NO era pasivo, no lo
+  // dejamos en silencio: fallback al contacto + alerta al owner para que lo tome.
+  // (En el flujo lineal el reply default casi siempre marca responded=true; esta red
+  // cubre early-returns sin envío y el caso de enqueue duplicado/erróneo.)
+  if (!responded && dealFound && !isIa360PassiveMessage(record.message_body)) {
+    await handleIa360BotFailure({
+      record,
+      reason: 'no-manejado',
+      alreadyResponded: false,
+    }).catch(e => console.error('[ia360-failure] end-net fallback error:', e.message));
+  }
+}
+
+// FlowWire Part B: universal nfm_reply router. When a prospect SUBMITS a WhatsApp Flow,
+// Meta sends an inbound interactive whose interactive.nfm_reply.response_json (a JSON STRING)
+// carries the answered fields + flow_token. The button state machine never matches it, so we
+// detect + route here BEFORE the button handler. Flow is identified by FIELDS PRESENT (robust,
+// not token-bound). Everything is wrapped in try/catch so a malformed nfm never tumbles the
+// webhook. Returns true if it routed (caller short-circuits), false otherwise.
+function extractIa360NfmResponse(record) {
+  try {
+    const payload = typeof record.raw_payload === 'string' ? JSON.parse(record.raw_payload) : record.raw_payload;
+    const messages = payload?.entry?.[0]?.changes?.[0]?.value?.messages || [];
+    const msg = messages.find(m => m && m.id === record.message_id) || messages[0];
+    const nfm = msg?.interactive?.nfm_reply;
+    if (!nfm || !nfm.response_json) return null;
+    const data = typeof nfm.response_json === 'string' ? JSON.parse(nfm.response_json) : nfm.response_json;
+    return (data && typeof data === 'object') ? data : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+const URGENCIA_LEGIBLE = {
+  esta_semana: 'algo de esta semana',
+  este_mes: 'algo de este mes',
+  este_trimestre: 'algo de este trimestre',
+  explorando: 'exploración',
+};
+
+async function handleIa360FlowReply(record) {
+  try {
+    if (!record || record.direction !== 'incoming' || record.message_type !== 'interactive') return false;
+    const data = extractIa360NfmResponse(record);
+    if (!data) return false;
+
+    // Identify WHICH flow by the fields present (not by token).
+    if (data.area !== undefined && data.urgencia !== undefined) {
+      // ── DIAGNOSTICO ───────────────────────────────────────────────────────
+      const { area, urgencia, fuga, sistema, resultado } = data;
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        tags: ['diagnostico-ia360', 'dolor:' + area, 'urgencia:' + urgencia],
+        customFields: {
+          ia360_dolor: area,
+          ia360_fuga: fuga,
+          ia360_sistema: sistema,
+          ia360_urgencia: urgencia,
+          ia360_resultado: resultado,
+        },
+      });
+      const hot = ['esta_semana', 'este_mes', 'este_trimestre'].includes(urgencia);
+      if (hot) {
+        await syncIa360Deal({
+          record,
+          targetStageName: 'Requiere Alek',
+          titleSuffix: 'Diagnóstico (Flow)',
+          notes: `diagnostic_answered: ${area} / ${urgencia}`,
+        });
+        await enqueueIa360Interactive({
+          record,
+          label: 'ia360_flow_diagnostic_hot',
+          messageBody: 'IA360 Flow: diagnóstico (urgente)',
+          interactive: {
+            type: 'button',
+            header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
+            body: { text: `Listo. Con lo que me diste —${area} / ${fuga}— ya tengo tu caso. Como es ${URGENCIA_LEGIBLE[urgencia] || 'algo prioritario'}, lo sensato es agendar 30 min con Alek y bajarlo a quick wins.` },
+            footer: { text: 'IA360' },
+            action: { buttons: [
+              { type: 'reply', reply: { id: '100m_urgent', title: 'Sí, agendar' } },
+              { type: 'reply', reply: { id: '100m_want_map', title: 'Primero el mapa' } },
+            ] },
+          },
+        });
+      } else {
+        await syncIa360Deal({
+          record,
+          targetStageName: 'Nutrición',
+          titleSuffix: 'Diagnóstico (Flow)',
+          notes: `diagnostic_answered: ${area} / ${urgencia}`,
+        });
+        await enqueueIa360Interactive({
+          record,
+          label: 'ia360_flow_diagnostic_explore',
+          messageBody: 'IA360 Flow: diagnóstico (explorando)',
+          interactive: {
+            type: 'button',
+            header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
+            body: { text: 'Te dejo en modo exploración: ejemplos concretos, sin presión. Cuando veas un caso aplicable lo volvemos mapa.' },
+            footer: { text: 'IA360' },
+            action: { buttons: [
+              { type: 'reply', reply: { id: '100m_see_example', title: 'Ver ejemplo' } },
+              { type: 'reply', reply: { id: '100m_want_map', title: 'Quiero mapa' } },
+            ] },
+          },
+        });
+      }
+      // BONUS C: avisar al OWNER que el contacto respondio el diagnostico.
+      try {
+        const who = record.contact_name || record.contact_number;
+        await sendOwnerInteractive({
+          record,
+          label: 'owner_flow_diagnostic',
+          messageBody: `IA360: ${who} respondió el diagnóstico`,
+          interactive: {
+            type: 'button',
+            header: { type: 'text', text: 'Diagnóstico respondido' },
+            body: { text: `Alek, ${who} respondió el diagnóstico. Dolor: ${area || 'n/d'}, urgencia: ${URGENCIA_LEGIBLE[urgencia] || urgencia || 'n/d'}.${resultado ? ' Resultado buscado: ' + resultado + '.' : ''}` },
+            footer: { text: 'IA360 · humano en el bucle' },
+            action: { buttons: [
+              { type: 'reply', reply: { id: `owner_take:${record.contact_number}`, title: 'Lo tomo yo' } },
+              { type: 'reply', reply: { id: `owner_book:${record.contact_number}`, title: 'Agendar' } },
+              { type: 'reply', reply: { id: `owner_nurture:${record.contact_number}`, title: 'Nutrir' } },
+            ] },
+          },
+        });
+      } catch (ownerErr) {
+        console.error('[ia360-owner] notify on flow diagnostic failed:', ownerErr.message);
+      }
+      return true;
+    }
+
+    if (data.tamano_empresa !== undefined) {
+      // ── OFFER_ROUTER ──────────────────────────────────────────────────────
+      const { tamano_empresa, personas_afectadas, tipo_solucion, presupuesto, nivel_decision } = data;
+      const tier = (presupuesto === '200k_1m' || presupuesto === 'mas_1m') ? 'Premium'
+        : (presupuesto === '50k_200k') ? 'Pro' : 'Starter';
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        tags: ['oferta:' + tier, 'decisor:' + nivel_decision],
+        customFields: { ia360_oferta_sugerida: tier },
+      });
+      await syncIa360Deal({
+        record,
+        targetStageName: 'Propuesta / siguiente paso',
+        titleSuffix: 'Oferta ' + tier + ' (Flow)',
+        notes: `offer_router_answered: ${tamano_empresa} / ${presupuesto} → ${tier}`,
+      });
+      await enqueueIa360Interactive({
+        record,
+        label: 'ia360_flow_offer_router',
+        messageBody: 'IA360 Flow: oferta sugerida ' + tier,
+        interactive: {
+          type: 'button',
+          header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
+          body: { text: `Con tu perfil (${tamano_empresa}, ${personas_afectadas}) te propongo arrancar por ${tipo_solucion} en nivel ${tier}. ¿Lo aterrizamos en una llamada?` },
+          footer: { text: 'IA360' },
+          action: { buttons: [
+            { type: 'reply', reply: { id: '100m_schedule', title: 'Agendar' } },
+            { type: 'reply', reply: { id: '100m_want_map', title: 'Ver mapa' } },
+          ] },
+        },
+      });
+      return true;
+    }
+
+    if (data.empresa !== undefined && data.rol !== undefined) {
+      // ── PRE_CALL ──────────────────────────────────────────────────────────
+      const { empresa, rol, objetivo, sistemas } = data;
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        tags: ['pre-call-ia360'],
+        customFields: {
+          ia360_empresa: empresa,
+          ia360_rol: rol,
+          ia360_objetivo: objetivo,
+          ia360_sistemas: sistemas,
+        },
+      });
+      await syncIa360Deal({
+        record,
+        targetStageName: 'Agenda en proceso',
+        titleSuffix: 'Pre-call (Flow)',
+        notes: `pre_call_intake_submitted: ${empresa} / ${rol}`,
+      });
+      await enqueueIa360Interactive({
+        record,
+        label: 'ia360_flow_pre_call',
+        messageBody: 'IA360 Flow: pre-call intake',
+        interactive: {
+          type: 'button',
+          header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
+          body: { text: 'Gracias, con esto llego preparado a la llamada (no demo de cajón). ¿Confirmamos horario?' },
+          footer: { text: 'IA360' },
+          action: { buttons: [
+            { type: 'reply', reply: { id: '100m_urgent', title: 'Sí, agendar' } },
+            { type: 'reply', reply: { id: '100m_schedule', title: 'Elegir horario' } },
+          ] },
+        },
+      });
+      return true;
+    }
+
+    if (data.preferencia !== undefined) {
+      // ── PREFERENCES ───────────────────────────────────────────────────────
+      const { preferencia } = data;
+      if (preferencia === 'no_contactar') {
+        await mergeContactIa360State({
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          tags: ['no-contactar'],
+          customFields: { ia360_preferencia: preferencia },
+        });
+        await syncIa360Deal({
+          record,
+          targetStageName: 'Perdido / no fit',
+          titleSuffix: 'Opt-out (Flow)',
+          notes: 'preferences: no_contactar',
+        });
+        await enqueueIa360Text({
+          record,
+          label: 'ia360_flow_preferences_optout',
+          body: 'Entendido, te saco de esta secuencia. Aquí estoy si algún día quieres retomarlo.',
+        });
+      } else {
+        await mergeContactIa360State({
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          tags: ['preferencia:' + preferencia],
+          customFields: { ia360_preferencia: preferencia },
+        });
+        await syncIa360Deal({
+          record,
+          targetStageName: 'Nutrición',
+          titleSuffix: 'Preferencias (Flow)',
+          notes: `preferences: ${preferencia}`,
+        });
+        await enqueueIa360Interactive({
+          record,
+          label: 'ia360_flow_preferences',
+          messageBody: 'IA360 Flow: preferencias',
+          interactive: {
+            type: 'button',
+            header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
+            body: { text: 'Listo, te mando solo lo útil y sin saturarte.' },
+            footer: { text: 'IA360' },
+            action: { buttons: [
+              { type: 'reply', reply: { id: '100m_see_example', title: 'Ver ejemplo' } },
+            ] },
+          },
+        });
+      }
+      return true;
+    }
+
+    // nfm_reply with unrecognized shape → don't route, let normal handling proceed (it won't match either).
+    return false;
+  } catch (err) {
+    console.error('[ia360-flowwire] nfm router error (degraded, no route):', err.message);
+    return false;
   }
 }
 
 async function handleIa360LiteInteractive(record) {
   if (!record || record.direction !== 'incoming' || !['interactive', 'button'].includes(record.message_type)) return;
+  // ── HITL: rama OWNER (Alek). Va ANTES de flow-reply y del funnel: un tap del
+  // owner (ids con prefijo 'owner_') jamas debe caer en el embudo del prospecto.
+  // getInteractiveReplyId ya devuelve el id en minusculas; por eso los ids owner
+  // se emiten en minusculas con guion_bajo y el contactNumber sobrevive (digitos).
+  const ownerReplyId = getInteractiveReplyId(record);
+  if (ownerReplyId && ownerReplyId.startsWith('owner_')) {
+    try {
+      const [ownerAction, ownerArg] = ownerReplyId.split(':');
+      // call/keep cargan el numero del contacto (digit-strip OK). owner_cancel_yes
+      // carga el EVENT_ID (alfanumerico) → NO digit-stripear ese arg.
+      const targetContact = (ownerArg || '').replace(/\D/g, '');
+      if (ownerAction === 'owner_cancel_yes') {
+        // MULTI-CITA: el boton trae el EVENT_ID de la cita concreta a cancelar.
+        // `record` aqui es Alek, asi que resolvemos contacto+cita por event_id
+        // (case-insensitive). Cancelamos con el event_id ORIGINAL guardado (NO el
+        // del boton, que pasa por toLowerCase y podria no coincidir en Google).
+        const eventArg = ownerArg || '';
+        const found = await findBookingByEventId(eventArg);
+        if (!found) {
+          await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_notfound', body: `No encontré la cita (${eventArg}). Puede que ya estuviera cancelada. No cancelé nada.` });
+          return;
+        }
+        const cancelContact = String(found.contact_number || '').replace(/\D/g, '');
+        const evt = found.event_id || '';   // ORIGINAL (case preservado) desde la DB
+        const zoom = found.zoom_id || '';
+        const startRaw = found.start || '';
+        const cancelRes = await cancelIa360Booking({ calendarEventId: evt, zoomMeetingId: zoom });
+        const startFmt = fmtIa360Medium(startRaw);
+        if (cancelRes.ok) {
+          // Quita ESA cita del array del contacto (y limpia campos sueltos si era la ultima).
+          const remaining = await removeIa360Booking({ waNumber: found.wa_number || record.wa_number, contactNumber: cancelContact, eventId: evt });
+          await mergeContactIa360State({ waNumber: found.wa_number || record.wa_number, contactNumber: cancelContact, tags: ['cancelada-aprobada'], customFields: { ultimo_cta_enviado: 'ia360_cancel_aprobada' } });
+          await sendIa360DirectText({ record, toNumber: cancelContact, label: 'ia360_cancel_done_contact', body: `Listo, Alek aprobó. Cancelé tu reunión del ${startFmt.replace(/\.$/, '')}. Si quieres retomar, escríbeme por aquí.` });
+          // Si ya no le quedan reuniones, saca el deal de "Reunión agendada".
+          if (remaining.length === 0) {
+            await syncIa360Deal({
+              record: { ...record, contact_number: cancelContact },
+              targetStageName: 'Requiere Alek',
+              titleSuffix: 'Reunión cancelada',
+              notes: `Reunión cancelada (aprobada por Alek). Event ${evt}. Sin reuniones activas → vuelve a Requiere Alek.`,
+            }).catch(e => console.error('[ia360-multicita] syncIa360Deal on empty:', e.message));
+            await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_done', body: `Hecho, cancelada la reunión de ${cancelContact}. Ya no le quedan reuniones; moví el deal a "Requiere Alek".` });
+          } else {
+            await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_done', body: `Hecho, cancelada la reunión del ${startFmt} de ${cancelContact}. ${remaining.length === 1 ? 'Le queda 1 reunión' : `Le quedan ${remaining.length} reuniones`}.` });
+          }
+        } else {
+          await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_failed', body: `No pude cancelar la cita de ${cancelContact} (el webhook falló). Revísalo manual.` });
+        }
+        return;
+      }
+      if (ownerAction === 'owner_cancel_call') {
+        await sendIa360DirectText({ record, toNumber: targetContact, label: 'ia360_cancel_call_contact', body: 'Alek te va a llamar para verlo.' });
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_call_ack', body: `Ok, le avisé a ${targetContact} que lo llamas.` });
+        return;
+      }
+      if (ownerAction === 'owner_cancel_keep') {
+        await sendIa360DirectText({ record, toNumber: targetContact, label: 'ia360_cancel_keep_contact', body: 'Tu reunión sigue en pie.' });
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_cancel_keep_ack', body: `Ok, la reunión de ${targetContact} se mantiene.` });
+        return;
+      }
+      // BONUS C acks: owner_take / owner_book / owner_nurture (FYI flow-reply).
+      if (ownerAction === 'owner_take') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_take_ack', body: `Ok, tú tomas a ${targetContact}.` }); return; }
+      if (ownerAction === 'owner_book') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_book_ack', body: `Ok, a agendar con ${targetContact}.` }); return; }
+      if (ownerAction === 'owner_nurture') { await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_nurture_ack', body: `Ok, ${targetContact} a nutrición.` }); return; }
+
+      // ── PRODUCTION-HARDENING: cierre del loop de fallos del bot ───────────────
+      // Estos botones llegan de la alerta de handleIa360BotFailure. El `ownerArg`
+      // (aquí: `ownerArg` crudo, NO `targetContact`) es el ID numérico de la fila en
+      // coexistence.ia360_bot_failures. Cada acción actualiza el status de esa fila.
+      if (ownerAction === 'owner_take_fail') {
+        const fid = String(ownerArg || '').replace(/\D/g, '');
+        if (fid) await pool.query(`UPDATE coexistence.ia360_bot_failures SET owner_action='lo_tomo', status='lo_tomo' WHERE id=$1`, [fid]).catch(e => console.error('[ia360-failure] take update:', e.message));
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_take_fail_ack', body: 'Anotado, lo tomas tú.' });
+        return;
+      }
+      if (ownerAction === 'owner_ignore_fail') {
+        const fid = String(ownerArg || '').replace(/\D/g, '');
+        if (fid) await pool.query(`UPDATE coexistence.ia360_bot_failures SET owner_action='ignorado', status='ignorado' WHERE id=$1`, [fid]).catch(e => console.error('[ia360-failure] ignore update:', e.message));
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_ignore_fail_ack', body: 'Ok, lo ignoro.' });
+        return;
+      }
+      if (ownerAction === 'owner_comment_fail') {
+        const fid = String(ownerArg || '').replace(/\D/g, '');
+        // Marca al CONTACTO owner como "esperando comentario para la fila <fid>": el
+        // SIGUIENTE texto del owner se captura como owner_comment (ver dispatch). Se
+        // guarda en custom_fields del contacto owner; el record aquí ES el owner.
+        if (fid) {
+          await mergeContactIa360State({
+            waNumber: record.wa_number,
+            contactNumber: record.contact_number,
+            customFields: { ia360_awaiting_comment_failure: fid },
+          }).catch(e => console.error('[ia360-failure] set awaiting:', e.message));
+        }
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_comment_fail_prompt', body: 'Escribe tu comentario para mejorar el bot:' });
+        return;
+      }
+      // owner_* desconocido: ack neutro + return (NUNCA cae al funnel).
+      await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_unknown_ack', body: 'Recibido.' });
+      return;
+    } catch (ownerErr) {
+      console.error('[ia360-owner] owner branch error:', ownerErr.message);
+      return; // no tumbar el webhook
+    }
+  }
+
+  // ── MULTI-CITA: el CONTACTO eligio cual cita cancelar desde la lista (pickcancel:
+  // <event_id>). Esto NO empieza con 'owner_', lo dispara el prospecto. Resolvemos la
+  // cita por event_id (case-insensitive) y notificamos al OWNER para ESA cita. try/catch
+  // propio: nunca tumba el webhook. Va ANTES de flow-reply y del funnel.
+  if (ownerReplyId && ownerReplyId.startsWith('pickcancel:')) {
+    try {
+      const pickedEventId = ownerReplyId.slice('pickcancel:'.length);
+      const found = await findBookingByEventId(pickedEventId);
+      if (!found) {
+        await enqueueIa360Text({ record, label: 'ia360_pickcancel_notfound', body: 'No encontré esa reunión, puede que ya esté cancelada. ¿Me confirmas qué día era?' });
+        return;
+      }
+      await enqueueIa360Text({ record, label: 'ia360_ai_cancel_request', body: 'Dame un momento, lo confirmo con Alek.' });
+      emitIa360N8nHandoff({
+        record,
+        eventType: 'meeting_cancel_requested',
+        targetStage: 'Reunión agendada',
+        priority: 'high',
+        summary: `El contacto eligió CANCELAR su reunión del ${fmtIa360Medium(found.start)} (CDMX). Acción humana: aprobar/cancelar el evento Calendar/Zoom y confirmar al contacto.`,
+      }).catch(e => console.error('[ia360-n8n] pickcancel handoff:', e.message));
+      await notifyOwnerCancelForBooking({
+        record,
+        contactNumber: String(found.contact_number || record.contact_number).replace(/\D/g, ''),
+        booking: { start: found.start || '', event_id: found.event_id || '', zoom_id: found.zoom_id || '' },
+      });
+    } catch (pickErr) {
+      console.error('[ia360-multicita] pickcancel branch error:', pickErr.message);
+    }
+    return;
+  }
+
+  // FlowWire Part B: a submitted WhatsApp Flow (nfm_reply) is NOT a button — route it first.
+  if (await handleIa360FlowReply(record)) return;
   const answer = String(record.message_body || '').trim().toLowerCase();
   const replyId = getInteractiveReplyId(record);
 
@@ -705,6 +1695,7 @@ async function handleIa360LiteInteractive(record) {
   const reply100m = {
     'diagnóstico rápido': {
       stage: 'Intención detectada', tag: 'problema-reconocido', title: 'Diagnóstico rápido',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/dolor_ceo.jpg',
       body: 'Perfecto. Para que esto no sea genérico: ¿cuál de estos síntomas te cuesta más dinero o tiempo hoy?',
       buttons: [
         { id: '100m_capture_manual', title: 'Captura manual' },
@@ -714,6 +1705,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'ver mapa 30-60-90': {
       stage: 'Diagnóstico enviado', tag: 'mapa-solicitado', title: 'Mapa 30-60-90',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/dolor_ceo.jpg',
       body: 'Va. El mapa 30-60-90 necesita ubicar primero la fuga principal: operación manual, datos tardíos o seguimiento comercial. ¿Cuál quieres atacar primero?',
       buttons: [
         { id: '100m_capture_manual', title: 'Captura manual' },
@@ -732,6 +1724,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'captura manual': {
       stage: 'Dolor calificado', tag: 'dolor-captura-manual', title: 'Captura manual',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/dolor_ceo.jpg',
       body: 'Ese suele ser quick win: reducir doble captura y pasar datos entre WhatsApp, CRM, ERP o Excel sin depender de copiar/pegar. ¿Qué mecanismo quieres ver?',
       buttons: [
         { id: '100m_wa_crm', title: 'WhatsApp → CRM' },
@@ -741,6 +1734,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'reportes tarde': {
       stage: 'Dolor calificado', tag: 'dolor-reportes-tarde', title: 'Reportes tarde',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/dolor_ceo.jpg',
       body: 'Aquí el valor está en convertir datos operativos en alertas y tablero semanal, no en esperar reportes manuales. ¿Qué ejemplo quieres ver?',
       buttons: [
         { id: '100m_erp_bi', title: 'ERP → BI' },
@@ -750,6 +1744,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'seguimiento ventas': {
       stage: 'Dolor calificado', tag: 'dolor-seguimiento-ventas', title: 'Seguimiento ventas',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/dolor_ceo.jpg',
       body: 'Ahí IA360 puede clasificar intención, mover pipeline y crear tareas humanas antes de que se enfríe el lead. ¿Qué mecanismo quieres ver?',
       buttons: [
         { id: '100m_wa_crm', title: 'WhatsApp → CRM' },
@@ -759,6 +1754,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'whatsapp → crm': {
       stage: 'Propuesta / siguiente paso', tag: 'mecanismo-whatsapp-crm', title: 'WhatsApp → CRM',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/bi_solucion.jpg',
       body: 'Flujo: mensaje entra → se clasifica intención → aplica tags/campos → mueve deal → si hay alta intención crea tarea humana. ¿Qué hacemos con este caso?',
       buttons: [
         { id: '100m_want_map', title: 'Quiero mapa' },
@@ -768,6 +1764,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'erp → bi': {
       stage: 'Propuesta / siguiente paso', tag: 'mecanismo-erp-bi', title: 'ERP → BI',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/bi_solucion.jpg',
       body: 'Flujo: ERP/CRM/Excel → datos normalizados → dashboard ejecutivo → alertas → decisiones semanales. ¿Qué hacemos con este caso?',
       buttons: [
         { id: '100m_want_map', title: 'Quiero mapa' },
@@ -777,6 +1774,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'agente follow-up': {
       stage: 'Propuesta / siguiente paso', tag: 'mecanismo-agentic-followup', title: 'Agente follow-up',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/bi_solucion.jpg',
       body: 'Flujo: agente detecta intención, prepara respuesta, actualiza CRM y escala al humano antes de comprometer algo sensible. ¿Qué hacemos con este caso?',
       buttons: [
         { id: '100m_want_map', title: 'Quiero mapa' },
@@ -786,6 +1784,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'quiero mapa': {
       stage: 'Diagnóstico enviado', tag: 'mapa-30-60-90-solicitado', title: 'Quiero mapa',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
       body: 'Perfecto. Para armar mapa sin humo necesito prioridad real: ¿esto urge, estás explorando o no es prioridad todavía?',
       buttons: [
         { id: '100m_urgent', title: 'Sí, urgente' },
@@ -795,6 +1794,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'ver ejemplo': {
       stage: 'Propuesta / siguiente paso', tag: 'ejemplo-solicitado', title: 'Ver ejemplo',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
       body: 'Ejemplo corto: WhatsApp detecta interés, ForgeChat etiqueta y mueve pipeline, n8n crea tarea en CRM, y Alek recibe resumen antes de hablar con el prospecto.',
       buttons: [
         { id: '100m_want_map', title: 'Quiero mapa' },
@@ -804,6 +1804,7 @@ async function handleIa360LiteInteractive(record) {
     },
     'sí, urgente': {
       stage: 'Requiere Alek', tag: 'hot-lead', title: 'Sí, urgente',
+      mediaKey: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
       body: 'Marcado como prioridad alta. Siguiente paso sensato: Alek revisa contexto y propone llamada con objetivo claro, no demo genérica.',
       buttons: [
         { id: 'sched_today', title: 'Hoy' },
@@ -881,6 +1882,26 @@ async function handleIa360LiteInteractive(record) {
       titleSuffix: flow100m.title,
       notes: `100M flow: ${record.message_body} → ${flow100m.stage}`,
     });
+    // FlowWire Part A: "Diagnóstico rápido" opens the diagnostico WhatsApp Flow instead of
+    // the button chain. tag 'problema-reconocido' is unique to that node. If the Flow can't be
+    // enqueued (dedup / account / throw), fall through to the existing button branch below.
+    if (flow100m.tag === 'problema-reconocido') {
+      try {
+        const flowSent = await enqueueIa360FlowMessage({
+          record,
+          flowId: '995344356550872',
+          screen: 'DIAGNOSTICO',
+          cta: 'Abrir diagnóstico',
+          bodyText: 'Para no darte algo genérico, cuéntame en 30 segundos dónde se te va el tiempo o el dinero. Lo aterrizo a tu caso.',
+          mediaUrl: 'https://wa.geekstudio.dev/ia360-bca/dolor_ceo.jpg',
+          flowToken: 'ia360_diagnostico',
+          label: `ia360_100m_${flow100m.tag}`,
+        });
+        if (flowSent) return;
+      } catch (flowErr) {
+        console.error('[ia360-flowwire] diagnostico flow send failed, falling back to buttons:', flowErr.message);
+      }
+    }
     if (flow100m.buttons.length > 0) {
       await enqueueIa360Interactive({
         record,
@@ -888,7 +1909,7 @@ async function handleIa360LiteInteractive(record) {
         messageBody: `IA360 100M: ${flow100m.title}`,
         interactive: {
           type: 'button',
-          header: { type: 'text', text: flow100m.title },
+          header: flow100m.mediaKey ? { type: 'image', image: { link: flow100m.mediaKey } } : { type: 'text', text: flow100m.title },
           body: { text: flow100m.body },
           footer: { text: 'IA360 · micro-paso' },
           action: { buttons: flow100m.buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } })) },
@@ -901,7 +1922,7 @@ async function handleIa360LiteInteractive(record) {
         messageBody: `IA360 100M: ${flow100m.title}`,
         interactive: {
           type: 'button',
-          header: { type: 'text', text: flow100m.title },
+          header: flow100m.mediaKey ? { type: 'image', image: { link: flow100m.mediaKey } } : { type: 'text', text: flow100m.title },
           body: { text: flow100m.body },
           footer: { text: 'IA360' },
           action: { buttons: [{ type: 'reply', reply: { id: '100m_more_later', title: 'Más adelante' } }] },
@@ -1274,9 +2295,114 @@ async function handleIa360LiteInteractive(record) {
     return;
   }
 
-  const selectedSlot = parseIa360SlotId(replyId);
-  if (selectedSlot) {
-    const booking = await bookIa360Slot({ record, ...selectedSlot });
+  // CFM-STEP (paso de confirmación, aditivo): al TOCAR un horario (slot_<ISO>) NO
+  // agendamos al instante. Interceptamos y mandamos un mensaje interactivo de
+  // confirmación con dos botones: "Sí, agendar" (cfm_<ISO>) y "Ver otras" (reslots).
+  // El booking real solo ocurre con cfm_<ISO> (abajo). Todo va en try/catch terminal:
+  // si algo falla, log + return (NUNCA cae al booking — ese es justo el riesgo que
+  // este paso existe para prevenir).
+  const tappedSlot = parseIa360SlotId(replyId);
+  if (tappedSlot) {
+    try {
+      // El id ya viene en minúsculas (getInteractiveReplyId). Reconstruimos el id de
+      // confirmación conservando el mismo ISO codificado: slot_<...> -> cfm_<...>.
+      const isoSuffix = replyId.slice('slot_'.length); // ej '20260605t160000z'
+      const confirmId = `cfm_${isoSuffix}`;             // ej 'cfm_20260605t160000z'
+      const promptTime = new Intl.DateTimeFormat('es-MX', {
+        timeZone: 'America/Mexico_City',
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      }).format(new Date(tappedSlot.start));
+      await enqueueIa360Interactive({
+        record,
+        label: 'ia360_lite_slot_confirm_prompt',
+        messageBody: `IA360: confirmar horario ${promptTime}`,
+        interactive: {
+          type: 'button',
+          header: { type: 'text', text: 'Confirmar reunión' },
+          body: { text: `¿Confirmas tu reunión con Alek el ${promptTime} (hora del centro de México)?` },
+          footer: { text: 'Se revalida antes de reservar' },
+          action: {
+            buttons: [
+              { type: 'reply', reply: { id: confirmId, title: 'Sí, agendar' } },
+              { type: 'reply', reply: { id: 'reslots', title: 'Ver otras' } },
+            ],
+          },
+        },
+      });
+    } catch (e) {
+      console.error('[ia360-calendar] slot confirm prompt error:', e.message);
+    }
+    return;
+  }
+
+  // CFM-STEP: re-mostrar el menú de horarios ("Ver otras"). Re-dispara el spread
+  // multi-día (nextAvailable) y reconstruye la lista interactiva inline (mismo shape
+  // que el path de día). try/catch terminal: si falla, log + texto de respaldo.
+  if (replyId === 'reslots') {
+    try {
+      const availUrl = process.env.N8N_IA360_AVAILABILITY_WEBHOOK_URL;
+      let spread = null;
+      if (availUrl) {
+        const r = await fetch(availUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ source: 'forgechat-ia360-webhook', workStartHour: 10, workEndHour: 18, slotMinutes: 60, nextAvailable: true }),
+        });
+        spread = r.ok ? await r.json() : null;
+      }
+      const reSlots = (spread && spread.slots) || [];
+      if (reSlots.length === 0) {
+        await enqueueIa360Text({
+          record,
+          label: 'ia360_lite_reslots_none',
+          body: 'Revisé la agenda real de Alek y no veo espacios de 1 hora libres en los próximos días hábiles. ¿Te late que le pase a Alek que te contacte para cuadrar un horario?',
+        });
+        return;
+      }
+      await enqueueIa360Interactive({
+        record,
+        label: 'ia360_lite_available_slots_reslots',
+        messageBody: `IA360: horarios disponibles${spread.date ? ' ' + spread.date : ''}`,
+        interactive: {
+          type: 'list',
+          header: { type: 'text', text: 'Horarios libres' },
+          body: { text: 'Te paso opciones de los próximos días (hora CDMX). Elige una y la confirmo con Calendar + Zoom.' },
+          footer: { text: 'Se revalida antes de reservar' },
+          action: {
+            button: 'Elegir hora',
+            sections: [{
+              title: 'Disponibles',
+              rows: reSlots.slice(0, 10).map((slot) => ({
+                id: slot.id,
+                title: String(slot.title).slice(0, 24),
+                description: slot.description,
+              })),
+            }],
+          },
+        },
+      });
+    } catch (e) {
+      console.error('[ia360-calendar] reslots handler error:', e.message);
+      await enqueueIa360Text({
+        record,
+        label: 'ia360_lite_reslots_holding',
+        body: 'Déjame revisar la agenda y te confirmo opciones en un momento.',
+      });
+    }
+    return;
+  }
+
+  // CFM-STEP: booking REAL. Solo ocurre cuando el prospecto pulsa "Sí, agendar"
+  // (cfm_<ISO>). Aquí vive TODO el flujo de reserva que antes corría al tocar el slot:
+  // parse -> bookIa360Slot (Zoom + Calendar) -> mutar estado/etapa -> confirmación
+  // final -> handoff n8n. El id de confirmación carga el mismo ISO; lo reescribimos a
+  // slot_<ISO> para reutilizar parseIa360SlotId verbatim (replyId ya en minúsculas).
+  const confirmedSlot = replyId.startsWith('cfm_')
+    ? parseIa360SlotId(`slot_${replyId.slice('cfm_'.length)}`)
+    : null;
+  if (confirmedSlot) {
+    const booking = await bookIa360Slot({ record, ...confirmedSlot });
     if (!booking?.ok) {
       await enqueueIa360Text({
         record,
@@ -1293,8 +2419,25 @@ async function handleIa360LiteInteractive(record) {
         ia360_ultima_respuesta: record.message_body,
         proximo_followup: `Reunión confirmada: ${booking.start}`,
         ultimo_cta_enviado: 'ia360_lite_reunion_confirmada',
+        // HITL/compat: campos sueltos de la ULTIMA cita (legacy). La fuente de verdad
+        // para multi-cita es `ia360_bookings` (append abajo), NO estos campos.
+        ia360_booking_event_id: booking.calendarEventId || '',
+        ia360_booking_zoom_id: booking.zoomMeetingId || '',
+        ia360_booking_start: booking.start || '',
       },
     });
+    // MULTI-CITA: en vez de SOBREESCRIBIR, AGREGAMOS esta cita al array de reservas.
+    // try/catch propio: si el append falla, la cita ya quedo en los campos sueltos
+    // (la confirmacion y el deal no se bloquean).
+    try {
+      await appendIa360Booking({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        booking: { start: booking.start || '', event_id: booking.calendarEventId || '', zoom_id: booking.zoomMeetingId || '' },
+      });
+    } catch (apErr) {
+      console.error('[ia360-multicita] append on booking failed:', apErr.message);
+    }
     await syncIa360Deal({
       record,
       targetStageName: getIa360StageForEvent('meeting_confirmed_calendar_zoom', 'Reunión agendada'),
@@ -1655,6 +2798,48 @@ router.post('/webhook/whatsapp', async (req, res) => {
     if (incomingRecords.length > 0) {
       for (const record of incomingRecords) {
         try {
+          // ── PRODUCTION-HARDENING: CAPTURA DEL COMENTARIO del owner ──────────
+          // Va ANTES de TODO (paused-resume, flow, funnel): si el owner (Alek) tocó
+          // "Comentar" en una alerta de fallo, su SIGUIENTE texto ES el comentario.
+          // Gate barato y colisión-segura: solo owner + texto + flag presente (el flag
+          // solo existe en la ventana corta tras tocar "Comentar", así que aunque su
+          // número coincida con el del prospecto de prueba, no se confunde).
+          if (record.message_type === 'text'
+              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER
+              && String(record.message_body || '').trim()) {
+            try {
+              const { rows: awRows } = await pool.query(
+                `SELECT custom_fields->>'ia360_awaiting_comment_failure' AS fid
+                   FROM coexistence.contacts
+                  WHERE wa_number=$1 AND contact_number=$2
+                  LIMIT 1`,
+                [record.wa_number, record.contact_number]
+              );
+              const awaitingFid = awRows[0]?.fid;
+              if (awaitingFid && String(awaitingFid).trim() !== '') {
+                const comment = String(record.message_body || '').trim();
+                await pool.query(
+                  `UPDATE coexistence.ia360_bot_failures
+                      SET owner_comment=$1, status='comentado'
+                    WHERE id=$2`,
+                  [comment, String(awaitingFid).replace(/\D/g, '')]
+                ).catch(e => console.error('[ia360-failure] save comment:', e.message));
+                // Limpia el flag. mergeContactIa360State NO borra llaves jsonb (solo
+                // concatena), así que lo vaciamos a '' y el check de arriba es `<> ''`.
+                await mergeContactIa360State({
+                  waNumber: record.wa_number,
+                  contactNumber: record.contact_number,
+                  customFields: { ia360_awaiting_comment_failure: '' },
+                }).catch(e => console.error('[ia360-failure] clear awaiting:', e.message));
+                await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_comment_fail_saved', body: 'Gracias, guardado para seguir mejorando.' });
+                continue; // NO procesar como mensaje normal (ni paused, ni funnel, ni triggers)
+              }
+            } catch (capErr) {
+              console.error('[ia360-failure] comment-capture error:', capErr.message);
+              // si la captura falla, dejamos que el mensaje siga el flujo normal
+            }
+          }
+
           const { rows: pausedRows } = await pool.query(
             `SELECT id FROM coexistence.automation_executions
               WHERE wa_number=$1 AND contact_number=$2
