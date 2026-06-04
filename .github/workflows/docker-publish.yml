@@ -25,10 +25,15 @@ jobs:
     strategy:
       matrix:
         include:
+          # The backend Dockerfile copies both backend/ and db/migrations/, so it
+          # builds from the repo ROOT (matches docker-compose.yml). The frontend
+          # is self-contained and builds from ./frontend.
           - name: backend
-            context: ./backend
+            context: .
+            dockerfile: ./backend/Dockerfile
           - name: frontend
             context: ./frontend
+            dockerfile: ./frontend/Dockerfile
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
@@ -47,6 +52,7 @@ jobs:
       - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
         with:
           context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
