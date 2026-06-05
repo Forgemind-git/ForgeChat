@@ -204,6 +204,81 @@ async function mergeContactIa360State({ waNumber, contactNumber, tags = [], cust
   );
 }
 
+function extractSharedContactsFromRecord(record) {
+  if (!record || record.message_type !== 'contacts' || !record.raw_payload) return [];
+  try {
+    const payload = typeof record.raw_payload === 'string' ? JSON.parse(record.raw_payload) : record.raw_payload;
+    const found = new Map();
+    const entries = Array.isArray(payload?.entry) ? payload.entry : [];
+    for (const entry of entries) {
+      const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+      for (const change of changes) {
+        const messages = Array.isArray(change?.value?.messages) ? change.value.messages : [];
+        for (const msg of messages) {
+          if (record.message_id && msg?.id && msg.id !== record.message_id) continue;
+          const contacts = Array.isArray(msg?.contacts) ? msg.contacts : [];
+          for (const c of contacts) {
+            const phones = Array.isArray(c?.phones) ? c.phones : [];
+            const primaryPhone = phones.find(p => p?.wa_id) || phones.find(p => p?.phone) || {};
+            const contactNumber = normalizePhone(primaryPhone.wa_id || primaryPhone.phone || '');
+            if (!contactNumber) continue;
+            const emails = Array.isArray(c?.emails) ? c.emails : [];
+            const name = c?.name?.formatted_name || c?.name?.first_name || c?.name?.last_name || contactNumber;
+            found.set(contactNumber, {
+              contactNumber,
+              name,
+              phoneRaw: primaryPhone.phone || null,
+              waId: primaryPhone.wa_id || null,
+              email: emails[0]?.email || null,
+              raw: c,
+            });
+          }
+        }
+      }
+    }
+    return [...found.values()];
+  } catch (err) {
+    console.error('[ia360-vcard] extract error:', err.message);
+    return [];
+  }
+}
+
+async function upsertIa360SharedContact({ record, shared }) {
+  if (!record?.wa_number || !shared?.contactNumber) return null;
+  const customFields = {
+    staged: true,
+    stage: 'Capturado / Por rutear',
+    captured_at: new Date().toISOString(),
+    intake_source: 'b29-vcard-whatsapp',
+    source_message_id: record.message_id || null,
+    referido_por: record.contact_number || null,
+    captured_by: normalizePhone(record.contact_number) === IA360_OWNER_NUMBER ? 'owner-whatsapp' : 'whatsapp-contact',
+    pipeline_sugerido: null,
+    vcard_phone_raw: shared.phoneRaw || null,
+    vcard_wa_id: shared.waId || null,
+    email: shared.email || null,
+  };
+  const tags = ['ia360-vcard', 'owner-intake', 'staged'];
+  const { rows } = await pool.query(
+    `INSERT INTO coexistence.contacts (wa_number, contact_number, name, profile_name, tags, custom_fields, updated_at)
+     VALUES ($1, $2, $3, $3, $4::jsonb, $5::jsonb, NOW())
+     ON CONFLICT (wa_number, contact_number) DO UPDATE SET
+       name = COALESCE(EXCLUDED.name, coexistence.contacts.name),
+       profile_name = COALESCE(EXCLUDED.profile_name, coexistence.contacts.profile_name),
+       tags = (
+         SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+         FROM jsonb_array_elements_text(
+           COALESCE(coexistence.contacts.tags, '[]'::jsonb) || EXCLUDED.tags
+         ) AS value
+       ),
+       custom_fields = COALESCE(coexistence.contacts.custom_fields, '{}'::jsonb) || EXCLUDED.custom_fields,
+       updated_at = NOW()
+     RETURNING id, wa_number, contact_number, name, profile_name, tags, custom_fields`,
+    [record.wa_number, shared.contactNumber, shared.name || shared.contactNumber, JSON.stringify(tags), JSON.stringify(customFields)]
+  );
+  return rows[0] || null;
+}
+
 async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes = '' }) {
   if (!record || !record.wa_number || !record.contact_number || !targetStageName) return null;
   const { rows: pipeRows } = await pool.query(
@@ -311,14 +386,17 @@ async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes 
   return { id: existing.id, moved: shouldMove };
 }
 
-async function resolveIa360Outbound(record) {
+async function resolveIa360Outbound(record, dedupSuffix = '') {
+  // dedupSuffix permite mandar UN segundo mensaje al mismo contacto para el mismo inbound
+  // sin que el dedup (por ia360_handler_for) lo descarte. Default '' = comportamiento idéntico.
+  const handlerFor = dedupSuffix ? record.message_id + dedupSuffix : record.message_id;
   const { rows } = await pool.query(
     `SELECT 1 FROM coexistence.chat_history
       WHERE direction='outgoing'
         AND contact_number=$1
         AND template_meta->>'ia360_handler_for'=$2
       LIMIT 1`,
-    [record.contact_number, record.message_id]
+    [record.contact_number, handlerFor]
   );
   if (rows.length > 0) return { duplicate: true };
 
@@ -330,8 +408,8 @@ async function resolveIa360Outbound(record) {
   return { account };
 }
 
-async function enqueueIa360Interactive({ record, label, messageBody, interactive }) {
-  const resolved = await resolveIa360Outbound(record);
+async function enqueueIa360Interactive({ record, label, messageBody, interactive, dedupSuffix = '' }) {
+  const resolved = await resolveIa360Outbound(record, dedupSuffix);
   if (resolved.duplicate || resolved.error) return false;
   const { account } = resolved;
 
@@ -343,7 +421,7 @@ async function enqueueIa360Interactive({ record, label, messageBody, interactive
     templateMeta: {
       ux: 'ia360_lite',
       label,
-      ia360_handler_for: record.message_id,
+      ia360_handler_for: dedupSuffix ? record.message_id + dedupSuffix : record.message_id,
       source: 'webhook_interactive_reply',
     },
   });
@@ -387,6 +465,38 @@ async function enqueueIa360FlowMessage({ record, flowId, screen, cta, bodyText, 
   });
 }
 
+// W4 — "Enviar contexto" es stage-aware (DESAMBIGUACION del brief): si el contacto YA tiene
+// slot agendado (ia360_bookings no vacio) abre el Flow pre_call (contexto para la llamada);
+// si NO hay slot abre el Flow diagnostico ligero. El stage manda. Devuelve el bool de envio
+// (true si se encolo). loadIa360Bookings/enqueueIa360FlowMessage estan hoisted (function decls).
+async function dispatchContextFlow(record) {
+  const bookings = await loadIa360Bookings(record.contact_number);
+  const hasSlot = Array.isArray(bookings) && bookings.length > 0;
+  console.log('[ia360-flowwire] send_context contact=%s hasSlot=%s -> %s', record.contact_number, hasSlot, hasSlot ? 'pre_call' : 'diagnostico');
+  if (hasSlot) {
+    return enqueueIa360FlowMessage({
+      record,
+      flowId: '862907796864124',
+      screen: 'PRE_CALL_INTAKE',
+      cta: 'Enviar contexto',
+      bodyText: 'Para que Alek llegue preparado a tu llamada (no demo de cajón): cuéntame empresa, tu rol, el objetivo, los sistemas que usan hoy y qué sería un buen resultado.',
+      mediaUrl: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
+      flowToken: 'ia360_pre_call',
+      label: 'ia360_send_context_precall',
+    });
+  }
+  return enqueueIa360FlowMessage({
+    record,
+    flowId: '995344356550872',
+    screen: 'DIAGNOSTICO',
+    cta: 'Abrir diagnóstico',
+    bodyText: 'Para no darte algo genérico, cuéntame en 30 segundos dónde se te va el tiempo o el dinero. Lo aterrizo a tu caso.',
+    mediaUrl: 'https://wa.geekstudio.dev/ia360-bca/dolor_ceo.jpg',
+    flowToken: 'ia360_diagnostico',
+    label: 'ia360_send_context_diag',
+  });
+}
+
 async function enqueueIa360Text({ record, label, body }) {
   const resolved = await resolveIa360Outbound(record);
   if (resolved.duplicate || resolved.error) return false;
@@ -412,6 +522,166 @@ async function enqueueIa360Text({ record, label, body }) {
     payload: { body, previewUrl: false },
   });
   return true;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseTemplateSamples(samples) {
+  if (!samples) return {};
+  if (typeof samples === 'object') return samples;
+  try { return JSON.parse(samples); } catch { return {}; }
+}
+
+function templateBodyIndexes(body) {
+  const out = new Set();
+  for (const m of String(body || '').matchAll(/\{\{\s*(\d+)\s*\}\}/g)) out.add(m[1]);
+  return Array.from(out).sort((a, b) => Number(a) - Number(b));
+}
+
+function firstNameForTemplate(record) {
+  const raw = String(record.contact_name || record.profile_name || '').trim();
+  const cleaned = raw.replace(/\s+WhatsApp IA360$/i, '').trim();
+  return cleaned.split(/\s+/).filter(Boolean)[0] || 'Alek';
+}
+
+async function resolveTemplateHeaderMediaId(tpl, account) {
+  const headerType = String(tpl.header_type || 'NONE').toUpperCase();
+  if (!['IMAGE', 'VIDEO', 'DOCUMENT'].includes(headerType)) return null;
+  if (!tpl.header_media_library_id) {
+    throw new Error(`template ${tpl.name} requires ${headerType} header media but has no header_media_library_id`);
+  }
+  const { rows: mRows } = await pool.query(
+    `SELECT * FROM coexistence.media_library WHERE id = $1 AND deleted_at IS NULL`,
+    [tpl.header_media_library_id]
+  );
+  if (!mRows.length) throw new Error(`media library id ${tpl.header_media_library_id} not found`);
+  const { rows: sRows } = await pool.query(
+    `SELECT * FROM coexistence.media_meta_sync WHERE media_id = $1 AND account_id = $2`,
+    [tpl.header_media_library_id, account.id]
+  );
+  let sync = sRows[0];
+  const needsSync = !sync || sync.status !== 'synced' || !sync.meta_media_id || (sync.expires_at && new Date(sync.expires_at) <= new Date());
+  if (needsSync) {
+    const { syncMediaToAccount } = require('./mediaLibrary');
+    const synced = await syncMediaToAccount(tpl.header_media_library_id, account.id);
+    sync = { meta_media_id: synced.metaMediaId, expires_at: synced.expiresAt, status: synced.status };
+  }
+  if (!sync?.meta_media_id) throw new Error(`media library id ${tpl.header_media_library_id} has no Meta media id`);
+  return sync.meta_media_id;
+}
+
+async function buildIa360TemplateComponents(tpl, account, record) {
+  const components = [];
+  const headerType = String(tpl.header_type || 'NONE').toUpperCase();
+  const headerMediaId = await resolveTemplateHeaderMediaId(tpl, account);
+  if (headerMediaId) {
+    const key = headerType.toLowerCase();
+    components.push({ type: 'header', parameters: [{ type: key, [key]: { id: headerMediaId } }] });
+  }
+
+  const samples = parseTemplateSamples(tpl.samples);
+  const indexes = templateBodyIndexes(tpl.body);
+  if (indexes.length) {
+    components.push({
+      type: 'body',
+      parameters: indexes.map(k => ({
+        type: 'text',
+        text: k === '1' ? firstNameForTemplate(record) : String(samples[k] || ' '),
+      })),
+    });
+  }
+  return components;
+}
+
+async function waitForIa360OutboundStatus(handlerFor, timeoutMs = 9000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    await sleep(600);
+    const { rows } = await pool.query(
+      `SELECT status, error_message, message_id
+         FROM coexistence.chat_history
+        WHERE direction='outgoing'
+          AND template_meta->>'ia360_handler_for'=$1
+        ORDER BY id DESC
+        LIMIT 1`,
+      [handlerFor]
+    );
+    last = rows[0] || last;
+    if (last && ['sent', 'failed'].includes(String(last.status || '').toLowerCase())) return last;
+  }
+  return last || { status: 'unknown' };
+}
+
+async function enqueueIa360Template({ record, label, templateName, templateId = null }) {
+  const resolved = await resolveIa360Outbound(record, `:${label}`);
+  if (resolved.duplicate || resolved.error) return { ok: false, status: resolved.duplicate ? 'duplicate' : 'error', error: resolved.error || null };
+  const { account } = resolved;
+  let tpl = null;
+  if (templateId) {
+    const { rows } = await pool.query(
+      `SELECT id, name, language, body, status, header_type, header_media_library_id, samples
+         FROM coexistence.message_templates
+        WHERE id=$1 AND status='APPROVED'
+        LIMIT 1`,
+      [templateId]
+    );
+    tpl = rows[0] || null;
+  }
+  if (!tpl && templateName) {
+    const { rows } = await pool.query(
+      `SELECT id, name, language, body, status, header_type, header_media_library_id, samples
+         FROM coexistence.message_templates
+        WHERE name=$1 AND status='APPROVED'
+        ORDER BY updated_at DESC
+        LIMIT 1`,
+      [templateName]
+    );
+    tpl = rows[0] || null;
+  }
+  if (!tpl) {
+    console.error('[ia360-owner-pipe] approved template not found:', templateName || templateId);
+    return { ok: false, status: 'template_not_found', error: String(templateName || templateId || '') };
+  }
+  let components;
+  try {
+    components = await buildIa360TemplateComponents(tpl, account, record);
+  } catch (err) {
+    console.error('[ia360-owner-pipe] template components error:', err.message);
+    return { ok: false, status: 'template_components_error', error: err.message };
+  }
+  const handlerFor = `${record.message_id}:${label}`;
+  const localId = await insertPendingRow({
+    account,
+    toNumber: record.contact_number,
+    messageType: 'template',
+    messageBody: tpl.body || tpl.name,
+    templateMeta: {
+      ux: 'ia360_owner_pipeline',
+      label,
+      ia360_handler_for: handlerFor,
+      source: 'webhook_owner_pipe',
+      template_name: tpl.name,
+      template_id: tpl.id,
+      header_type: tpl.header_type || 'NONE',
+      header_media_library_id: tpl.header_media_library_id || null,
+    },
+  });
+  await enqueueSend({
+    kind: 'template',
+    accountId: account.id,
+    to: record.contact_number,
+    localMessageId: localId,
+    payload: { name: tpl.name, languageCode: tpl.language || 'es_MX', components },
+  });
+  const status = await waitForIa360OutboundStatus(handlerFor);
+  return {
+    ok: String(status?.status || '').toLowerCase() === 'sent',
+    status: status?.status || 'unknown',
+    error: status?.error_message || null,
+  };
 }
 
 async function emitIa360N8nHandoff({ record, eventType, targetStage, summary, priority = 'normal' }) {
@@ -593,9 +863,44 @@ async function getActiveNonTerminalIa360Deal(record) {
   return deal;
 }
 
+const N8N_IA360_CONTACT_INTEL_WEBHOOK_URL = process.env.N8N_IA360_CONTACT_INTEL_WEBHOOK_URL || 'https://n8n.geekstudio.dev/webhook/ia360-contact-intelligence-agent-draft';
+
+function buildIa360AgentPayload({ record, stageName, history, source }) {
+  return {
+    source,
+    channel: 'whatsapp',
+    dry_run: source === 'forgechat-ia360-contact-intelligence-shadow',
+    text: record.message_body || '',
+    stage: stageName,
+    history,
+    message_id: record.message_id || null,
+    wa_number: record.wa_number || null,
+    contact_number: record.contact_number || null,
+    contact_name: record.contact_name || record.profile_name || null,
+  };
+}
+
+async function shadowIa360ContactIntelligence({ record, stageName, history }) {
+  const url = N8N_IA360_CONTACT_INTEL_WEBHOOK_URL;
+  if (!url) return;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(buildIa360AgentPayload({
+        record,
+        stageName,
+        history,
+        source: 'forgechat-ia360-contact-intelligence-shadow',
+      })),
+    });
+    if (!res.ok) console.error('[ia360-contact-intel] shadow failed:', res.status);
+  } catch (err) {
+    console.error('[ia360-contact-intel] shadow error:', err.message);
+  }
+}
+
 async function callIa360Agent({ record, stageName }) {
-  const url = process.env.N8N_IA360_AGENT_WEBHOOK_URL;
-  if (!url) return null;
   // Recent conversation for context (last 8 messages).
   const { rows: hist } = await pool.query(
     `SELECT direction AS dir, message_body AS body
@@ -605,16 +910,24 @@ async function callIa360Agent({ record, stageName }) {
     [record.wa_number, record.contact_number]
   );
   const history = hist.reverse().map(h => ({ dir: h.dir, body: h.body }));
+
+  const primaryIa360AgentUrl = process.env.N8N_IA360_AGENT_WEBHOOK_URL;
+  if (N8N_IA360_CONTACT_INTEL_WEBHOOK_URL && N8N_IA360_CONTACT_INTEL_WEBHOOK_URL !== primaryIa360AgentUrl) {
+    shadowIa360ContactIntelligence({ record, stageName, history }).catch(() => {});
+  }
+
+  const url = primaryIa360AgentUrl;
+  if (!url) return null;
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        source: 'forgechat-ia360-webhook',
-        text: record.message_body || '',
-        stage: stageName,
+      body: JSON.stringify(buildIa360AgentPayload({
+        record,
+        stageName,
         history,
-      }),
+        source: 'forgechat-ia360-webhook',
+      })),
     });
     if (!res.ok) { console.error('[ia360-agent] failed:', res.status); return null; }
     return await res.json();
@@ -627,6 +940,952 @@ async function callIa360Agent({ record, stageName }) {
 // ── IA360 Human-in-the-loop (owner notify + cancelar conversacional) ─────────
 // Owner = Alek. HOY su numero es el MISMO que el prospecto de prueba, asi que la
 // rama owner discrimina por PREFIJO de id de boton ('owner_'), NO por numero.
+// Reflejo por interaccion a EspoCRM: find-or-update de UN Contact con campos ia360_*.
+// Best-effort: nunca bloquea la respuesta WA, nunca lanza, nunca toca ia360_bot_failures.
+// Llave estable WA = espo_id cacheado en coexistence.contacts.custom_fields (no toca el phone de EspoCRM).
+const N8N_IA360_UPSERT_WEBHOOK_URL = process.env.N8N_IA360_UPSERT_WEBHOOK_URL || 'https://n8n.geekstudio.dev/webhook/ia360-espocrm-upsert';
+async function reflectIa360ToEspoCrm({ record, agent, channel = 'whatsapp' }) {
+  try {
+    if (!record || !record.wa_number || !record.contact_number) return;
+    const { rows } = await pool.query(
+      `SELECT custom_fields->>'espo_id' AS espo_id, COALESCE(name, profile_name) AS name
+         FROM coexistence.contacts WHERE wa_number=$1 AND contact_number=$2 LIMIT 1`,
+      [record.wa_number, record.contact_number]
+    );
+    const espoId = rows[0] && rows[0].espo_id ? rows[0].espo_id : null;
+    const name = rows[0] && rows[0].name ? rows[0].name : null;
+    const payload = {
+      channel,
+      identifier: record.contact_number,
+      espo_id: espoId,
+      name,
+      intent: (agent && agent.intent) || null,
+      action: (agent && agent.action) || null,
+      extracted: (agent && agent.extracted) || {},
+      last_message: record.message_body || '',
+    };
+    const res = await fetch(N8N_IA360_UPSERT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) { console.error('[ia360-crm] upsert failed:', res.status); return; }
+    const out = await res.json().catch(() => null);
+    if (out && out.ok && out.espo_id && out.espo_id !== espoId) {
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        customFields: { espo_id: String(out.espo_id) },
+      }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('[ia360-crm] reflect error:', err.message);
+  }
+}
+
+async function notifyOwnerVcardCaptured({ record, shared }) {
+  const who = shared.name || shared.contactNumber;
+  const body = `Alek, recibí un contacto compartido por WhatsApp y ya lo dejé capturado.\n\nNombre: ${who}\nWhatsApp: ${shared.contactNumber}\n\nPrimero clasifica qué tipo de persona/contacto es. En esta etapa NO envío secuencias automáticas desde vCard; solo guardo contexto para elegir después una secuencia lógica.`;
+  return sendOwnerInteractive({
+    record,
+    label: `owner_vcard_captured_${shared.contactNumber}`,
+    messageBody: `IA360: vCard ${who}`,
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: 'Contacto capturado' },
+      body: { text: body },
+      footer: { text: 'Captura primero, persona después, envío al final' },
+      action: {
+        button: 'Elegir persona',
+        sections: [{
+          title: 'Clasificación',
+          rows: [
+            { id: `owner_pipe:${shared.contactNumber}:persona_beta`, title: 'Beta / amigo', description: 'Técnico, conocido o prueba' },
+            { id: `owner_pipe:${shared.contactNumber}:persona_referido`, title: 'Referido / BNI', description: 'Intro o recomendación' },
+            { id: `owner_pipe:${shared.contactNumber}:persona_aliado`, title: 'Aliado / socio', description: 'Canal o proveedor' },
+            { id: `owner_pipe:${shared.contactNumber}:persona_cliente`, title: 'Cliente activo', description: 'Engage o deleitar' },
+            { id: `owner_pipe:${shared.contactNumber}:persona_sponsor`, title: 'Sponsor ejecutivo', description: 'Buyer o dueño' },
+            { id: `owner_pipe:${shared.contactNumber}:persona_comercial`, title: 'Director comercial', description: 'Ventas o pipeline' },
+            { id: `owner_pipe:${shared.contactNumber}:persona_cfo`, title: 'CFO / finanzas', description: 'Control, datos o dinero' },
+            { id: `owner_pipe:${shared.contactNumber}:persona_tecnico`, title: 'Guardián técnico', description: 'Integración o permisos' },
+            { id: `owner_pipe:${shared.contactNumber}:guardar`, title: 'Solo guardar', description: 'Captura sin envío' },
+            { id: `owner_pipe:${shared.contactNumber}:excluir`, title: 'No contactar', description: 'Exclusión sin envío' },
+          ],
+        }],
+      },
+    },
+  });
+}
+
+const IA360_PERSONA_SEQUENCE_FLOWS = {
+  persona_beta: {
+    personaContext: 'Beta / amigo',
+    relationshipContext: 'beta_amigo',
+    flywheelPhase: 'Engage',
+    riskLevel: 'low',
+    notes: 'Contacto de confianza o prueba técnica; no tratar como prospecto frío.',
+    sequences: [
+      {
+        id: 'beta_architectura',
+        uiTitle: 'Validar arquitectura',
+        label: 'Validar arquitectura IA360',
+        goal: 'validar si el flujo persona-first se entiende',
+        expectedSignal: 'feedback sobre claridad, límites y arquitectura del flujo',
+        nextAction: 'Alek revisa si la explicación técnica tiene sentido antes de pedir feedback real.',
+        cta: 'pedir permiso para una pregunta corta de validación',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió guardar tu contacto para una prueba controlada de IA360. No quiero venderte nada: quiere validar si este flujo de WhatsApp, CRM y memoria tiene sentido técnico. ¿Te puedo dejar una pregunta corta o prefieres que Alek te escriba directo?`,
+      },
+      {
+        id: 'beta_feedback',
+        uiTitle: 'Pedir feedback técnico',
+        label: 'Pedir feedback técnico',
+        goal: 'obtener crítica concreta',
+        expectedSignal: 'comentario técnico accionable sobre una parte del sistema',
+        nextAction: 'Alek edita la pregunta técnica y decide si la manda como prueba controlada.',
+        cta: 'pedir una crítica concreta del flujo',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek está probando IA360 con contactos de confianza y quiere una crítica concreta, no venderte nada. ¿Te puedo dejar una pregunta breve sobre el flujo de WhatsApp, CRM y memoria, o prefieres que Alek te escriba directo?`,
+      },
+      {
+        id: 'beta_memoria',
+        uiTitle: 'Probar memoria/contexto',
+        label: 'Probar memoria/contexto',
+        goal: 'probar si IA360 recuerda contexto útil',
+        expectedSignal: 'validación de si el contexto guardado ayuda o estorba',
+        nextAction: 'Alek confirma qué contexto usar en la prueba antes de escribir.',
+        cta: 'probar memoria con una pregunta controlada',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek quiere probar si IA360 puede recordar contexto útil sin volverse invasiva. ¿Te puedo hacer una pregunta corta para validar memoria y seguimiento, o prefieres que Alek lo revise contigo?`,
+      },
+    ],
+  },
+  persona_referido: {
+    personaContext: 'Referido / BNI',
+    relationshipContext: 'referido_bni',
+    flywheelPhase: 'Attract',
+    riskLevel: 'medium',
+    notes: 'Proteger reputación del canal; pedir contexto y permiso antes de vender.',
+    sequences: [
+      {
+        id: 'referido_contexto',
+        uiTitle: 'Pedir contexto intro',
+        label: 'Pedir contexto de intro',
+        goal: 'entender de dónde viene la intro',
+        expectedSignal: 'origen de la introducción, dolor probable o permiso para avanzar',
+        nextAction: 'Alek completa el contexto del referidor antes de mandar cualquier mensaje.',
+        cta: 'pedir contexto breve de la introducción',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Te tengo registrado como referido de una introducción. Antes de mandarte una propuesta fuera de contexto, Alek quiere entender si tiene sentido hablar de IA360 para tu área o dolor principal. ¿Prefieres una pregunta breve o que Alek te escriba directo?`,
+      },
+      {
+        id: 'referido_oneliner',
+        uiTitle: 'One-liner cuidadoso',
+        label: 'One-liner cuidadoso',
+        goal: 'explicar IA360 sin pitch agresivo',
+        expectedSignal: 'interés inicial sin romper la confianza del canal',
+        nextAction: 'Alek ajusta el one-liner según quién hizo la introducción.',
+        cta: 'pedir permiso para explicar IA360 en una línea',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de abrir una conversación larga, Alek quiere darte una versión simple: IA360 ayuda a que WhatsApp, CRM y seguimiento no se caigan entre personas, datos y agenda. ¿Te hace sentido que te deje una pregunta para ver si aplica a tu caso?`,
+      },
+      {
+        id: 'referido_permiso_agenda',
+        uiTitle: 'Agendar con permiso',
+        label: 'Agendar con permiso',
+        goal: 'pedir permiso antes de agenda',
+        expectedSignal: 'permiso explícito para explorar una llamada o siguiente paso',
+        nextAction: 'Alek confirma que la introducción justifica proponer agenda.',
+        cta: 'pedir permiso para sugerir una llamada',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para cuidar la introducción, no quiero mandarte agenda sin contexto. Si el tema de IA360 te suena útil, ¿te puedo dejar una pregunta breve para saber si conviene que Alek te proponga una llamada?`,
+      },
+    ],
+  },
+  persona_aliado: {
+    personaContext: 'Aliado / socio',
+    relationshipContext: 'aliado_socio',
+    flywheelPhase: 'Engage',
+    riskLevel: 'medium',
+    notes: 'Explorar colaboración, canal o reventa sin exponer datos sensibles.',
+    sequences: [
+      {
+        id: 'aliado_mapa_colaboracion',
+        uiTitle: 'Mapa colaboración',
+        label: 'Mapa de colaboración',
+        goal: 'detectar cómo pueden colaborar',
+        expectedSignal: 'tipo de colaboración posible y segmento de clientes compatible',
+        nextAction: 'Alek define si la conversación es canal, proveedor, implementación o co-venta.',
+        cta: 'mapear fit de colaboración',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió ubicar si tiene sentido explorar una colaboración alrededor de IA360. La idea no es venderte algo genérico, sino ver si tus clientes suelen tener fricción en WhatsApp, CRM, datos o procesos repetidos. ¿Te hago una pregunta corta para mapear fit?`,
+      },
+      {
+        id: 'aliado_criterios_fit',
+        uiTitle: 'Criterios de fit',
+        label: 'Criterios de fit',
+        goal: 'definir a quién sí conviene presentar',
+        expectedSignal: 'criterios de cliente ideal o señales para descartar',
+        nextAction: 'Alek valida criterios de fit antes de pedir intros.',
+        cta: 'pedir señales de cliente compatible',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para no pedir intros a ciegas, Alek quiere definir qué tipo de cliente sí tendría sentido para IA360. ¿Te puedo preguntar qué señales ves cuando una empresa ya necesita ordenar WhatsApp, CRM, datos o seguimiento?`,
+      },
+      {
+        id: 'aliado_caso_reventa',
+        uiTitle: 'Caso NDA-safe',
+        label: 'Caso NDA-safe',
+        goal: 'dar material para explicar IA360 sin exponer datos',
+        expectedSignal: 'interés en caso seguro para presentar o revender',
+        nextAction: 'Alek elige el caso NDA-safe correcto antes de compartirlo.',
+        cta: 'ofrecer caso seguro y resumido',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si quieres explicar IA360 sin exponer datos de clientes, Alek puede compartirte un caso NDA-safe: problema, operación antes y resultado esperado. ¿Te serviría para detectar si hay fit con tus clientes?`,
+      },
+    ],
+  },
+  persona_cliente: {
+    personaContext: 'Cliente activo',
+    relationshipContext: 'cliente_activo',
+    flywheelPhase: 'Deleitar',
+    riskLevel: 'low',
+    notes: 'Primero continuidad, adopción o soporte; no abrir venta nueva sin contexto.',
+    sequences: [
+      {
+        id: 'cliente_readout',
+        uiTitle: 'Readout de avance',
+        label: 'Readout de avance',
+        goal: 'mostrar valor logrado',
+        expectedSignal: 'avance confirmado, evidencia o siguiente punto pendiente',
+        nextAction: 'Alek revisa el avance real del proyecto antes de enviar readout.',
+        cta: 'pedir validación del avance',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de proponerte algo nuevo, quiero ubicar si hay algún avance, fricción o siguiente paso pendiente en lo que ya estamos trabajando. ¿Quieres que te deje una pregunta breve o prefieres que Alek lo revise contigo?`,
+      },
+      {
+        id: 'cliente_soporte',
+        uiTitle: 'Soporte rápido',
+        label: 'Soporte rápido',
+        goal: 'resolver fricción y aprender',
+        expectedSignal: 'bloqueo operativo, duda o necesidad de soporte',
+        nextAction: 'Alek confirma si hay soporte pendiente antes de abrir expansión.',
+        cta: 'detectar fricción concreta',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Quiero revisar si algo se atoró antes de hablar de siguientes pasos. ¿Hay una fricción concreta que quieras que Alek vea primero?`,
+      },
+      {
+        id: 'cliente_expansion',
+        uiTitle: 'Detectar expansión',
+        label: 'Detectar expansión',
+        goal: 'identificar siguiente módulo',
+        expectedSignal: 'área donde el cliente ya ve oportunidad de continuidad',
+        nextAction: 'Alek valida que exista adopción o evidencia antes de proponer expansión.',
+        cta: 'identificar siguiente módulo con permiso',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si lo actual ya está avanzando, Alek quiere ubicar el siguiente punto con más impacto, sin empujar algo fuera de tiempo. ¿El mayor siguiente paso está en WhatsApp, CRM, datos, agenda o seguimiento?`,
+      },
+    ],
+  },
+  persona_sponsor: {
+    personaContext: 'Sponsor ejecutivo',
+    relationshipContext: 'sponsor_ejecutivo',
+    flywheelPhase: 'Attract',
+    riskLevel: 'medium',
+    notes: 'Traducir IA a tiempo, dinero, riesgo y conversación ejecutiva.',
+    sequences: [
+      {
+        id: 'sponsor_diagnostico',
+        uiTitle: 'Diagnóstico ejecutivo',
+        label: 'Diagnóstico ejecutivo',
+        goal: 'ubicar cuello que mueve tiempo/dinero',
+        expectedSignal: 'cuello ejecutivo prioritario y disposición a conversar',
+        nextAction: 'Alek decide si la pregunta va a operación, ventas, datos o seguimiento.',
+        cta: 'detectar cuello ejecutivo',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para no mandarte una demo genérica, primero quiero ubicar dónde podría haber valor real: operación, ventas, datos o seguimiento. ¿Te dejo una pregunta rápida para detectar el cuello que más mueve la aguja?`,
+      },
+      {
+        id: 'sponsor_fuga_valor',
+        uiTitle: 'Fuga tiempo/dinero',
+        label: 'Fuga de tiempo/dinero',
+        goal: 'traducir IA a impacto de negocio',
+        expectedSignal: 'mención de costo, demora, retrabajo o pérdida de visibilidad',
+        nextAction: 'Alek prepara una lectura de impacto antes de sugerir solución.',
+        cta: 'pedir síntoma de fuga de valor',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando IA360 sí aplica, normalmente se nota en tiempo perdido, seguimiento que se cae, datos poco confiables o decisiones lentas. ¿Cuál de esas fugas te preocupa más hoy?`,
+      },
+      {
+        id: 'sponsor_caso_ndasafe',
+        uiTitle: 'Caso NDA-safe',
+        label: 'Caso NDA-safe',
+        goal: 'dar prueba sin exponer clientes',
+        expectedSignal: 'interés en evidencia ejecutiva sin datos sensibles',
+        nextAction: 'Alek elige el caso más parecido antes de compartirlo.',
+        cta: 'ofrecer prueba segura',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si prefieres ver evidencia antes de hablar de solución, Alek puede compartirte un caso NDA-safe con problema, enfoque y resultado esperado. ¿Te serviría como punto de partida?`,
+      },
+    ],
+  },
+  persona_comercial: {
+    personaContext: 'Director comercial',
+    relationshipContext: 'director_comercial',
+    flywheelPhase: 'Attract',
+    riskLevel: 'medium',
+    notes: 'Centrar la conversación en fuga de leads, seguimiento y WhatsApp/CRM.',
+    sequences: [
+      {
+        id: 'comercial_pipeline',
+        uiTitle: 'Auditar pipeline',
+        label: 'Auditar pipeline',
+        goal: 'detectar fuga de leads',
+        expectedSignal: 'fuga en generación, seguimiento, cierre o visibilidad',
+        nextAction: 'Alek confirma si conviene hacer diagnóstico comercial antes de proponer.',
+        cta: 'ubicar fuga principal del pipeline',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si el problema está en ventas, casi siempre aparece en tres lugares: leads que no llegan, seguimiento que se cae o WhatsApp/CRM sin contexto. ¿Cuál de esos te duele más hoy?`,
+      },
+      {
+        id: 'comercial_wa_crm',
+        uiTitle: 'WhatsApp + CRM',
+        label: 'WhatsApp + CRM',
+        goal: 'mapear seguimiento y contexto',
+        expectedSignal: 'dolor entre conversaciones, CRM y seguimiento comercial',
+        nextAction: 'Alek revisa si el caso pide orden operativo o motor de ventas.',
+        cta: 'mapear seguimiento WhatsApp/CRM',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Muchas fugas comerciales no vienen del vendedor, sino de WhatsApp y CRM trabajando sin contexto compartido. ¿Hoy qué se pierde más: historial, seguimiento, prioridad o datos para decidir?`,
+      },
+      {
+        id: 'comercial_motor_prospeccion',
+        uiTitle: 'Motor prospección',
+        label: 'Motor de prospección',
+        goal: 'conectar dolor con oferta concreta',
+        expectedSignal: 'canal, segmento o proceso que podría convertirse en motor comercial',
+        nextAction: 'Alek valida segmento y oferta antes de hablar de prospección.',
+        cta: 'detectar si hay motor comercial repetible',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si IA360 se aplica a prospección, primero hay que saber si existe un segmento claro, un mensaje repetible y seguimiento medible. ¿Qué parte de ese motor está más débil hoy?`,
+      },
+    ],
+  },
+  persona_cfo: {
+    personaContext: 'CFO / finanzas',
+    relationshipContext: 'cfo_finanzas',
+    flywheelPhase: 'Attract',
+    riskLevel: 'medium',
+    notes: 'Hablar de control, confiabilidad de datos, cartera, comisiones o conciliación.',
+    sequences: [
+      {
+        id: 'cfo_control',
+        uiTitle: 'Auditar control',
+        label: 'Auditar control',
+        goal: 'detectar pérdida de control operativo',
+        expectedSignal: 'dolor de control, visibilidad o retrabajo financiero',
+        nextAction: 'Alek decide si el ángulo financiero es control, cartera o comisiones.',
+        cta: 'detectar punto de control débil',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando finanzas no puede confiar rápido en los datos, la operación termina trabajando a mano. ¿El mayor dolor está en cartera, comisiones, reportes o conciliación?`,
+      },
+      {
+        id: 'cfo_cartera_datos',
+        uiTitle: 'Cartera/datos',
+        label: 'Cartera/datos',
+        goal: 'ubicar dinero o datos poco visibles',
+        expectedSignal: 'mención de cartera, cobranza, datos dispersos o visibilidad lenta',
+        nextAction: 'Alek confirma si hay un flujo de datos que se pueda ordenar sin invadir sistemas.',
+        cta: 'ubicar datos financieros poco visibles',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si cartera o datos viven dispersos, la decisión financiera llega tarde. ¿Qué información te cuesta más tener confiable y a tiempo?`,
+      },
+      {
+        id: 'cfo_comisiones',
+        uiTitle: 'Comisiones/reglas',
+        label: 'Comisiones / conciliación',
+        goal: 'detectar reglas que generan errores',
+        expectedSignal: 'regla manual, conciliación lenta o disputa por cálculo',
+        nextAction: 'Alek valida si el caso se puede convertir en diagnóstico de reglas y datos.',
+        cta: 'detectar reglas financieras propensas a error',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. En comisiones y conciliación, el problema suele estar en reglas manuales, excepciones y datos que no cuadran. ¿Dónde se te va más tiempo revisando o corrigiendo?`,
+      },
+    ],
+  },
+  persona_tecnico: {
+    personaContext: 'Guardián técnico',
+    relationshipContext: 'guardian_tecnico',
+    flywheelPhase: 'Engage',
+    riskLevel: 'medium',
+    notes: 'Reducir fricción técnica con permisos, trazabilidad, integración y rollback.',
+    sequences: [
+      {
+        id: 'tecnico_arquitectura',
+        uiTitle: 'Arquitectura/permisos',
+        label: 'Arquitectura y permisos',
+        goal: 'explicar integración sin invadir',
+        expectedSignal: 'preguntas sobre permisos, datos, sistemas o alcance técnico',
+        nextAction: 'Alek prepara mapa técnico mínimo antes de pedir acceso o integración.',
+        cta: 'pedir revisión de mapa de integración',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si revisamos IA360 desde lo técnico, la conversación debe empezar por permisos, datos, trazabilidad y rollback. ¿Quieres que te deje el mapa de integración o prefieres que Alek lo revise contigo?`,
+      },
+      {
+        id: 'tecnico_rollback',
+        uiTitle: 'Riesgos/rollback',
+        label: 'Riesgos / rollback',
+        goal: 'bajar objeción técnica',
+        expectedSignal: 'riesgo técnico prioritario o condición para prueba segura',
+        nextAction: 'Alek define guardrails técnicos antes de proponer piloto.',
+        cta: 'identificar riesgo técnico principal',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de hablar de funciones, Alek quiere entender qué riesgo técnico habría que controlar: permisos, datos, trazabilidad, reversibilidad o dependencia operativa. ¿Cuál revisarías primero?`,
+      },
+      {
+        id: 'tecnico_integracion',
+        uiTitle: 'Integración controlada',
+        label: 'Integración controlada',
+        goal: 'definir prueba segura',
+        expectedSignal: 'condiciones para una prueba limitada y auditable',
+        nextAction: 'Alek confirma límites de piloto antes de tocar sistemas.',
+        cta: 'definir prueba técnica controlada',
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si hacemos una prueba técnica, debe ser limitada, trazable y reversible. ¿Qué condición tendría que cumplirse para que una integración controlada te parezca segura?`,
+      },
+    ],
+  },
+};
+
+const IA360_TERMINAL_VCARD_CHOICES = {
+  guardar: {
+    personaContext: 'Solo guardar',
+    relationshipContext: 'solo_guardar',
+    flywheelPhase: 'Unknown',
+    riskLevel: 'low',
+    sequence: {
+      id: 'solo_guardar',
+      label: 'Captura sin acción',
+      goal: 'conservar contacto sin ruido ni riesgo',
+      expectedSignal: 'ninguna señal esperada; solo conservar contexto',
+      nextAction: 'No contactar. Alek puede reclasificar después si existe contexto.',
+      cta: 'sin CTA',
+      copyStatus: 'blocked',
+      draft: ({ name }) => `No se genera borrador comercial para ${name}. El contacto queda guardado sin acción externa.`,
+    },
+  },
+  excluir: {
+    personaContext: 'No contactar',
+    relationshipContext: 'no_contactar',
+    flywheelPhase: 'Unknown',
+    riskLevel: 'high',
+    sequence: {
+      id: 'no_contactar',
+      label: 'Bloqueo',
+      goal: 'respetar exclusión y evitar secuencia comercial',
+      expectedSignal: 'ninguna; bloqueo operativo',
+      nextAction: 'Mantener exclusión. No crear secuencia ni oportunidad comercial.',
+      cta: 'sin CTA',
+      copyStatus: 'blocked',
+      draft: ({ name }) => `No se genera borrador comercial para ${name}. El contacto queda marcado como no contactar.`,
+    },
+  },
+};
+
+function findIa360SequenceFlow(sequenceId) {
+  const target = String(sequenceId || '').toLowerCase();
+  for (const flow of Object.values(IA360_PERSONA_SEQUENCE_FLOWS)) {
+    const sequence = flow.sequences.find(s => s.id === target);
+    if (sequence) return { flow, sequence };
+  }
+  return null;
+}
+
+function compactForWhatsApp(text, max) {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  return clean.length <= max ? clean : clean.slice(0, Math.max(0, max - 1)).trimEnd() + '…';
+}
+
+function hasUnresolvedIa360Placeholder(text) {
+  return /\{\{\s*(?:\d+|nombre|referidor)[^}]*\}\}|\{\{[^}]+\}\}/i.test(String(text || ''));
+}
+
+function buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction = 'sequence_selected' }) {
+  const customFields = contact?.custom_fields || {};
+  const name = contact?.name || targetContact;
+  const draft = typeof sequence.draft === 'function' ? sequence.draft({ name }) : String(sequence.draft || '');
+  const copyStatus = hasUnresolvedIa360Placeholder(draft) ? 'blocked' : (sequence.copyStatus || 'draft');
+  return {
+    schema: 'persona_first_vcard.v1',
+    request_id: `${record.message_id || 'owner'}:${targetContact}:${sequence.id}`,
+    source: 'forgechat_b29_vcard_intake',
+    received_at: customFields.captured_at || record.timestamp || new Date().toISOString(),
+    dry_run: true,
+    requires_human_approval: true,
+    owner: {
+      wa_id: IA360_OWNER_NUMBER,
+      role: 'Alek',
+    },
+    contact: {
+      forgechat_contact_id: contact?.id || '',
+      espo_contact_id: customFields.espo_id || '',
+      wa_id: customFields.vcard_wa_id || targetContact,
+      phone_e164: targetContact ? `+${targetContact}` : '',
+      name,
+      email: customFields.email || '',
+      source_message_id: customFields.source_message_id || '',
+      staged: true,
+      consent_status: flow.relationshipContext === 'no_contactar' ? 'do_not_contact' : 'unknown',
+    },
+    identity: {
+      dedupe_method: 'wa_number_contact_number',
+      confidence: contact?.id ? 0.85 : 0.5,
+      existing_relationship: flow.personaContext || '',
+      matched_records: [],
+    },
+    classification: {
+      persona_context: flow.personaContext,
+      relationship_context: flow.relationshipContext,
+      flywheel_phase: flow.flywheelPhase,
+      intent: ownerAction,
+      risk_level: flow.riskLevel || 'medium',
+      notes: flow.notes || '',
+    },
+    sequence_candidate: {
+      id: sequence.id,
+      label: sequence.label,
+      goal: sequence.goal,
+      product: 'IA360',
+      proof_asset: sequence.proofAsset || '',
+      cta: sequence.cta || '',
+      copy_status: copyStatus,
+      media_status: 'not_required',
+      crm_expected_state: 'no_opportunity_auto',
+      draft,
+    },
+    approval: {
+      status: 'requires_alek',
+      approved_by: '',
+      approved_at: '',
+      reason: 'Requiere aprobación humana antes de cualquier envío externo.',
+    },
+    guardrail: {
+      current_block: 'requires_human_approval',
+      external_send_allowed: false,
+      allowed_recipient: 'owner_only',
+    },
+    learning: {
+      expected_signal: sequence.expectedSignal || '',
+      response_summary: '',
+      objection: '',
+      next_step: sequence.nextAction || '',
+      update_crm: false,
+      update_memory: false,
+    },
+  };
+}
+
+function buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload }) {
+  return [
+    'Readout IA360 persona-first',
+    '',
+    `Contacto: ${name} (${targetContact})`,
+    `Persona: ${flow.personaContext}`,
+    `Fase flywheel sugerida: ${flow.flywheelPhase}`,
+    `Logro esperado del flujo: ${sequence.goal}`,
+    `Secuencia elegida: ${sequence.label} (${sequence.id})`,
+    '',
+    'Borrador propuesto:',
+    payload.sequence_candidate.draft,
+    '',
+    'Bloqueo actual: requiere aprobación humana; no hay envío externo al contacto.',
+    `Siguiente acción recomendada: ${sequence.nextAction || 'Alek revisa y aprueba solo si el contexto lo justifica.'}`,
+  ].join('\n');
+}
+
+async function persistIa360PersonaPayload({ record, targetContact, flow, sequence, payload, tags = [] }) {
+  const stage =
+    flow.relationshipContext === 'no_contactar' ? 'No contactar'
+      : flow.relationshipContext === 'solo_guardar' ? 'Capturado / Sin acción'
+        : sequence.id === 'persona_selected' ? 'Persona seleccionada / Por secuencia'
+          : 'Requiere Alek';
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    tags: ['ia360-persona-first', `persona:${flow.relationshipContext}`, `sequence:${sequence.id}`, ...tags],
+    customFields: {
+      staged: true,
+      stage,
+      persona_context: flow.personaContext,
+      fase_flywheel: flow.flywheelPhase,
+      sequence_candidate: sequence.id,
+      owner_action: payload.classification.intent,
+      owner_action_at: new Date().toISOString(),
+      ia360_persona_first: payload,
+    },
+  });
+}
+
+async function sendIa360SequenceSelector({ record, targetContact, contact, flowKey, flow }) {
+  const name = contact?.name || targetContact;
+  const payload = buildIa360PersonaPayload({
+    record,
+    contact,
+    targetContact,
+    flow,
+    sequence: {
+      id: 'persona_selected',
+      label: 'Persona seleccionada',
+      goal: 'elegir una secuencia lógica por persona antes de redactar',
+      expectedSignal: 'Alek selecciona el flujo correcto',
+      nextAction: 'Elegir una secuencia filtrada por persona.',
+      cta: 'elegir secuencia',
+      copyStatus: 'draft',
+      draft: () => 'Pendiente: Alek debe elegir una secuencia antes de generar borrador.',
+    },
+    ownerAction: 'persona_selected',
+  });
+  await persistIa360PersonaPayload({
+    record,
+    targetContact,
+    flow,
+    sequence: payload.sequence_candidate,
+    payload,
+    tags: [`persona-choice:${flowKey}`],
+  });
+  return sendOwnerInteractive({
+    record,
+    label: `owner_sequence_selector_${targetContact}_${flowKey}`,
+    messageBody: `IA360: secuencias ${name}`,
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: 'Elegir secuencia' },
+      body: {
+        text: `Alek, ${name} quedó como ${flow.personaContext}. Elige una secuencia lógica. Sigo en dry-run: no enviaré nada al contacto.`,
+      },
+      footer: { text: 'Persona antes de secuencia; aprobación antes de envío' },
+      action: {
+        button: 'Elegir secuencia',
+        sections: [{
+          title: compactForWhatsApp(flow.personaContext, 24),
+          rows: flow.sequences.map(seq => ({
+            id: `owner_seq:${targetContact}:${seq.id}`,
+            title: compactForWhatsApp(seq.uiTitle || seq.label, 24),
+            description: compactForWhatsApp(seq.goal, 72),
+          })),
+        }],
+      },
+    },
+  });
+}
+
+async function handleIa360PersonaChoice({ record, targetContact, personaChoice }) {
+  const flow = IA360_PERSONA_SEQUENCE_FLOWS[personaChoice];
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  const name = contact?.name || targetContact;
+  if (!flow) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_persona_unknown', body: `No reconozco la persona elegida para ${name}. No envié nada y queda para revisión de Alek.` });
+    return;
+  }
+  await sendIa360SequenceSelector({ record, targetContact, contact, flowKey: personaChoice, flow });
+}
+
+async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceId }) {
+  if (!targetContact) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_sequence_missing_target', body: 'No encontré el número del contacto para esa secuencia. No envié nada.' });
+    return;
+  }
+  const found = findIa360SequenceFlow(sequenceId);
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  const name = contact?.name || targetContact;
+  if (!found) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_sequence_unknown', body: `La secuencia elegida para ${name} no está en el catálogo persona-first. No envié nada.` });
+    return;
+  }
+  const { flow, sequence } = found;
+  const payload = buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction: 'sequence_selected' });
+  const readout = buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload });
+  if (hasUnresolvedIa360Placeholder(readout)) {
+    payload.sequence_candidate.copy_status = 'blocked';
+    payload.approval.reason = 'Borrador bloqueado por placeholder sin resolver.';
+  }
+  await persistIa360PersonaPayload({ record, targetContact, flow, sequence, payload, tags: ['owner-sequence-selected'] });
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: `owner_sequence_readout_${sequence.id}`,
+    body: readout,
+  });
+}
+
+async function handleIa360TerminalVcardChoice({ record, targetContact, terminalChoice }) {
+  const terminal = IA360_TERMINAL_VCARD_CHOICES[terminalChoice];
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  const name = contact?.name || targetContact;
+  if (!terminal) return false;
+  const payload = buildIa360PersonaPayload({
+    record,
+    contact,
+    targetContact,
+    flow: terminal,
+    sequence: terminal.sequence,
+    ownerAction: terminalChoice === 'excluir' ? 'no_contactar_selected' : 'solo_guardar_selected',
+  });
+  await persistIa360PersonaPayload({
+    record,
+    targetContact,
+    flow: terminal,
+    sequence: terminal.sequence,
+    payload,
+    tags: terminalChoice === 'excluir' ? ['no-contactar'] : ['solo-guardar'],
+  });
+  const readout = buildIa360SequenceReadout({ name, targetContact, flow: terminal, sequence: terminal.sequence, payload });
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: `owner_terminal_${terminal.sequence.id}`,
+    body: readout,
+  });
+  return true;
+}
+
+async function handleIa360LegacyOwnerPipeChoice({ record, targetContact, choice, contact }) {
+  const name = contact?.name || targetContact;
+  const legacyFlow = {
+    personaContext: 'Requiere Alek',
+    relationshipContext: 'legacy_button_guard',
+    flywheelPhase: 'Unknown',
+    riskLevel: 'high',
+    notes: 'Botón heredado de pipeline o nutrición bloqueado por regla persona-first.',
+  };
+  const legacySequence = {
+    id: `legacy_${String(choice || 'sin_ruta').replace(/[^a-z0-9_]+/g, '_')}`,
+    label: `Botón heredado: ${choice || 'sin ruta'}`,
+    goal: 'bloquear rutas antiguas hasta que Alek apruebe persona, secuencia y copy',
+    expectedSignal: 'Alek revisa manualmente si el botón antiguo debe rediseñarse',
+    nextAction: 'No usar el botón heredado. Reclasificar persona y elegir una secuencia persona-first.',
+    cta: 'bloquear botón heredado',
+    copyStatus: 'blocked',
+    draft: () => `No se genera borrador para ${name}; el botón heredado "${choice || 'sin ruta'}" queda bloqueado.`,
+  };
+  const payload = buildIa360PersonaPayload({
+    record,
+    contact,
+    targetContact,
+    flow: legacyFlow,
+    sequence: legacySequence,
+    ownerAction: 'legacy_button_blocked',
+  });
+  await persistIa360PersonaPayload({
+    record,
+    targetContact,
+    flow: legacyFlow,
+    sequence: legacySequence,
+    payload,
+    tags: ['legacy-owner-pipe-blocked'],
+  });
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_pipe_legacy_blocked',
+    body: `Botón heredado bloqueado para ${name}: ${choice || 'sin ruta'}.\n\nEstado: Requiere Alek.\nNo envié nada al contacto. No creé oportunidad comercial. Reclasifica persona y elige una secuencia persona-first si quieres preparar borrador.`,
+  });
+}
+
+async function handleIa360SharedContacts(record) {
+  if (!record || record.direction !== 'incoming' || record.message_type !== 'contacts') return false;
+  try {
+    const sharedContacts = extractSharedContactsFromRecord(record);
+    if (!sharedContacts.length) {
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_vcard_parse_failed',
+        body: 'Recibí una tarjeta de contacto, pero no pude extraer un número de WhatsApp. Revísala manualmente.',
+      });
+      return true;
+    }
+
+    for (const shared of sharedContacts.slice(0, 5)) {
+      const saved = await upsertIa360SharedContact({ record, shared });
+      console.log('[ia360-vcard] captured contact=%s name=%s source=%s', shared.contactNumber, shared.name || '-', record.contact_number || '-');
+      const targetRecord = {
+        ...record,
+        contact_number: shared.contactNumber,
+        contact_name: shared.name,
+        message_type: 'contacts',
+        message_body: `Contacto compartido por WhatsApp: ${shared.name || shared.contactNumber}`,
+      };
+      reflectIa360ToEspoCrm({
+        record: targetRecord,
+        channel: 'whatsapp-vcard',
+        agent: {
+          intent: 'owner_shared_contact_capture',
+          action: 'stage_contact',
+          extracted: {
+            intake_source: 'b29-vcard-whatsapp',
+            staged: true,
+            contact_id: saved?.id || null,
+            referred_by: record.contact_number || null,
+          },
+        },
+      }).catch(e => console.error('[ia360-vcard] crm reflect:', e.message));
+      await notifyOwnerVcardCaptured({ record, shared });
+    }
+    return true;
+  } catch (err) {
+    console.error('[ia360-vcard] handler error:', err.message);
+    return false;
+  }
+}
+
+async function loadIa360ContactForOwnerAction({ waNumber, contactNumber }) {
+  const { rows } = await pool.query(
+    `SELECT id, COALESCE(name, profile_name, $2) AS name, custom_fields
+       FROM coexistence.contacts
+      WHERE wa_number=$1 AND contact_number=$2
+      LIMIT 1`,
+    [waNumber, contactNumber]
+  );
+  return rows[0] || null;
+}
+
+async function sendOwnerPipelineSlots({ record }) {
+  const url = process.env.N8N_IA360_AVAILABILITY_WEBHOOK_URL;
+  if (!url) return false;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      source: 'forgechat-ia360-owner-pipe',
+      nextAvailable: true,
+      workStartHour: 10,
+      workEndHour: 18,
+      slotMinutes: 60,
+      contact: {
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        contactName: record.contact_name || null,
+      },
+    }),
+  }).catch(e => {
+    console.error('[ia360-owner-pipe] availability request failed:', e.message);
+    return null;
+  });
+  if (!res || !res.ok) {
+    console.error('[ia360-owner-pipe] availability failed:', res && res.status);
+    return false;
+  }
+  const data = await res.json().catch(() => null);
+  const slots = (data && Array.isArray(data.slots)) ? data.slots : [];
+  if (!slots.length) {
+    await enqueueIa360Text({
+      record,
+      label: 'owner_pipe_no_slots',
+      body: 'Alek me pidió agendar contigo, pero no encontré espacios libres en los próximos días. Te escribo en cuanto confirme opciones.',
+    });
+    return true;
+  }
+  await enqueueIa360Interactive({
+    record,
+    label: 'owner_pipe_available_slots',
+    messageBody: 'IA360: horarios disponibles',
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: 'Horarios libres' },
+      body: { text: 'Alek me pidió pasarte opciones para revisar tu caso. Estos espacios de 1 hora están libres (hora CDMX). Elige uno y lo confirmo con Calendar + Zoom.' },
+      footer: { text: 'Se revalida antes de reservar' },
+      action: {
+        button: 'Elegir hora',
+        sections: [{
+          title: 'Disponibles',
+          rows: slots.slice(0, 10).map(slot => ({
+            id: slot.id,
+            title: String(slot.title || '').slice(0, 24),
+            description: slot.description || '',
+          })),
+        }],
+      },
+    },
+  });
+  return true;
+}
+
+async function handleIa360OwnerPipelineChoice({ record, targetContact, pipeline }) {
+  if (!targetContact) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_pipe_missing_target', body: 'No encontré el número del contacto de esa acción.' });
+    return;
+  }
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  const name = contact?.name || targetContact;
+  const choice = String(pipeline || '').toLowerCase();
+  const targetRecord = {
+    ...record,
+    contact_number: targetContact,
+    contact_name: name,
+    message_type: 'owner_pipe',
+    message_body: `Alek eligió pipeline ${choice}`,
+  };
+
+  if (IA360_PERSONA_SEQUENCE_FLOWS[choice]) {
+    await handleIa360PersonaChoice({ record, targetContact, personaChoice: choice });
+    return;
+  }
+
+  if (IA360_TERMINAL_VCARD_CHOICES[choice]) {
+    await handleIa360TerminalVcardChoice({ record, targetContact, terminalChoice: choice });
+    return;
+  }
+
+  await handleIa360LegacyOwnerPipeChoice({ record: targetRecord, targetContact, choice, contact });
+}
+
+async function handleIa360OwnerVcardAction({ record, ownerAction, targetContact }) {
+  if (!targetContact) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_vcard_missing_target', body: 'No encontré el número del contacto de esa acción.' });
+    return;
+  }
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  const name = contact?.name || targetContact;
+  const targetRecord = {
+    ...record,
+    contact_number: targetContact,
+    contact_name: name,
+    message_type: 'owner_action',
+    message_body: `Acción owner sobre vCard: ${ownerAction}`,
+  };
+
+  if (ownerAction === 'owner_vcard_pipe') {
+    await notifyOwnerVcardCaptured({
+      record,
+      shared: { name, contactNumber: targetContact },
+    });
+    return;
+  }
+
+  if (ownerAction === 'owner_vcard_take') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: targetContact,
+      tags: ['requiere-alek', 'owner-manual'],
+      customFields: {
+        staged: false,
+        stage: 'Requiere Alek',
+        owner_action: 'manual_take',
+        owner_action_at: new Date().toISOString(),
+      },
+    });
+    await syncIa360Deal({
+      record: targetRecord,
+      targetStageName: 'Requiere Alek',
+      titleSuffix: 'vCard',
+      notes: 'Alek tomo manualmente este contacto compartido por vCard.',
+    });
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_vcard_take_ack',
+      body: `Ok, ${name} quedó en Requiere Alek para que lo tomes manualmente. No le envié mensaje.`,
+    });
+    return;
+  }
+
+  if (ownerAction === 'owner_vcard_keep') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: targetContact,
+      tags: ['solo-guardar'],
+      customFields: {
+        staged: true,
+        stage: 'Capturado / Por rutear',
+        owner_action: 'solo_guardar',
+        owner_action_at: new Date().toISOString(),
+      },
+    });
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_vcard_keep_ack',
+      body: `Guardado: ${name} (${targetContact}) queda capturado sin pipeline ni envío.`,
+    });
+  }
+}
+
 const IA360_OWNER_NUMBER = '5213322638033';
 
 // Envia un interactivo al OWNER (Alek), no al record.contact_number. Construye la
@@ -999,6 +2258,8 @@ async function handleIa360FreeText(record) {
     // etapa, y ahí abajo caería al branch de reagendar. Es read-only (solo lee
     // ia360_bookings), por eso es seguro responder y returnear sin tocar el estado.
     console.log('[ia360-agent] contact=%s stage=%s action=%s intent=%s', record.contact_number, deal.stage_name, agent.action || '-', agent.intent || '-');
+    // Reflejo CRM por interaccion (best-effort; no bloquea dispatch ni regresa agenda).
+    reflectIa360ToEspoCrm({ record, agent, channel: 'whatsapp' }).catch(() => {});
     if (agent.action === 'list_bookings' || agent.intent === 'list_bookings') {
       const bookings = await loadIa360Bookings(record.contact_number);
       console.log('[ia360-list] contact=%s bookings=%d', record.contact_number, bookings.length);
@@ -1322,6 +2583,19 @@ const URGENCIA_LEGIBLE = {
   explorando: 'exploración',
 };
 
+// W4 — etiquetas legibles para no mostrar ids crudos (15m_50m, 6_20, taller_capacitacion) al
+// contacto. Se usan en la respuesta del offer_router. Fallback al id si no hay etiqueta.
+const TAMANO_LEGIBLE = {
+  menos_5m: 'menos de 5M', '5m_15m': '5M a 15M', '15m_50m': '15M a 50M', '50m_200m': '50M a 200M', mas_200m: 'más de 200M',
+};
+const PERSONAS_LEGIBLE = {
+  '1_5': '1 a 5 personas', '6_20': '6 a 20 personas', '21_50': '21 a 50 personas', '51_100': '51 a 100 personas', mas_100: 'más de 100 personas',
+};
+const SOLUCION_LEGIBLE = {
+  taller_capacitacion: 'un taller de capacitación', servicio_productizado: 'un servicio productizado',
+  saas_aiaas: 'una plataforma SaaS/AIaaS', consultoria_premium: 'consultoría premium', aun_no_se: 'la opción que mejor te encaje',
+};
+
 async function handleIa360FlowReply(record) {
   try {
     if (!record || record.direction !== 'incoming' || record.message_type !== 'interactive') return false;
@@ -1332,6 +2606,7 @@ async function handleIa360FlowReply(record) {
     if (data.area !== undefined && data.urgencia !== undefined) {
       // ── DIAGNOSTICO ───────────────────────────────────────────────────────
       const { area, urgencia, fuga, sistema, resultado } = data;
+      console.log('[ia360-flowwire] event=diagnostic_answered contact=%s area=%s urgencia=%s', record.contact_number, area, urgencia);
       await mergeContactIa360State({
         waNumber: record.wa_number,
         contactNumber: record.contact_number,
@@ -1418,6 +2693,7 @@ async function handleIa360FlowReply(record) {
     if (data.tamano_empresa !== undefined) {
       // ── OFFER_ROUTER ──────────────────────────────────────────────────────
       const { tamano_empresa, personas_afectadas, tipo_solucion, presupuesto, nivel_decision } = data;
+      console.log('[ia360-flowwire] event=offer_router_answered contact=%s tamano=%s presupuesto=%s', record.contact_number, tamano_empresa, presupuesto);
       const tier = (presupuesto === '200k_1m' || presupuesto === 'mas_1m') ? 'Premium'
         : (presupuesto === '50k_200k') ? 'Pro' : 'Starter';
       await mergeContactIa360State({
@@ -1432,6 +2708,9 @@ async function handleIa360FlowReply(record) {
         titleSuffix: 'Oferta ' + tier + ' (Flow)',
         notes: `offer_router_answered: ${tamano_empresa} / ${presupuesto} → ${tier}`,
       });
+      const tamanoTxt = TAMANO_LEGIBLE[tamano_empresa] || tamano_empresa;
+      const personasTxt = PERSONAS_LEGIBLE[personas_afectadas] || personas_afectadas;
+      const solucionTxt = SOLUCION_LEGIBLE[tipo_solucion] || tipo_solucion;
       await enqueueIa360Interactive({
         record,
         label: 'ia360_flow_offer_router',
@@ -1439,11 +2718,10 @@ async function handleIa360FlowReply(record) {
         interactive: {
           type: 'button',
           header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
-          body: { text: `Con tu perfil (${tamano_empresa}, ${personas_afectadas}) te propongo arrancar por ${tipo_solucion} en nivel ${tier}. ¿Lo aterrizamos en una llamada?` },
+          body: { text: `Gracias. Por tu perfil (facturación ${tamanoTxt}, ${personasTxt}) lo sensato es arrancar con ${solucionTxt}, en nivel ${tier}. El siguiente paso es una llamada de 20 minutos con Alek para aterrizarlo a tu caso.` },
           footer: { text: 'IA360' },
           action: { buttons: [
-            { type: 'reply', reply: { id: '100m_schedule', title: 'Agendar' } },
-            { type: 'reply', reply: { id: '100m_want_map', title: 'Ver mapa' } },
+            { type: 'reply', reply: { id: '100m_schedule', title: 'Agendar llamada' } },
           ] },
         },
       });
@@ -1453,6 +2731,7 @@ async function handleIa360FlowReply(record) {
     if (data.empresa !== undefined && data.rol !== undefined) {
       // ── PRE_CALL ──────────────────────────────────────────────────────────
       const { empresa, rol, objetivo, sistemas } = data;
+      console.log('[ia360-flowwire] event=pre_call_intake_submitted contact=%s empresa=%s rol=%s', record.contact_number, empresa, rol);
       await mergeContactIa360State({
         waNumber: record.wa_number,
         contactNumber: record.contact_number,
@@ -1464,27 +2743,46 @@ async function handleIa360FlowReply(record) {
           ia360_sistemas: sistemas,
         },
       });
-      await syncIa360Deal({
-        record,
-        targetStageName: 'Agenda en proceso',
-        titleSuffix: 'Pre-call (Flow)',
-        notes: `pre_call_intake_submitted: ${empresa} / ${rol}`,
-      });
-      await enqueueIa360Interactive({
-        record,
-        label: 'ia360_flow_pre_call',
-        messageBody: 'IA360 Flow: pre-call intake',
-        interactive: {
-          type: 'button',
-          header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
-          body: { text: 'Gracias, con esto llego preparado a la llamada (no demo de cajón). ¿Confirmamos horario?' },
-          footer: { text: 'IA360' },
-          action: { buttons: [
-            { type: 'reply', reply: { id: '100m_urgent', title: 'Sí, agendar' } },
-            { type: 'reply', reply: { id: '100m_schedule', title: 'Elegir horario' } },
-          ] },
-        },
-      });
+      // W4 fix anti-lazo (per FLOWS doc: pre_call es stage-aware). Si el contacto YA tiene una
+      // reunión agendada, NO lo empujamos a re-agendar (eso causaba el lazo booking→contexto→
+      // re-agenda→booking); cerramos con acuse terminal. Solo si NO hay slot ofrecemos agendar.
+      const preCallBookings = await loadIa360Bookings(record.contact_number);
+      const preCallHasSlot = Array.isArray(preCallBookings) && preCallBookings.length > 0;
+      if (preCallHasSlot) {
+        await syncIa360Deal({
+          record,
+          targetStageName: 'Reunión agendada',
+          titleSuffix: 'Pre-call (Flow)',
+          notes: `pre_call_intake_submitted: ${empresa} / ${rol} (con reunión ya agendada)`,
+        });
+        const ultimaCita = preCallBookings[preCallBookings.length - 1]?.start;
+        await enqueueIa360Text({
+          record,
+          label: 'ia360_flow_pre_call_booked',
+          body: `Gracias, con esto Alek llega preparado a tu reunión${ultimaCita ? ' del ' + fmtIa360Short(ultimaCita) : ''}. No necesitas hacer nada más; nos vemos ahí.`,
+        });
+      } else {
+        await syncIa360Deal({
+          record,
+          targetStageName: 'Agenda en proceso',
+          titleSuffix: 'Pre-call (Flow)',
+          notes: `pre_call_intake_submitted: ${empresa} / ${rol}`,
+        });
+        await enqueueIa360Interactive({
+          record,
+          label: 'ia360_flow_pre_call',
+          messageBody: 'IA360 Flow: pre-call intake',
+          interactive: {
+            type: 'button',
+            header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
+            body: { text: 'Gracias, con esto Alek llega preparado (nada de demo genérica). ¿Agendamos la llamada?' },
+            footer: { text: 'IA360' },
+            action: { buttons: [
+              { type: 'reply', reply: { id: '100m_schedule', title: 'Agendar llamada' } },
+            ] },
+          },
+        });
+      }
       return true;
     }
 
@@ -1498,11 +2796,12 @@ async function handleIa360FlowReply(record) {
           tags: ['no-contactar'],
           customFields: { ia360_preferencia: preferencia },
         });
+        console.log('[ia360-flowwire] event=opt_out contact=%s preferencia=no_contactar', record.contact_number);
         await syncIa360Deal({
           record,
           targetStageName: 'Perdido / no fit',
           titleSuffix: 'Opt-out (Flow)',
-          notes: 'preferences: no_contactar',
+          notes: 'opt_out: no_contactar',
         });
         await enqueueIa360Text({
           record,
@@ -1516,25 +2815,19 @@ async function handleIa360FlowReply(record) {
           tags: ['preferencia:' + preferencia],
           customFields: { ia360_preferencia: preferencia },
         });
+        console.log('[ia360-flowwire] event=nurture_selected contact=%s preferencia=%s', record.contact_number, preferencia);
         await syncIa360Deal({
           record,
           targetStageName: 'Nutrición',
           titleSuffix: 'Preferencias (Flow)',
-          notes: `preferences: ${preferencia}`,
+          notes: `nurture_selected: ${preferencia}`,
         });
-        await enqueueIa360Interactive({
+        // W4 fix: nurture = nutrir, NO empujar a ventas (per FLOWS doc). Acuse terminal sin
+        // botón de "Ver ejemplo" (ese re-metía al embudo y contribuía a la sensación de lazo).
+        await enqueueIa360Text({
           record,
           label: 'ia360_flow_preferences',
-          messageBody: 'IA360 Flow: preferencias',
-          interactive: {
-            type: 'button',
-            header: { type: 'image', image: { link: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg' } },
-            body: { text: 'Listo, te mando solo lo útil y sin saturarte.' },
-            footer: { text: 'IA360' },
-            action: { buttons: [
-              { type: 'reply', reply: { id: '100m_see_example', title: 'Ver ejemplo' } },
-            ] },
-          },
+          body: 'Listo, ajustado. Te mando solo lo útil y sin saturarte. Cuando quieras retomar, aquí estoy.',
         });
       }
       return true;
@@ -1557,10 +2850,22 @@ async function handleIa360LiteInteractive(record) {
   const ownerReplyId = getInteractiveReplyId(record);
   if (ownerReplyId && ownerReplyId.startsWith('owner_')) {
     try {
-      const [ownerAction, ownerArg] = ownerReplyId.split(':');
+      const [ownerAction, ownerArg, ownerPipe] = ownerReplyId.split(':');
       // call/keep cargan el numero del contacto (digit-strip OK). owner_cancel_yes
       // carga el EVENT_ID (alfanumerico) → NO digit-stripear ese arg.
       const targetContact = (ownerArg || '').replace(/\D/g, '');
+      if (ownerAction === 'owner_pipe') {
+        await handleIa360OwnerPipelineChoice({ record, targetContact, pipeline: ownerPipe });
+        return;
+      }
+      if (ownerAction === 'owner_seq') {
+        await handleIa360OwnerSequenceChoice({ record, targetContact, sequenceId: ownerPipe });
+        return;
+      }
+      if (ownerAction === 'owner_vcard_pipe' || ownerAction === 'owner_vcard_take' || ownerAction === 'owner_vcard_keep') {
+        await handleIa360OwnerVcardAction({ record, ownerAction, targetContact });
+        return;
+      }
       if (ownerAction === 'owner_cancel_yes') {
         // MULTI-CITA: el boton trae el EVENT_ID de la cita concreta a cancelar.
         // `record` aqui es Alek, asi que resolvemos contacto+cita por event_id
@@ -1622,7 +2927,7 @@ async function handleIa360LiteInteractive(record) {
       if (ownerAction === 'owner_take_fail') {
         const fid = String(ownerArg || '').replace(/\D/g, '');
         if (fid) await pool.query(`UPDATE coexistence.ia360_bot_failures SET owner_action='lo_tomo', status='lo_tomo' WHERE id=$1`, [fid]).catch(e => console.error('[ia360-failure] take update:', e.message));
-        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_take_fail_ack', body: 'Anotado, lo tomas tú.' });
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_take_fail_ack', body: 'Tomado: queda para gestión manual tuya.' });
         return;
       }
       if (ownerAction === 'owner_ignore_fail') {
@@ -1690,6 +2995,18 @@ async function handleIa360LiteInteractive(record) {
   if (await handleIa360FlowReply(record)) return;
   const answer = String(record.message_body || '').trim().toLowerCase();
   const replyId = getInteractiveReplyId(record);
+
+  // W4 — boton "Enviar contexto" (stage-aware): sin slot abre diagnostico, con slot abre
+  // pre_call. Va ANTES del embudo para no confundirse con un micro-paso. Si el Flow no se
+  // pudo encolar (dedup/cuenta), cae al flujo normal (este id no matchea = no-op silencioso).
+  if (replyId === '100m_send_context') {
+    try {
+      const sent = await dispatchContextFlow(record);
+      if (sent) return;
+    } catch (ctxErr) {
+      console.error('[ia360-flowwire] dispatchContextFlow failed:', ctxErr.message);
+    }
+  }
 
   // IA360 100M WhatsApp prospecting flow: coherent stage machine for approved templates.
   const reply100m = {
@@ -1900,6 +3217,44 @@ async function handleIa360LiteInteractive(record) {
         if (flowSent) return;
       } catch (flowErr) {
         console.error('[ia360-flowwire] diagnostico flow send failed, falling back to buttons:', flowErr.message);
+      }
+    }
+    // W4 D1 — offer_router: estado dolor+mecanismo+mapa solicitado. REEMPLAZA los botones de
+    // urgencia (fallback abajo si el envio falla). Replica el patron del diagnostico.
+    if (flow100m.tag === 'mapa-30-60-90-solicitado') {
+      try {
+        const flowSent = await enqueueIa360FlowMessage({
+          record,
+          flowId: '2185399508915155',
+          screen: 'PERFIL_EMPRESA',
+          cta: 'Ver mi oferta',
+          bodyText: 'Para darte la oferta correcta y sin humo, contéstame 5 datos rápidos: tamaño de tu empresa, equipo afectado, presupuesto, tu nivel de decisión y qué tipo de solución prefieres.',
+          mediaUrl: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
+          flowToken: 'ia360_offer_router',
+          label: `ia360_100m_${flow100m.tag}`,
+        });
+        if (flowSent) return;
+      } catch (flowErr) {
+        console.error('[ia360-flowwire] offer_router flow send failed, falling back to buttons:', flowErr.message);
+      }
+    }
+    // W4 — preferences: nodos "Baja" (no-contactar) y "No ahora"/"Más adelante" (nutricion-suave).
+    // Lanza el Flow de preferencias granular; fallback al texto/botones del nodo si el envio falla.
+    if (flow100m.tag === 'no-contactar' || flow100m.tag === 'nutricion-suave') {
+      try {
+        const flowSent = await enqueueIa360FlowMessage({
+          record,
+          flowId: '4037415283227252',
+          screen: 'PREFERENCIAS',
+          cta: 'Elegir preferencia',
+          bodyText: 'Para no saturarte: dime cómo prefieres que sigamos en contacto. Lo eliges en 10 segundos y respeto tu decisión.',
+          mediaUrl: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
+          flowToken: 'ia360_preferences',
+          label: `ia360_100m_${flow100m.tag}`,
+        });
+        if (flowSent) return;
+      } catch (flowErr) {
+        console.error('[ia360-flowwire] preferences flow send failed, falling back to buttons:', flowErr.message);
       }
     }
     if (flow100m.buttons.length > 0) {
@@ -2122,7 +3477,7 @@ async function handleIa360LiteInteractive(record) {
     return;
   }
 
-  if (answer === 'agendar' || replyId === 'next_schedule' || replyId === 'wa_schedule') {
+  if (answer === 'agendar' || replyId === '100m_schedule' || replyId === 'next_schedule' || replyId === 'wa_schedule') {
     await mergeContactIa360State({
       waNumber: record.wa_number,
       contactNumber: record.contact_number,
@@ -2454,6 +3809,27 @@ async function handleIa360LiteInteractive(record) {
       label: 'ia360_100m_schedule_confirmed',
       body: `Listo, tu reunión con Alek quedó agendada para ${confirmedTime} (hora CDMX).\n\n${booking.zoomJoinUrl ? 'Aquí tu enlace de Zoom para conectarte:\n' + booking.zoomJoinUrl : 'En un momento te confirmo el enlace de Zoom.'}\n\n¡Nos vemos!`,
     });
+    // W4 D2 — ofrecer "Enviar contexto" ahora que YA hay slot (el helper stage-aware lo manda a
+    // pre_call). Aditivo: NO altera el mensaje de confirmacion (critico) y no rompe el booking.
+    try {
+      await enqueueIa360Interactive({
+        record,
+        label: 'ia360_postbooking_send_context',
+        messageBody: 'IA360: ofrecer enviar contexto pre-llamada',
+        dedupSuffix: ':sendctx',
+        interactive: {
+          type: 'button',
+          header: { type: 'text', text: 'Antes de la reunión (opcional)' },
+          body: { text: 'Si quieres que Alek llegue con tu contexto a la mano, mándamelo en 30 segundos. Si no, así ya quedó listo y nos vemos en la reunión.' },
+          footer: { text: 'IA360 · opcional' },
+          action: { buttons: [
+            { type: 'reply', reply: { id: '100m_send_context', title: 'Enviar contexto' } },
+          ] },
+        },
+      });
+    } catch (ctxErr) {
+      console.error('[ia360-flowwire] post-booking send-context offer failed:', ctxErr.message);
+    }
     await emitIa360N8nHandoff({
       record,
       eventType: 'meeting_confirmed_calendar_zoom',
@@ -2609,11 +3985,31 @@ async function handleIa360LiteInteractive(record) {
       titleSuffix: 'Llamada',
       notes: 'Solicitó llamada; falta crear evento real en calendario/Zoom',
     });
-    await enqueueIa360Text({
-      record,
-      label: 'ia360_100m_call_terminal_handoff',
-      body: 'Listo: lo marco como solicitud de llamada. No envío más opciones automáticas aquí para no dar vueltas.\n\nSiguiente paso humano: Alek confirma objetivo, horario y enlace. En la siguiente fase n8n debe crear tarea en EspoCRM y evento Zoom/Calendar automáticamente.',
-    });
+    // W4 — pre_call: al pedir llamada, abre el Flow de contexto pre-llamada (captura empresa/rol/
+    // objetivo/sistemas/buen resultado). Cae al texto de handoff si el envio falla. El handoff a
+    // n8n/Alek (call_requested) se dispara SIEMPRE despues, independiente del Flow.
+    let preCallSent = false;
+    try {
+      preCallSent = await enqueueIa360FlowMessage({
+        record,
+        flowId: '862907796864124',
+        screen: 'PRE_CALL_INTAKE',
+        cta: 'Enviar contexto',
+        bodyText: 'Para que Alek llegue preparado a tu llamada (no demo de cajón): cuéntame empresa, tu rol, el objetivo, los sistemas que usan hoy y qué sería un buen resultado.',
+        mediaUrl: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
+        flowToken: 'ia360_pre_call',
+        label: 'ia360_apply_call_precall',
+      });
+    } catch (flowErr) {
+      console.error('[ia360-flowwire] pre_call flow send (apply_call) failed, falling back to text:', flowErr.message);
+    }
+    if (!preCallSent) {
+      await enqueueIa360Text({
+        record,
+        label: 'ia360_100m_call_terminal_handoff',
+        body: 'Listo: lo marco como solicitud de llamada. No envío más opciones automáticas aquí para no dar vueltas.\n\nSiguiente paso humano: Alek confirma objetivo, horario y enlace. En la siguiente fase n8n debe crear tarea en EspoCRM y evento Zoom/Calendar automáticamente.',
+      });
+    }
     await emitIa360N8nHandoff({
       record,
       eventType: 'call_requested',
@@ -2840,6 +4236,10 @@ router.post('/webhook/whatsapp', async (req, res) => {
             }
           }
 
+          if (await handleIa360SharedContacts(record)) {
+            continue; // B-29: vCard capturada y owner-gated; no cae al embudo normal
+          }
+
           const { rows: pausedRows } = await pool.query(
             `SELECT id FROM coexistence.automation_executions
               WHERE wa_number=$1 AND contact_number=$2
@@ -2936,5 +4336,78 @@ router.get('/webhook/whatsapp', async (req, res) => {
   }
   res.status(403).json({ error: 'Verification failed' });
 });
+
+// ============================================================================
+// W6-EQUIPO-0 — Endpoint de callback n8n -> webhook.js (EGRESS UNICO)
+// ----------------------------------------------------------------------------
+// La capa de agentes n8n NO habla con Meta/ForgeChat. Emite una DIRECTIVA
+// (Direccion B del contrato W6 §4.3 / W6b §6.3) por este endpoint y webhook.js
+// la ejecuta por sendQueue (unico chokepoint de egress). Auth = header secreto
+// compartido X-IA360-Directive-Secret. Montado en la zona PUBLICA (sin
+// authMiddleware), igual que /webhook/whatsapp y /ia360-intake.
+//
+// GATE EQUIPO-0 (CERO OUTBOUND): mientras IA360_DIRECTIVE_EGRESS !== 'on' corre
+// en DRY-RUN: valida y ACK, pero NUNCA encola ni envia. El cableado de envio
+// real (free_reply/send_template/owner_notify/handback_booking) se completa en
+// EQUIPO-1 (PARCIAL). NO toca el ciclo de agenda VIVO (12/12 PASS).
+// ============================================================================
+const IA360_DIRECTIVE_SECRET = process.env.IA360_DIRECTIVE_SECRET || '';
+const IA360_DIRECTIVE_EGRESS_ON = process.env.IA360_DIRECTIVE_EGRESS === 'on';
+const IA360_DIRECTIVE_ACTIONS = ['free_reply', 'send_template', 'handback_booking', 'owner_notify', 'noop'];
+
+router.post('/internal/n8n-directive', async (req, res) => {
+  // 1) Auth por secreto compartido (timing-safe, reusa safeEqual del modulo)
+  const provided = req.get('X-IA360-Directive-Secret') || '';
+  if (!IA360_DIRECTIVE_SECRET || !safeEqual(provided, IA360_DIRECTIVE_SECRET)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const d = req.body || {};
+    const action = String(d.action || '');
+    const espoId = d.espo_id || null;
+    const payload = (d.payload && typeof d.payload === 'object') ? d.payload : {};
+    const announce = (d.announce_handoff && typeof d.announce_handoff === 'object') ? d.announce_handoff : null;
+
+    // 2) Validacion del contrato (Direccion B)
+    if (!IA360_DIRECTIVE_ACTIONS.includes(action)) {
+      return res.status(422).json({ ok: false, error: 'invalid_action', allowed: IA360_DIRECTIVE_ACTIONS });
+    }
+    if (action === 'free_reply' && !(payload.texto && String(payload.texto).trim())) {
+      return res.status(422).json({ ok: false, error: 'free_reply_requires_payload_texto' });
+    }
+    if (action === 'send_template' && !payload.template_name) {
+      return res.status(422).json({ ok: false, error: 'send_template_requires_template_name' });
+    }
+    if (action !== 'noop' && !espoId) {
+      return res.status(422).json({ ok: false, error: 'espo_id_required' });
+    }
+
+    // 3) GATE EQUIPO-0: cero outbound. Dry-run = valida + ACK, no encola.
+    if (!IA360_DIRECTIVE_EGRESS_ON) {
+      return res.status(200).json({
+        ok: true,
+        dry_run: true,
+        accepted: {
+          action,
+          espo_id: espoId,
+          announce_handoff: announce ? (announce.label_publico || true) : null,
+          requiere_confirmacion: payload.requiere_confirmacion !== false
+        },
+        egress: 'suppressed (EQUIPO-0; activar con IA360_DIRECTIVE_EGRESS=on en EQUIPO-1)'
+      });
+    }
+
+    // 4) EQUIPO-1 (PARCIAL): cableado de egress real por sendQueue pendiente.
+    return res.status(501).json({
+      ok: false,
+      error: 'egress_wiring_pending_equipo_1',
+      detail: 'IA360_DIRECTIVE_EGRESS=on pero el envio real se cablea en EQUIPO-1'
+    });
+  } catch (err) {
+    console.error('[n8n-directive] error:', err && err.message);
+    return res.status(500).json({ ok: false, error: 'directive_failed', detail: err && err.message });
+  }
+});
+
 
 module.exports = { router };
