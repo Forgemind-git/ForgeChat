@@ -243,8 +243,25 @@ function extractSharedContactsFromRecord(record) {
   }
 }
 
+function inferIa360QaPersonaHint(name) {
+  const text = String(name || '').toLowerCase();
+  if (!text.startsWith('qa personafirst')) return null;
+  if (/\baliado\b|\bsocio\b/.test(text)) return 'persona_aliado';
+  if (/\bbeta\b|\bamigo\b/.test(text)) return 'persona_beta';
+  if (/\breferido\b|\bbni\b/.test(text)) return 'persona_referido';
+  if (/\bcliente\b/.test(text)) return 'persona_cliente';
+  if (/\bsponsor\b/.test(text)) return 'persona_sponsor';
+  if (/\bcomercial\b|\bdirector\b/.test(text)) return 'persona_comercial';
+  if (/\bcfo\b|\bfinanzas\b/.test(text)) return 'persona_cfo';
+  if (/\btecnico\b|\bt[eé]cnico\b|\bguardian\b|\bguardi[aá]n\b/.test(text)) return 'persona_tecnico';
+  if (/\bsolo\b.*\bguardar\b|\bguardar\b/.test(text)) return 'guardar';
+  if (/\bno\b.*\bcontactar\b|\bexcluir\b/.test(text)) return 'excluir';
+  return null;
+}
+
 async function upsertIa360SharedContact({ record, shared }) {
   if (!record?.wa_number || !shared?.contactNumber) return null;
+  const qaPersonaExpectedChoice = inferIa360QaPersonaHint(shared.name);
   const customFields = {
     staged: true,
     stage: 'Capturado / Por rutear',
@@ -257,6 +274,7 @@ async function upsertIa360SharedContact({ record, shared }) {
     vcard_phone_raw: shared.phoneRaw || null,
     vcard_wa_id: shared.waId || null,
     email: shared.email || null,
+    ...(qaPersonaExpectedChoice ? { qa_persona_expected_choice: qaPersonaExpectedChoice } : {}),
   };
   const tags = ['ia360-vcard', 'owner-intake', 'staged'];
   const { rows } = await pool.query(
@@ -1948,6 +1966,17 @@ async function handleIa360OwnerPipelineChoice({ record, targetContact, pipeline 
   const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
   const name = contact?.name || targetContact;
   const choice = String(pipeline || '').toLowerCase();
+  const qaExpectedChoice = contact?.custom_fields?.qa_persona_expected_choice || null;
+  if (qaExpectedChoice && choice !== qaExpectedChoice) {
+    await blockIa360OwnerContextMismatch({
+      record,
+      targetContact,
+      action: 'owner_pipe',
+      reason: `qa_persona_hint_mismatch:${choice || 'empty'}`,
+      expectedLabel: `qa_expected=${qaExpectedChoice}`,
+    });
+    return;
+  }
   const targetRecord = {
     ...record,
     contact_number: targetContact,
