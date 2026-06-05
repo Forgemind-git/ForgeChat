@@ -279,6 +279,25 @@ async function upsertIa360SharedContact({ record, shared }) {
   return rows[0] || null;
 }
 
+function isIa360OwnerNumber(phone) {
+  return normalizePhone(phone) === IA360_OWNER_NUMBER;
+}
+
+async function recordBlockedOwnerNumberVcard({ record, shared }) {
+  const blockedAt = new Date().toISOString();
+  console.warn('[ia360-vcard] blocked owner-number vCard source=%s message=%s', record?.contact_number || '-', record?.message_id || '-');
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: IA360_OWNER_NUMBER,
+    customFields: {
+      ia360_owner_number_vcard_blocked_at: blockedAt,
+      ia360_owner_number_vcard_blocked_source_message_id: record.message_id || '',
+      ia360_owner_number_vcard_blocked_name: shared?.name || '',
+      ia360_owner_number_vcard_blocked_reason: 'shared_contact_phone_matches_owner',
+    },
+  }).catch(e => console.error('[ia360-vcard] owner-number block persist:', e.message));
+}
+
 async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes = '' }) {
   if (!record || !record.wa_number || !record.contact_number || !targetStageName) return null;
   const { rows: pipeRows } = await pool.query(
@@ -990,6 +1009,8 @@ async function notifyOwnerVcardCaptured({ record, shared }) {
     record,
     label: `owner_vcard_captured_${shared.contactNumber}`,
     messageBody: `IA360: vCard ${who}`,
+    targetContact: shared.contactNumber,
+    ownerBudget: true,
     interactive: {
       type: 'list',
       header: { type: 'text', text: 'Contacto capturado' },
@@ -1389,14 +1410,28 @@ function buildIa360PersonaPayload({ record, contact, targetContact, flow, sequen
   const customFields = contact?.custom_fields || {};
   const name = contact?.name || targetContact;
   const draft = typeof sequence.draft === 'function' ? sequence.draft({ name }) : String(sequence.draft || '');
-  const copyStatus = hasUnresolvedIa360Placeholder(draft) ? 'blocked' : (sequence.copyStatus || 'draft');
+  const relationshipContext = flow.relationshipContext || '';
+  const isCapturedOnly = relationshipContext === 'solo_guardar';
+  const isDoNotContact = relationshipContext === 'no_contactar';
+  const copyStatus = isCapturedOnly
+    ? 'captured_only'
+    : hasUnresolvedIa360Placeholder(draft) ? 'blocked' : (sequence.copyStatus || 'draft');
+  const approvalStatus = isCapturedOnly ? 'no_action' : isDoNotContact ? 'do_not_contact' : 'requires_alek';
+  const approvalReason = isCapturedOnly
+    ? 'Captura sin acción: no existe borrador ni intento de envío por aprobar.'
+    : isDoNotContact
+      ? 'Exclusión operativa: no contactar ni crear secuencia.'
+      : 'Requiere aprobación humana antes de cualquier envío externo.';
+  const currentBlock = isCapturedOnly
+    ? 'captured_only'
+    : isDoNotContact ? 'do_not_contact' : 'requires_human_approval';
   return {
     schema: 'persona_first_vcard.v1',
     request_id: `${record.message_id || 'owner'}:${targetContact}:${sequence.id}`,
     source: 'forgechat_b29_vcard_intake',
     received_at: customFields.captured_at || record.timestamp || new Date().toISOString(),
     dry_run: true,
-    requires_human_approval: true,
+    requires_human_approval: !(isCapturedOnly || isDoNotContact),
     owner: {
       wa_id: IA360_OWNER_NUMBER,
       role: 'Alek',
@@ -1439,13 +1474,13 @@ function buildIa360PersonaPayload({ record, contact, targetContact, flow, sequen
       draft,
     },
     approval: {
-      status: 'requires_alek',
+      status: approvalStatus,
       approved_by: '',
       approved_at: '',
-      reason: 'Requiere aprobación humana antes de cualquier envío externo.',
+      reason: approvalReason,
     },
     guardrail: {
-      current_block: 'requires_human_approval',
+      current_block: currentBlock,
       external_send_allowed: false,
       allowed_recipient: 'owner_only',
     },
@@ -1458,6 +1493,13 @@ function buildIa360PersonaPayload({ record, contact, targetContact, flow, sequen
       update_memory: false,
     },
   };
+}
+
+function describeIa360CurrentBlock(payload) {
+  const status = payload?.approval?.status || '';
+  if (status === 'no_action') return 'captura sin acción; no hay borrador ni envío externo al contacto.';
+  if (status === 'do_not_contact') return 'no contactar; exclusión operativa sin envío externo al contacto.';
+  return 'requiere aprobación humana; no hay envío externo al contacto.';
 }
 
 function buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload }) {
@@ -1473,9 +1515,62 @@ function buildIa360SequenceReadout({ name, targetContact, flow, sequence, payloa
     'Borrador propuesto:',
     payload.sequence_candidate.draft,
     '',
-    'Bloqueo actual: requiere aprobación humana; no hay envío externo al contacto.',
+    `Bloqueo actual: ${describeIa360CurrentBlock(payload)}`,
     `Siguiente acción recomendada: ${sequence.nextAction || 'Alek revisa y aprueba solo si el contexto lo justifica.'}`,
   ].join('\n');
+}
+
+async function loadIa360OwnerReplyContext({ record }) {
+  if (!record?.context_message_id) return { ok: false, reason: 'missing_context_message_id' };
+  const { rows } = await pool.query(
+    `SELECT message_id, message_body, template_meta->>'label' AS label
+       FROM coexistence.chat_history
+      WHERE wa_number=$1
+        AND contact_number=$2
+        AND direction='outgoing'
+        AND message_id=$3
+        AND template_meta->>'ux'='ia360_owner'
+      LIMIT 1`,
+    [record.wa_number, IA360_OWNER_NUMBER, record.context_message_id]
+  );
+  if (!rows.length) return { ok: false, reason: 'context_owner_message_not_found' };
+  return { ok: true, row: rows[0], label: rows[0].label || '' };
+}
+
+async function blockIa360OwnerContextMismatch({ record, targetContact, action, reason, expectedLabel }) {
+  if (targetContact) {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: targetContact,
+      tags: ['ia360-owner-context-blocked'],
+      customFields: {
+        ia360_owner_reply_blocked_at: new Date().toISOString(),
+        ia360_owner_reply_blocked_action: action || '',
+        ia360_owner_reply_blocked_reason: reason || '',
+        ia360_owner_reply_expected_context: expectedLabel || '',
+      },
+    }).catch(e => console.error('[ia360-owner-context] persist block:', e.message));
+  }
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_context_mismatch_blocked',
+    body: `Bloqueé esa acción IA360 porque el botón no coincide con el mensaje/contexto esperado para ${targetContact || 'ese contacto'}. No envié nada al contacto.`,
+    targetContact,
+    ownerBudget: true,
+  });
+}
+
+async function validateIa360OwnerContext({ record, targetContact, action, expectedLabelPrefix }) {
+  if (normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
+    return { ok: false, reason: 'not_owner_contact' };
+  }
+  const ctx = await loadIa360OwnerReplyContext({ record });
+  if (!ctx.ok) return ctx;
+  if (expectedLabelPrefix && !String(ctx.label || '').startsWith(expectedLabelPrefix)) {
+    return { ok: false, reason: 'context_label_mismatch', label: ctx.label || '' };
+  }
+  return { ok: true, label: ctx.label || '', row: ctx.row };
 }
 
 async function persistIa360PersonaPayload({ record, targetContact, flow, sequence, payload, tags = [] }) {
@@ -1532,6 +1627,8 @@ async function sendIa360SequenceSelector({ record, targetContact, contact, flowK
     record,
     label: `owner_sequence_selector_${targetContact}_${flowKey}`,
     messageBody: `IA360: secuencias ${name}`,
+    targetContact,
+    ownerBudget: true,
     interactive: {
       type: 'list',
       header: { type: 'text', text: 'Elegir secuencia' },
@@ -1559,7 +1656,7 @@ async function handleIa360PersonaChoice({ record, targetContact, personaChoice }
   const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
   const name = contact?.name || targetContact;
   if (!flow) {
-    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_persona_unknown', body: `No reconozco la persona elegida para ${name}. No envié nada y queda para revisión de Alek.` });
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_persona_unknown', body: `No reconozco la persona elegida para ${name}. No envié nada y queda para revisión de Alek.`, targetContact, ownerBudget: true });
     return;
   }
   await sendIa360SequenceSelector({ record, targetContact, contact, flowKey: personaChoice, flow });
@@ -1574,10 +1671,40 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
   const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
   const name = contact?.name || targetContact;
   if (!found) {
-    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_sequence_unknown', body: `La secuencia elegida para ${name} no está en el catálogo persona-first. No envié nada.` });
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_sequence_unknown', body: `La secuencia elegida para ${name} no está en el catálogo persona-first. No envié nada.`, targetContact, ownerBudget: true });
     return;
   }
   const { flow, sequence } = found;
+  const ctx = await validateIa360OwnerContext({
+    record,
+    targetContact,
+    action: 'owner_seq',
+    expectedLabelPrefix: `owner_sequence_selector_${targetContact}_`,
+  });
+  if (!ctx.ok) {
+    await blockIa360OwnerContextMismatch({
+      record,
+      targetContact,
+      action: 'owner_seq',
+      reason: ctx.reason,
+      expectedLabel: `owner_sequence_selector_${targetContact}_*`,
+    });
+    return;
+  }
+  const contextFlowKey = String(ctx.label || '').slice(`owner_sequence_selector_${targetContact}_`.length);
+  const contextFlow = IA360_PERSONA_SEQUENCE_FLOWS[contextFlowKey];
+  const previousRel = contact?.custom_fields?.ia360_persona_first?.classification?.relationship_context || '';
+  if ((contextFlow && contextFlow.relationshipContext !== flow.relationshipContext) ||
+      (previousRel && previousRel !== flow.relationshipContext)) {
+    await blockIa360OwnerContextMismatch({
+      record,
+      targetContact,
+      action: 'owner_seq',
+      reason: 'sequence_persona_mismatch',
+      expectedLabel: `persona=${contextFlowKey || previousRel}`,
+    });
+    return;
+  }
   const payload = buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction: 'sequence_selected' });
   const readout = buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload });
   if (hasUnresolvedIa360Placeholder(readout)) {
@@ -1590,6 +1717,8 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
     toNumber: IA360_OWNER_NUMBER,
     label: `owner_sequence_readout_${sequence.id}`,
     body: readout,
+    targetContact,
+    ownerBudget: true,
   });
 }
 
@@ -1620,6 +1749,8 @@ async function handleIa360TerminalVcardChoice({ record, targetContact, terminalC
     toNumber: IA360_OWNER_NUMBER,
     label: `owner_terminal_${terminal.sequence.id}`,
     body: readout,
+    targetContact,
+    ownerBudget: true,
   });
   return true;
 }
@@ -1664,6 +1795,8 @@ async function handleIa360LegacyOwnerPipeChoice({ record, targetContact, choice,
     toNumber: IA360_OWNER_NUMBER,
     label: 'owner_pipe_legacy_blocked',
     body: `Botón heredado bloqueado para ${name}: ${choice || 'sin ruta'}.\n\nEstado: Requiere Alek.\nNo envié nada al contacto. No creé oportunidad comercial. Reclasifica persona y elige una secuencia persona-first si quieres preparar borrador.`,
+    targetContact,
+    ownerBudget: true,
   });
 }
 
@@ -1677,11 +1810,16 @@ async function handleIa360SharedContacts(record) {
         toNumber: IA360_OWNER_NUMBER,
         label: 'owner_vcard_parse_failed',
         body: 'Recibí una tarjeta de contacto, pero no pude extraer un número de WhatsApp. Revísala manualmente.',
+        ownerBudget: true,
       });
       return true;
     }
 
     for (const shared of sharedContacts.slice(0, 5)) {
+      if (isIa360OwnerNumber(shared.contactNumber)) {
+        await recordBlockedOwnerNumberVcard({ record, shared });
+        continue;
+      }
       const saved = await upsertIa360SharedContact({ record, shared });
       console.log('[ia360-vcard] captured contact=%s name=%s source=%s', shared.contactNumber, shared.name || '-', record.contact_number || '-');
       const targetRecord = {
@@ -1791,6 +1929,22 @@ async function handleIa360OwnerPipelineChoice({ record, targetContact, pipeline 
     await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_pipe_missing_target', body: 'No encontré el número del contacto de esa acción.' });
     return;
   }
+  const ctx = await validateIa360OwnerContext({
+    record,
+    targetContact,
+    action: 'owner_pipe',
+    expectedLabelPrefix: `owner_vcard_captured_${targetContact}`,
+  });
+  if (!ctx.ok) {
+    await blockIa360OwnerContextMismatch({
+      record,
+      targetContact,
+      action: 'owner_pipe',
+      reason: ctx.reason,
+      expectedLabel: `owner_vcard_captured_${targetContact}`,
+    });
+    return;
+  }
   const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
   const name = contact?.name || targetContact;
   const choice = String(pipeline || '').toLowerCase();
@@ -1888,12 +2042,66 @@ async function handleIa360OwnerVcardAction({ record, ownerAction, targetContact 
 
 const IA360_OWNER_NUMBER = '5213322638033';
 
+function parsePositiveIntEnv(name, fallback, min = 1) {
+  const value = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value >= min ? value : fallback;
+}
+
+const IA360_OWNER_NOTIFY_WINDOW_SECONDS = parsePositiveIntEnv('IA360_OWNER_NOTIFY_WINDOW_SECONDS', 60, 10);
+const IA360_OWNER_NOTIFY_MAX_PER_WINDOW = parsePositiveIntEnv('IA360_OWNER_NOTIFY_MAX_PER_WINDOW', 6, 1);
+
+function inferIa360OwnerNotifyTarget(label) {
+  const m = String(label || '').match(/(?:owner_vcard_captured|owner_sequence_selector)_(\d+)/);
+  return m ? m[1] : null;
+}
+
+async function recordIa360OwnerNotifySuppressed({ record, label, targetContact, reason }) {
+  const contactNumber = targetContact || inferIa360OwnerNotifyTarget(label);
+  console.warn('[ia360-owner] suppressed notify label=%s target=%s reason=%s', label || '-', contactNumber || '-', reason || '-');
+  if (!contactNumber || !record?.wa_number) return;
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber,
+    customFields: {
+      ia360_owner_notify_suppressed_at: new Date().toISOString(),
+      ia360_owner_notify_suppressed_label: label || '',
+      ia360_owner_notify_suppressed_reason: reason || '',
+      ia360_owner_notify_window_seconds: IA360_OWNER_NOTIFY_WINDOW_SECONDS,
+      ia360_owner_notify_max_per_window: IA360_OWNER_NOTIFY_MAX_PER_WINDOW,
+    },
+  }).catch(e => console.error('[ia360-owner] suppress persist:', e.message));
+}
+
+async function canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }) {
+  if (!ownerBudget) return true;
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS count
+       FROM coexistence.chat_history
+      WHERE wa_number=$1
+        AND contact_number=$2
+        AND direction='outgoing'
+        AND template_meta->>'ux'='ia360_owner'
+        AND created_at > NOW() - ($3::int * INTERVAL '1 second')`,
+    [record.wa_number, IA360_OWNER_NUMBER, IA360_OWNER_NOTIFY_WINDOW_SECONDS]
+  );
+  const count = rows[0]?.count || 0;
+  if (count < IA360_OWNER_NOTIFY_MAX_PER_WINDOW) return true;
+  await recordIa360OwnerNotifySuppressed({
+    record,
+    label,
+    targetContact,
+    reason: `owner_notify_budget_exceeded:${count}/${IA360_OWNER_NOTIFY_MAX_PER_WINDOW}/${IA360_OWNER_NOTIFY_WINDOW_SECONDS}s`,
+  });
+  return false;
+}
+
 // Envia un interactivo al OWNER (Alek), no al record.contact_number. Construye la
 // fila + encola apuntando a IA360_OWNER_NUMBER. NO pasa por resolveIa360Outbound
 // (su dedup es por contact_number+ia360_handler_for; aqui el destino es otro
 // numero, no colisiona). try/catch propio: nunca tumba el webhook.
-async function sendOwnerInteractive({ record, interactive, label, messageBody }) {
+async function sendOwnerInteractive({ record, interactive, label, messageBody, targetContact = null, ownerBudget = false }) {
   try {
+    if (!(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }))) return false;
     const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
     if (error || !account) { console.error('[ia360-owner] account resolve failed:', error || 'unknown'); return false; }
     const localId = await insertPendingRow({
@@ -1913,8 +2121,10 @@ async function sendOwnerInteractive({ record, interactive, label, messageBody })
 
 // Envia texto libre a un numero ARBITRARIO (p.ej. el contacto cuya cita se cancela
 // desde la rama owner, donde record.contact_number es Alek, no el prospecto).
-async function sendIa360DirectText({ record, toNumber, body, label }) {
+async function sendIa360DirectText({ record, toNumber, body, label, targetContact = null, ownerBudget = false }) {
   try {
+    if (normalizePhone(toNumber) === IA360_OWNER_NUMBER &&
+        !(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }))) return false;
     const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
     if (error || !account) { console.error('[ia360-owner] direct text account resolve failed:', error || 'unknown'); return false; }
     const localId = await insertPendingRow({
@@ -2849,6 +3059,10 @@ async function handleIa360LiteInteractive(record) {
   // se emiten en minusculas con guion_bajo y el contactNumber sobrevive (digitos).
   const ownerReplyId = getInteractiveReplyId(record);
   if (ownerReplyId && ownerReplyId.startsWith('owner_')) {
+    if (normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
+      console.warn('[ia360-owner] ignored owner-prefixed reply from non-owner contact=%s id=%s', record.contact_number || '-', ownerReplyId);
+      return;
+    }
     try {
       const [ownerAction, ownerArg, ownerPipe] = ownerReplyId.split(':');
       // call/keep cargan el numero del contacto (digit-strip OK). owner_cancel_yes
