@@ -204,6 +204,589 @@ async function mergeContactIa360State({ waNumber, contactNumber, tags = [], cust
   );
 }
 
+let ia360MemoryTablesReady = null;
+const IA360_MEMORY_EGRESS_ON = process.env.IA360_MEMORY_EGRESS === 'on';
+
+async function ensureIa360MemoryTables() {
+  if (!ia360MemoryTablesReady) {
+    ia360MemoryTablesReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS coexistence.ia360_memory_events (
+          id BIGSERIAL PRIMARY KEY,
+          schema_version TEXT NOT NULL DEFAULT 'ia360_memory_event.v1',
+          source TEXT NOT NULL DEFAULT 'whatsapp',
+          contact_wa_number TEXT,
+          contact_number TEXT,
+          forgechat_contact_id BIGINT,
+          espo_contact_id TEXT,
+          contact_name TEXT,
+          contact_role TEXT,
+          account_name TEXT,
+          project_name TEXT,
+          persona TEXT,
+          lifecycle_stage TEXT,
+          area TEXT NOT NULL,
+          signal_type TEXT NOT NULL,
+          confidence NUMERIC(4,3) NOT NULL DEFAULT 0.650,
+          summary TEXT NOT NULL,
+          business_impact TEXT,
+          missing_data TEXT,
+          next_action TEXT,
+          should_be_fact BOOLEAN NOT NULL DEFAULT false,
+          crm_sync_status TEXT NOT NULL DEFAULT 'dry_run_compact',
+          rag_index_status TEXT NOT NULL DEFAULT 'structured_lookup_ready',
+          owner_review_status TEXT NOT NULL DEFAULT 'required',
+          external_send_allowed BOOLEAN NOT NULL DEFAULT false,
+          contains_sensitive_data BOOLEAN NOT NULL DEFAULT false,
+          store_transcript BOOLEAN NOT NULL DEFAULT false,
+          source_message_id TEXT,
+          source_chat_history_id BIGINT,
+          payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS ia360_memory_events_source_area_uidx
+          ON coexistence.ia360_memory_events (source_message_id, area, signal_type)
+          WHERE source_message_id IS NOT NULL
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS ia360_memory_events_contact_idx
+          ON coexistence.ia360_memory_events (contact_wa_number, contact_number, created_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS ia360_memory_events_project_area_idx
+          ON coexistence.ia360_memory_events (project_name, area, created_at DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS coexistence.ia360_memory_facts (
+          id BIGSERIAL PRIMARY KEY,
+          schema_version TEXT NOT NULL DEFAULT 'ia360_memory_fact.v1',
+          fact_key TEXT NOT NULL UNIQUE,
+          source_event_id BIGINT REFERENCES coexistence.ia360_memory_events(id) ON DELETE SET NULL,
+          source TEXT NOT NULL DEFAULT 'whatsapp',
+          contact_wa_number TEXT,
+          contact_number TEXT,
+          forgechat_contact_id BIGINT,
+          espo_contact_id TEXT,
+          account_name TEXT,
+          project_name TEXT,
+          persona TEXT,
+          role TEXT,
+          preference TEXT,
+          objection TEXT,
+          recurring_pain TEXT,
+          affected_process TEXT,
+          missing_metric TEXT,
+          confidence NUMERIC(4,3) NOT NULL DEFAULT 0.650,
+          owner_review_status TEXT NOT NULL DEFAULT 'pending_owner_review',
+          status TEXT NOT NULL DEFAULT 'pending_owner_review',
+          evidence_count INTEGER NOT NULL DEFAULT 1,
+          payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+          first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS ia360_memory_facts_contact_idx
+          ON coexistence.ia360_memory_facts (contact_wa_number, contact_number, last_seen_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS ia360_memory_facts_project_area_idx
+          ON coexistence.ia360_memory_facts (project_name, affected_process, last_seen_at DESC)
+      `);
+    })().catch(err => {
+      ia360MemoryTablesReady = null;
+      throw err;
+    });
+  }
+  return ia360MemoryTablesReady;
+}
+
+function stripSensitiveIa360Text(text, max = 220) {
+  return String(text || '')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]')
+    .replace(/\+?\d[\d\s().-]{7,}\d/g, '[phone]')
+    .replace(/\b(?:sk|pk|rk|org|proj)-[A-Za-z0-9_-]{16,}\b/g, '[secret]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+}
+
+function buildIa360CrmCompactNote({ record, agent }) {
+  const parts = [
+    `canal=whatsapp`,
+    `tipo=${record?.message_type || 'text'}`,
+    `accion=${agent?.action || 'reply'}`,
+    `intent=${agent?.intent || 'unknown'}`,
+  ];
+  if (agent?.extracted?.area_operacion) parts.push(`area=${stripSensitiveIa360Text(agent.extracted.area_operacion, 80)}`);
+  if (agent?.extracted?.dolor) parts.push(`dolor=${stripSensitiveIa360Text(agent.extracted.dolor, 120)}`);
+  return parts.join('; ');
+}
+
+async function loadIa360ContactContext(record) {
+  if (!record?.wa_number || !record?.contact_number) return null;
+  const { rows } = await pool.query(
+    `SELECT id, COALESCE(name, profile_name) AS name, tags, custom_fields
+       FROM coexistence.contacts
+      WHERE wa_number=$1 AND contact_number=$2
+      LIMIT 1`,
+    [record.wa_number, record.contact_number]
+  );
+  return rows[0] || null;
+}
+
+function isIa360ClienteActivoBetaContact(contact) {
+  const cf = contact?.custom_fields || {};
+  const beta = cf.ia360_cliente_activo_beta || {};
+  const tags = Array.isArray(contact?.tags) ? contact.tags.map(t => String(t || '').toLowerCase()) : [];
+  return beta.schema === 'cliente_activo_beta.v1'
+    || beta.contact_role === 'cliente_activo_cfo_champion'
+    || cf.lifecycle_stage === 'cliente_activo_beta_supervisado'
+    || cf.relationship_context === 'cliente_activo_beta_supervisado'
+    || tags.includes('cliente-activo-beta');
+}
+
+function getIa360ContactProfile(contact) {
+  const cf = contact?.custom_fields || {};
+  const beta = cf.ia360_cliente_activo_beta || {};
+  const personaFirst = cf.ia360_persona_first || {};
+  return {
+    forgechatContactId: contact?.id || null,
+    espoContactId: cf.espo_id || '',
+    name: contact?.name || '',
+    role: beta.contact_role || cf.project_role || cf.rol_comite || '',
+    accountName: cf.account_name || cf.empresa || beta.project || cf.project_name || '',
+    projectName: beta.project || cf.project_name || cf.account_name || '',
+    persona: cf.persona_principal || personaFirst?.classification?.persona_context || '',
+    lifecycleStage: cf.lifecycle_stage || beta.flywheel_phase || cf.flywheel_phase || '',
+  };
+}
+
+const IA360_MEMORY_SIGNAL_CATALOG = [
+  {
+    area: 'cartera_cobranza_portal',
+    label: 'cartera/cobranza portal',
+    signalType: 'dolor_operativo',
+    regex: /cartera|cobran[cz]a|cuentas? por cobrar|portal|excel|comentarios?|fecha(?:s)? compromiso|promesa de pago|seguimiento de pago/i,
+    summary: 'Cobranza necesita comentarios, fechas compromiso, pasos internos y seguimiento visibles en portal, no dispersos en Excel o llamadas.',
+    businessImpact: 'Reduce fuga de seguimiento y mejora visibilidad financiera de cartera.',
+    missingData: 'Cuenta o cliente, fecha compromiso, responsable, siguiente paso y estado actual.',
+    nextAction: 'Mapear cartera -> comentario -> compromiso -> responsable -> seguimiento.',
+    affectedProcess: 'cartera -> comentario -> compromiso -> responsable -> seguimiento',
+    missingMetric: 'fecha compromiso y responsable por cuenta',
+    confidence: 0.88,
+  },
+  {
+    area: 'taller_garantia_dias_detencion',
+    label: 'taller/garantía/días detenidos',
+    signalType: 'dolor_operativo',
+    regex: /taller|garant[ií]a|unidad(?:es)?|cami[oó]n|detenid|parad[ao]|refacci[oó]n|bloqueo|escalaci[oó]n|d[ií]as/i,
+    summary: 'Taller necesita visibilidad de días de unidad detenida, bloqueo, responsable y criterio de escalación.',
+    businessImpact: 'Una decisión de garantía o proceso puede costar más que resolver rápido si la unidad deja de operar.',
+    missingData: 'Unidad, días detenida, tipo de caso, bloqueo, responsable y costo operativo estimado.',
+    nextAction: 'Mapear unidad detenida -> bloqueo -> responsable -> decisión -> costo para cliente.',
+    affectedProcess: 'unidad detenida -> bloqueo -> responsable -> decisión',
+    missingMetric: 'días detenida por unidad y costo operativo',
+    confidence: 0.90,
+  },
+  {
+    area: 'auditoria_licencias_gasto',
+    label: 'auditoría de licencias/gasto',
+    signalType: 'dolor_operativo',
+    regex: /licencias?|asientos?|usuarios?|gasto|software|suscripci[oó]n|uso real|permisos?|consultas?|consulta con ia/i,
+    summary: 'Se necesita comparar licencias pagadas contra uso real y evaluar si IA concentra consultas sin comprar asientos innecesarios.',
+    businessImpact: 'Puede bajar gasto recurrente sin perder acceso operativo a información.',
+    missingData: 'Sistema, costo por licencia, usuarios activos, consultas necesarias y permisos mínimos.',
+    nextAction: 'Mapear licencia pagada -> uso real -> consulta necesaria -> permiso -> ahorro posible.',
+    affectedProcess: 'licencias -> uso real -> consultas -> permisos -> ahorro',
+    missingMetric: 'usuarios activos contra licencias pagadas',
+    confidence: 0.86,
+  },
+  {
+    area: 'feedback_asistente',
+    label: 'feedback del asistente',
+    signalType: 'feedback',
+    regex: /no sirve|eso no|mal|incorrect|equivoc|no ayuda|no entend|deber[ií]a|prefiero que responda|respuesta mala/i,
+    summary: 'El cliente está corrigiendo la respuesta del asistente y deja aprendizaje sobre cómo debe contestar.',
+    businessImpact: 'Mejora criterio del asistente y evita insistir con respuestas que no ayudan.',
+    missingData: 'Qué parte falló y cuál sería la respuesta preferida.',
+    nextAction: 'Registrar motivo del fallo, ajustar criterio y pedir ejemplo de respuesta útil.',
+    affectedProcess: 'calidad de respuesta beta',
+    missingMetric: 'motivo de fallo y respuesta esperada',
+    confidence: 0.84,
+  },
+];
+
+function isPassiveIa360Text(text) {
+  return /^(ok|okay|gracias|va|sale|listo|perfecto|sí|si|no|👍|👌)[\s.!¡!¿?]*$/i.test(String(text || '').trim());
+}
+
+function extractIa360MemorySignals({ record, contact, agent = {} }) {
+  const text = String(record?.message_body || '').trim();
+  if (!text || isPassiveIa360Text(text)) return [];
+  const matches = IA360_MEMORY_SIGNAL_CATALOG.filter(item => item.regex.test(text));
+  if (matches.length) return matches.map(item => ({ ...item, shouldBeFact: true }));
+  const extracted = agent?.extracted || {};
+  const hasAgentLearning = agent?.action === 'advance_pain'
+    || agent?.intent === 'ask_pain'
+    || extracted.area_operacion
+    || extracted.dolor;
+  if (!hasAgentLearning && text.length < 32) return [];
+  if (!isIa360ClienteActivoBetaContact(contact) && !hasAgentLearning) return [];
+  return [{
+    area: extracted.area_operacion ? stripSensitiveIa360Text(extracted.area_operacion, 80).toLowerCase().replace(/[^a-z0-9_]+/g, '_') : 'operacion_cliente',
+    label: 'operación cliente',
+    signalType: extracted.dolor ? 'dolor_operativo' : 'senal_operativa',
+    summary: extracted.dolor
+      ? stripSensitiveIa360Text(extracted.dolor, 180)
+      : 'El contacto dejó una señal operativa que requiere revisión de Alek antes de convertirla en acción.',
+    businessImpact: 'Impacto pendiente de precisar con dato operativo y responsable.',
+    missingData: 'Dato actual, bloqueo, responsable y siguiente acción.',
+    nextAction: 'Convertir la señal en mapa dato actual -> bloqueo -> responsable -> siguiente acción.',
+    affectedProcess: 'operación cliente',
+    missingMetric: 'dato operativo mínimo',
+    confidence: hasAgentLearning ? 0.70 : 0.55,
+    shouldBeFact: Boolean(extracted.dolor || isIa360ClienteActivoBetaContact(contact)),
+  }];
+}
+
+function buildIa360MemoryEventPayload({ record, contact, signal }) {
+  const profile = getIa360ContactProfile(contact);
+  const payload = {
+    schema: 'ia360_memory_event.v1',
+    source: 'whatsapp',
+    contact: {
+      forgechat_contact_id: profile.forgechatContactId || '',
+      espo_contact_id: profile.espoContactId || '',
+      name: profile.name || record?.contact_name || '',
+      role: profile.role || '',
+    },
+    account: {
+      name: profile.accountName || '',
+      project: profile.projectName || '',
+    },
+    classification: {
+      persona: profile.persona || '',
+      lifecycle_stage: profile.lifecycleStage || '',
+      area: signal.area,
+      signal_type: signal.signalType,
+      confidence: signal.confidence,
+    },
+    learning: {
+      summary: signal.summary,
+      business_impact: signal.businessImpact,
+      missing_data: signal.missingData,
+      next_action: signal.nextAction,
+      should_be_fact: Boolean(signal.shouldBeFact),
+    },
+    sync: {
+      crm_sync_status: 'dry_run_compact',
+      rag_index_status: 'structured_lookup_ready',
+      owner_review_status: 'required',
+    },
+    guardrails: {
+      external_send_allowed: false,
+      contains_sensitive_data: false,
+      store_transcript: false,
+    },
+  };
+  return {
+    payload,
+    profile,
+  };
+}
+
+async function persistIa360MemorySignal({ record, contact, signal }) {
+  await ensureIa360MemoryTables();
+  const { payload, profile } = buildIa360MemoryEventPayload({ record, contact, signal });
+  const { rows } = await pool.query(
+    `INSERT INTO coexistence.ia360_memory_events (
+       schema_version, source, contact_wa_number, contact_number, forgechat_contact_id,
+       espo_contact_id, contact_name, contact_role, account_name, project_name,
+       persona, lifecycle_stage, area, signal_type, confidence, summary,
+       business_impact, missing_data, next_action, should_be_fact,
+       crm_sync_status, rag_index_status, owner_review_status, external_send_allowed,
+       contains_sensitive_data, store_transcript, source_message_id, payload
+     )
+     VALUES (
+       'ia360_memory_event.v1', 'whatsapp', $1, $2, $3, $4, $5, $6, $7, $8,
+       $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+       'dry_run_compact', 'structured_lookup_ready', 'required', false,
+       false, false, $19, $20::jsonb
+     )
+     ON CONFLICT (source_message_id, area, signal_type) WHERE source_message_id IS NOT NULL
+     DO UPDATE SET
+       summary=EXCLUDED.summary,
+       business_impact=EXCLUDED.business_impact,
+       missing_data=EXCLUDED.missing_data,
+       next_action=EXCLUDED.next_action,
+       payload=EXCLUDED.payload,
+       updated_at=NOW()
+     RETURNING id`,
+    [
+      record.wa_number || null,
+      record.contact_number || null,
+      profile.forgechatContactId,
+      profile.espoContactId || null,
+      profile.name || record.contact_name || null,
+      profile.role || null,
+      profile.accountName || null,
+      profile.projectName || null,
+      profile.persona || null,
+      profile.lifecycleStage || null,
+      signal.area,
+      signal.signalType,
+      signal.confidence,
+      signal.summary,
+      signal.businessImpact,
+      signal.missingData,
+      signal.nextAction,
+      Boolean(signal.shouldBeFact),
+      record.message_id || null,
+      JSON.stringify(payload),
+    ]
+  );
+  const eventId = rows[0]?.id || null;
+  let factId = null;
+  if (signal.shouldBeFact) {
+    const factKey = [
+      record.wa_number || '',
+      record.contact_number || '',
+      profile.projectName || '',
+      signal.area,
+      signal.signalType,
+    ].join(':').toLowerCase();
+    const factPayload = {
+      schema: 'ia360_memory_fact.v1',
+      persona: profile.persona || '',
+      role: profile.role || '',
+      preference: isIa360ClienteActivoBetaContact(contact)
+        ? 'Responder con hallazgo, impacto, dato faltante y siguiente acción; no pitch ni agenda por default.'
+        : '',
+      objection: signal.signalType === 'feedback' ? signal.summary : '',
+      recurring_pain: signal.summary,
+      affected_process: signal.affectedProcess,
+      missing_metric: signal.missingMetric,
+      source: record.message_id || 'whatsapp',
+      confidence: signal.confidence,
+    };
+    const fact = await pool.query(
+      `INSERT INTO coexistence.ia360_memory_facts (
+         schema_version, fact_key, source_event_id, source, contact_wa_number,
+         contact_number, forgechat_contact_id, espo_contact_id, account_name,
+         project_name, persona, role, preference, objection, recurring_pain,
+         affected_process, missing_metric, confidence, owner_review_status,
+         status, payload
+       )
+       VALUES (
+         'ia360_memory_fact.v1', md5($1), $2, 'whatsapp', $3,
+         $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+         $14, $15, $16, 'pending_owner_review', 'pending_owner_review', $17::jsonb
+       )
+       ON CONFLICT (fact_key)
+       DO UPDATE SET
+         source_event_id=COALESCE(EXCLUDED.source_event_id, coexistence.ia360_memory_facts.source_event_id),
+         preference=COALESCE(NULLIF(EXCLUDED.preference, ''), coexistence.ia360_memory_facts.preference),
+         objection=COALESCE(NULLIF(EXCLUDED.objection, ''), coexistence.ia360_memory_facts.objection),
+         recurring_pain=EXCLUDED.recurring_pain,
+         missing_metric=EXCLUDED.missing_metric,
+         evidence_count=coexistence.ia360_memory_facts.evidence_count + 1,
+         last_seen_at=NOW(),
+         updated_at=NOW(),
+         payload=EXCLUDED.payload
+       RETURNING id`,
+      [
+        factKey,
+        eventId,
+        record.wa_number || null,
+        record.contact_number || null,
+        profile.forgechatContactId,
+        profile.espoContactId || null,
+        profile.accountName || null,
+        profile.projectName || null,
+        profile.persona || null,
+        profile.role || null,
+        factPayload.preference,
+        factPayload.objection,
+        factPayload.recurring_pain,
+        factPayload.affected_process,
+        factPayload.missing_metric,
+        signal.confidence,
+        JSON.stringify(factPayload),
+      ]
+    );
+    factId = fact.rows[0]?.id || null;
+  }
+  return { eventId, factId, payload };
+}
+
+async function persistIa360MemorySignals({ record, contact, signals }) {
+  const results = [];
+  for (const signal of signals || []) {
+    try {
+      results.push(await persistIa360MemorySignal({ record, contact, signal }));
+    } catch (err) {
+      console.error('[ia360-memory] persist error:', err.message);
+    }
+  }
+  return results;
+}
+
+async function lookupIa360MemoryContext({ record, contact, limit = 8 }) {
+  await ensureIa360MemoryTables();
+  const profile = getIa360ContactProfile(contact);
+  const params = [
+    record?.wa_number || null,
+    record?.contact_number || null,
+    profile.projectName || null,
+    limit,
+  ];
+  const events = await pool.query(
+    `SELECT area, signal_type, summary, business_impact, missing_data, next_action, owner_review_status, created_at
+       FROM coexistence.ia360_memory_events
+      WHERE ((contact_wa_number=$1 AND contact_number=$2)
+             OR ($3::text IS NOT NULL AND project_name=$3))
+      ORDER BY created_at DESC
+      LIMIT $4`,
+    params
+  );
+  const facts = await pool.query(
+    `SELECT persona, role, preference, objection, recurring_pain, affected_process, missing_metric, confidence, status, last_seen_at
+       FROM coexistence.ia360_memory_facts
+      WHERE ((contact_wa_number=$1 AND contact_number=$2)
+             OR ($3::text IS NOT NULL AND project_name=$3))
+      ORDER BY last_seen_at DESC
+      LIMIT $4`,
+    params
+  );
+  return { events: events.rows, facts: facts.rows };
+}
+
+function uniqueIa360Areas(memoryContext, signals = []) {
+  const areas = new Map();
+  for (const signal of signals) areas.set(signal.area, signal.label || signal.area);
+  for (const event of memoryContext?.events || []) areas.set(event.area, event.area);
+  for (const fact of memoryContext?.facts || []) {
+    if (fact.affected_process) areas.set(fact.affected_process, fact.affected_process);
+  }
+  return [...areas.values()].slice(0, 5);
+}
+
+function buildIa360ClienteActivoBetaReply({ signals, memoryContext }) {
+  const primary = signals[0];
+  const areas = uniqueIa360Areas(memoryContext, signals);
+  if (signals.length > 1 || areas.length >= 3) {
+    return [
+      'Ya dejé registrados los frentes para Alek.',
+      '',
+      `Lo que veo: ${areas.join('; ')}.`,
+      '',
+      'Para aterrizarlo sin dispersarnos, elegiría uno y lo bajaría a: dato actual -> bloqueo -> responsable -> siguiente acción.',
+      '',
+      '¿Cuál quieres que prioricemos primero?'
+    ].join('\n');
+  }
+  return [
+    `Ya lo registré como ${primary.label || primary.area}.`,
+    '',
+    `Hallazgo: ${primary.summary}`,
+    '',
+    `Impacto: ${primary.businessImpact}`,
+    '',
+    `Dato faltante: ${primary.missingData}`,
+    '',
+    `Siguiente acción: ${primary.nextAction}`,
+    '',
+    '¿Quieres que prioricemos esto o lo dejo como frente secundario para Alek?'
+  ].join('\n');
+}
+
+function maskIa360Number(number) {
+  const s = String(number || '');
+  if (!s) return 'sin número';
+  return `${s.slice(0, 3)}***${s.slice(-2)}`;
+}
+
+function buildIa360OwnerMemoryReadout({ record, signals, persisted }) {
+  const lines = [
+    'Readout IA360 memoria',
+    '',
+    `Contacto: ${record.contact_name || 'contacto'} (${maskIa360Number(record.contact_number)})`,
+    `Eventos guardados: ${persisted.filter(x => x.eventId).length}`,
+    `Facts propuestos: ${persisted.filter(x => x.factId).length}`,
+    '',
+    'Señales:',
+    ...signals.map(s => `- ${s.label || s.area}: ${s.nextAction}`),
+    '',
+    'Guardrail: no envié pitch, no creé oportunidad y CRM queda en dry-run compacto.'
+  ];
+  return lines.join('\n');
+}
+
+async function handleIa360ClienteActivoBetaLearning({ record, deal, contact }) {
+  const memoryBefore = await lookupIa360MemoryContext({ record, contact }).catch(err => {
+    console.error('[ia360-memory] lookup before reply:', err.message);
+    return { events: [], facts: [] };
+  });
+  const signals = extractIa360MemorySignals({ record, contact, agent: { action: 'cliente_activo_beta_learning' } });
+  if (!signals.length) return false;
+  const persisted = await persistIa360MemorySignals({ record, contact, signals });
+  const memoryAfter = await lookupIa360MemoryContext({ record, contact }).catch(() => memoryBefore);
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: record.contact_number,
+    tags: ['ia360-memory', 'cliente-activo-beta'],
+    customFields: {
+      ia360_memory_last_event_at: new Date().toISOString(),
+      ia360_memory_last_areas: signals.map(s => s.area),
+      ia360_memory_last_lookup_count: (memoryAfter.events || []).length + (memoryAfter.facts || []).length,
+      ia360_cliente_activo_beta_last_reply_kind: 'memory_learning',
+    },
+  }).catch(e => console.error('[ia360-memory] contact marker:', e.message));
+  const reply = buildIa360ClienteActivoBetaReply({ signals, memoryContext: memoryAfter });
+  const ownerReadout = buildIa360OwnerMemoryReadout({ record, signals, persisted });
+  if (!IA360_MEMORY_EGRESS_ON) {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      customFields: {
+        ia360_memory_egress: 'dry_run',
+        ia360_memory_last_reply_preview: reply,
+        ia360_memory_last_owner_readout_preview: ownerReadout,
+      },
+    }).catch(e => console.error('[ia360-memory] dry-run marker:', e.message));
+    console.log('[ia360-memory] contact=%s mode=%s events=%d facts=%d stage=%s egress=dry_run',
+      maskIa360Number(record.contact_number),
+      deal?.memory_mode || 'cliente_activo_beta',
+      persisted.filter(x => x.eventId).length,
+      persisted.filter(x => x.factId).length,
+      deal?.stage_name || '-'
+    );
+    return true;
+  }
+  await enqueueIa360Text({ record, label: 'ia360_cliente_activo_beta_memory_reply', body: reply });
+  sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_ia360_memory_readout',
+    body: ownerReadout,
+    targetContact: record.contact_number,
+    ownerBudget: true,
+  }).catch(e => console.error('[ia360-memory] owner readout:', e.message));
+  console.log('[ia360-memory] contact=%s mode=%s events=%d facts=%d stage=%s',
+    maskIa360Number(record.contact_number),
+    deal?.memory_mode || 'cliente_activo_beta',
+    persisted.filter(x => x.eventId).length,
+    persisted.filter(x => x.factId).length,
+    deal?.stage_name || '-'
+  );
+  return true;
+}
+
 function extractSharedContactsFromRecord(record) {
   if (!record || record.message_type !== 'contacts' || !record.raw_payload) return [];
   try {
@@ -879,7 +1462,19 @@ async function getActiveNonTerminalIa360Deal(record) {
     [pipelineId, record.wa_number, record.contact_number]
   );
   const deal = rows[0];
-  if (!deal) return null;
+  if (!deal) {
+    const contact = await loadIa360ContactContext(record).catch(() => null);
+    if (isIa360ClienteActivoBetaContact(contact)) {
+      return {
+        id: null,
+        stage_name: 'Cliente activo beta supervisado',
+        stage_type: 'active_client_beta',
+        memory_mode: 'cliente_activo_beta_supervisado',
+        contact_context: contact,
+      };
+    }
+    return null;
+  }
   const txt = String(record.message_body || '').toLowerCase();
   // Reschedule intent: a prospect with an already-booked meeting who wants to move it
   // SHOULD reach the agent (we explicitly invite "escríbeme por aquí" in the confirmation).
@@ -892,8 +1487,21 @@ async function getActiveNonTerminalIa360Deal(record) {
   // agendado que quiere CONSULTAR sus citas debe llegar al agente (list_bookings). Sin
   // esto el gate lo silenciaba estando en "Reunión agendada".
   const wantsList = /(cu[aá]l|cu[aá]nt|qu[eé]).{0,14}(tengo|hay|agend|cita|reuni)|mis (citas|reuni)|ver (mis )?(citas|reuni)|tengo .{0,10}(agend|cita|reuni)/i.test(txt);
-  // Always-terminal = won/lost → never auto-answer.
-  if (deal.stage_type === 'won' || deal.stage_type === 'lost' || deal.stage_name === 'Ganado' || deal.stage_name === 'Perdido / no fit') return null;
+  // Always-terminal = won/lost → never auto-prospect. Explicit client-beta context
+  // is the exception: it can learn/respond with delight guardrails, not sell.
+  if (deal.stage_type === 'won' || deal.stage_type === 'lost' || deal.stage_name === 'Ganado' || deal.stage_name === 'Perdido / no fit') {
+    const contact = await loadIa360ContactContext(record).catch(() => null);
+    if (isIa360ClienteActivoBetaContact(contact) && (deal.stage_type === 'won' || deal.stage_name === 'Ganado')) {
+      return {
+        ...deal,
+        stage_name: 'Cliente activo beta supervisado',
+        stage_type: 'active_client_beta',
+        memory_mode: 'cliente_activo_beta_supervisado',
+        contact_context: contact,
+      };
+    }
+    return null;
+  }
   // "Reunión agendada" pasa solo para reagendar, cancelar o un NUEVO agendamiento
   // (evita re-disparar en mensajes pasivos: "gracias", "ok", smalltalk → siguen en null).
   if (deal.stage_name === 'Reunión agendada' && !wantsReschedule && !wantsBooking && !wantsList) return null;
@@ -999,7 +1607,8 @@ async function reflectIa360ToEspoCrm({ record, agent, channel = 'whatsapp' }) {
       intent: (agent && agent.intent) || null,
       action: (agent && agent.action) || null,
       extracted: (agent && agent.extracted) || {},
-      last_message: record.message_body || '',
+      last_message: buildIa360CrmCompactNote({ record, agent }),
+      transcript_stored: false,
     };
     const res = await fetch(N8N_IA360_UPSERT_WEBHOOK_URL, {
       method: 'POST',
@@ -2475,6 +3084,12 @@ async function handleIa360FreeText(record) {
     const deal = await getActiveNonTerminalIa360Deal(record);
     if (!deal) return; // only inside an active, non-terminal IA360 funnel
     dealFound = true;
+    const contactContext = deal.contact_context || await loadIa360ContactContext(record).catch(() => null);
+    if (deal.memory_mode === 'cliente_activo_beta_supervisado' || isIa360ClienteActivoBetaContact(contactContext)) {
+      const handled = await handleIa360ClienteActivoBetaLearning({ record, deal, contact: contactContext });
+      if (handled) responded = true;
+      return;
+    }
     const agent = await callIa360Agent({ record, stageName: deal.stage_name });
     if (!agent || !agent.reply) {
       // Agent unavailable (n8n down / webhook unregistered) → holding reply, never silence.
@@ -4598,10 +5213,102 @@ const IA360_DIRECTIVE_SECRET = process.env.IA360_DIRECTIVE_SECRET || '';
 const IA360_DIRECTIVE_EGRESS_ON = process.env.IA360_DIRECTIVE_EGRESS === 'on';
 const IA360_DIRECTIVE_ACTIONS = ['free_reply', 'send_template', 'handback_booking', 'owner_notify', 'noop'];
 
+function isIa360InternalAuthorized(req) {
+  const provided = req.get('X-IA360-Directive-Secret') || '';
+  return Boolean(IA360_DIRECTIVE_SECRET && safeEqual(provided, IA360_DIRECTIVE_SECRET));
+}
+
+router.post('/internal/ia360-memory/lookup', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    const record = {
+      wa_number: normalizePhone(b.wa_number || b.contact?.wa_number || ''),
+      contact_number: normalizePhone(b.contact_number || b.contact?.contact_number || b.contact?.wa_id || ''),
+    };
+    if (!record.wa_number || !record.contact_number) {
+      return res.status(422).json({ ok: false, error: 'wa_number_and_contact_number_required' });
+    }
+    const contact = await loadIa360ContactContext(record);
+    const memory = await lookupIa360MemoryContext({ record, contact, limit: Math.min(parseInt(b.limit || '8', 10) || 8, 20) });
+    return res.json({
+      ok: true,
+      schema: 'ia360_memory_lookup.v1',
+      contact: {
+        masked_contact_number: maskIa360Number(record.contact_number),
+        name: contact?.name || '',
+      },
+      facts: memory.facts,
+      events: memory.events,
+      guardrails: {
+        transcript_returned: false,
+        external_send_allowed: false,
+      },
+    });
+  } catch (err) {
+    console.error('[ia360-memory] lookup endpoint error:', err.message);
+    return res.status(500).json({ ok: false, error: 'lookup_failed' });
+  }
+});
+
+router.post('/internal/ia360-memory/capture', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    const incoming = b.payload && typeof b.payload === 'object' ? b.payload : b;
+    if (incoming.schema && incoming.schema !== 'ia360_memory_event.v1') {
+      return res.status(422).json({ ok: false, error: 'unsupported_schema', expected: 'ia360_memory_event.v1' });
+    }
+    const record = {
+      wa_number: normalizePhone(incoming.contact?.wa_number || b.wa_number || ''),
+      contact_number: normalizePhone(incoming.contact?.wa_id || incoming.contact?.contact_number || b.contact_number || ''),
+      contact_name: incoming.contact?.name || '',
+      message_id: incoming.source_message_id || incoming.request_id || `ia360-memory-${Date.now()}`,
+      message_body: '',
+      message_type: 'memory_event',
+    };
+    if (!record.wa_number || !record.contact_number) {
+      return res.status(422).json({ ok: false, error: 'wa_number_and_contact_number_required' });
+    }
+    const contact = await loadIa360ContactContext(record);
+    const signal = {
+      area: incoming.classification?.area || 'operacion_cliente',
+      label: incoming.classification?.area || 'operación cliente',
+      signalType: incoming.classification?.signal_type || 'senal_operativa',
+      summary: incoming.learning?.summary || 'Señal operativa capturada por IA360.',
+      businessImpact: incoming.learning?.business_impact || '',
+      missingData: incoming.learning?.missing_data || '',
+      nextAction: incoming.learning?.next_action || '',
+      affectedProcess: incoming.learning?.affected_process || incoming.classification?.area || 'operación cliente',
+      missingMetric: incoming.learning?.missing_metric || incoming.learning?.missing_data || '',
+      confidence: Number(incoming.classification?.confidence || 0.65),
+      shouldBeFact: Boolean(incoming.learning?.should_be_fact),
+    };
+    const persisted = await persistIa360MemorySignals({ record, contact, signals: [signal] });
+    return res.json({
+      ok: true,
+      schema: 'ia360_memory_capture_result.v1',
+      dry_run: false,
+      ids: persisted.map(item => ({ event_id: item.eventId, fact_id: item.factId })),
+      guardrails: {
+        transcript_stored: false,
+        external_send_allowed: false,
+        crm_sync_status: 'dry_run_compact',
+      },
+    });
+  } catch (err) {
+    console.error('[ia360-memory] capture endpoint error:', err.message);
+    return res.status(500).json({ ok: false, error: 'capture_failed' });
+  }
+});
+
 router.post('/internal/n8n-directive', async (req, res) => {
   // 1) Auth por secreto compartido (timing-safe, reusa safeEqual del modulo)
-  const provided = req.get('X-IA360-Directive-Secret') || '';
-  if (!IA360_DIRECTIVE_SECRET || !safeEqual(provided, IA360_DIRECTIVE_SECRET)) {
+  if (!isIa360InternalAuthorized(req)) {
     return res.status(401).json({ ok: false, error: 'unauthorized' });
   }
   try {
