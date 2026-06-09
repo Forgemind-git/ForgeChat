@@ -1,6 +1,6 @@
 ---
 name: forgechat-ai-agent-skill
-description: Generate a production-ready system prompt for a ForgeChat WhatsApp AI agent (order bot, booking bot, lead-capture bot, etc.). Use this skill WHENEVER the user wants to "write a prompt for an agent", "build a WhatsApp bot prompt", "create a system prompt for a client's chatbot/order assistant/booking assistant", set up a ForgeChat agent, or asks for an agent prompt that uses send_media / Google Sheets tools and a step-by-step conversation flow. First interview the user for the missing details, then assemble the prompt in the exact structure below. Do NOT free-write an agent prompt without this skill — the structure (step-locked flow, tool discipline, verbatim copy, anti-hallucination guardrails) is what makes these bots reliable.
+description: Generate a production-ready system prompt for a ForgeChat WhatsApp AI agent (order bot, booking bot, lead-capture bot, etc.) AND, when a ForgeChat MCP connector is available, build/configure that agent directly in ForgeChat over MCP. Use this skill WHENEVER the user wants to "write a prompt for an agent", "build a WhatsApp bot prompt", "create a system prompt for a client's chatbot/order assistant/booking assistant", "create/build a ForgeChat agent via MCP", set up a ForgeChat agent, or asks for an agent prompt that uses send_media / Google Sheets / HTTP tools and a step-by-step conversation flow. First interview the user for the missing details, then assemble the prompt in the exact structure below; if an MCP connector is connected, optionally create the agent with it (Phase 4). Do NOT free-write an agent prompt without this skill — the structure (step-locked flow, tool discipline, verbatim copy, anti-hallucination guardrails) is what makes these bots reliable.
 ---
 
 # ForgeChat AI Agent Prompt Builder
@@ -112,6 +112,32 @@ The skeleton holds for other transactional agents — swap the nouns and the ste
 - **Lead-capture bot:** no payment; steps collect name → need → budget → contact preference, then append the lead row and send a brochure/media.
 
 Keep all eight design principles regardless of flow.
+
+---
+
+## Phase 4 — Build the agent in ForgeChat over MCP (optional)
+
+Phases 1–3 produce the **system prompt**. If a ForgeChat **MCP connector** is connected, you can also **create and configure the agent directly in ForgeChat** instead of pasting the prompt by hand — Claude drives the build through the MCP tools.
+
+**Connect once:** in ForgeChat → **Admin Settings → MCP Tools**, turn on the master switch + capabilities, **Generate key**, then add the remote connector URL `https://<your-forgechat-domain>/api/mcp/http/<key>` in Claude (Settings → Connectors → Add custom connector). The connector is per-deployment — it manages that instance's data only.
+
+**Golden rule (same as the prompt phase): never invent ids.** Fetch the real options with the discovery tools, let the user choose, summarize, and get an explicit confirmation before `create_agent`.
+
+Build flow:
+1. Confirm the final system prompt from Phase 3 (this becomes the agent's `systemPrompt`).
+2. `list_wa_accounts` → ask which WhatsApp number it runs on.
+3. `list_models` → ask which provider + model; pass `aiModelId` + `llmModel`. An ACTIVE agent needs both; otherwise save `status:"draft"`.
+4. Trigger: `"any"` (every message) or `"keyword"` (ask keyword, match type exact/contains/starts, case sensitivity, session minutes — default 30).
+5. Inbound understanding: set `transcribeAudio:true` to transcribe voice notes (needs an OpenAI key), `acceptImages:true` to let it see images (pick a vision-capable model, e.g. GPT-4o / Claude).
+6. Tools:
+   - **Google Sheets** (per connected Google account): `list_google_accounts` → `search_spreadsheets` (with that `googleAccountId`) → `list_sheet_tabs` → ask which ops (read/append/update), then `add_google_sheets_tool` (`googleAccountId` + spreadsheet + tab + ops).
+   - **HTTP request** (call an external API / device / webhook): `add_http_tool` with method + URL (use `{name}` for path params) + static auth headers + the params the AI fills (each: name, location path/query/body/header, type, description, required).
+7. Media groups (optional): for each, a "when to send" **description** + media (`list_media`) and/or an approved template (`list_templates` → `get_template` to confirm content before using its id).
+8. Summarize the full config, get a "yes", then `create_agent`; attach any tools; report the new agent id and offer to activate it (Go Live).
+
+**MCP tools available** — discovery: `list_wa_accounts`, `list_models`, `list_google_accounts`, `search_spreadsheets`, `list_sheet_tabs`, `list_media`, `list_templates`, `get_template`, `list_agents`, `get_agent`. Mutations: `create_agent`, `update_agent`, `add_google_sheets_tool`, `add_http_tool`, `add_tool`, `update_tool`, `delete_tool`, `delete_agent`. The master switch + per-capability toggles in Admin Settings → MCP Tools gate what's allowed (a disabled capability returns 403); always confirm destructive actions first.
+
+**Constraints to respect** (the server enforces them too): OpenAI / Anthropic providers only; one active agent per WhatsApp number; a keyword-triggered active agent needs a keyword; context window 1–100 messages; max tool iterations 1–20; trigger session 1–1440 minutes; `acceptImages` requires a vision-capable model.
 
 ---
 
