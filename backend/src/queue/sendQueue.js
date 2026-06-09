@@ -9,6 +9,7 @@ const { getAccountWithToken } = require('../routes/whatsappAccounts');
 const { sendText, sendTemplate, sendMedia, sendInteractive, sendLocation, sendContacts, sendReaction } = require('../integrations/metaSend');
 const { markSent, markFailed } = require('../services/messageSender');
 const { markAccountHealth, classifyMetaError } = require('../services/accountHealth');
+const { validateTemplateSend } = require('../integrations/templateValidator');
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
 const QUEUE_NAME = 'forgecrm-send';
@@ -58,6 +59,23 @@ async function processJob(job) {
     phoneNumberId: account.phoneNumberId,
     to,
   };
+
+  // Universal pre-Meta guard: block any template whose outgoing component shape
+  // (body/header-media/URL-button param counts) does not match the
+  // Meta-registered spec. This is the last choke point every template send
+  // funnels through, so it catches mismatches from ALL paths (owner pipe,
+  // reminders, automation, broadcasts, test-send) before they reach Meta and
+  // burn as #132000 / #132012. Thrown as skipRetry so the optimistic row is
+  // marked failed once, with the exact reason, and nothing hits Meta.
+  if (kind === 'template') {
+    const v = await validateTemplateSend(account, payload.name, payload.languageCode, payload.components);
+    if (!v.valid) {
+      const e = new Error(`template "${payload.name}" blocked pre-Meta: ${v.errors.join('; ')} [authority=${v.source}]`);
+      e.skipRetry = true;
+      e.templateBlocked = true;
+      throw e;
+    }
+  }
 
   let result;
   try {

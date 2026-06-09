@@ -1525,6 +1525,16 @@ async function resolveTemplateHeaderMediaId(tpl, account) {
   return sync.meta_media_id;
 }
 
+const { validateTemplateSend } = require('../integrations/templateValidator');
+
+// Render a template body to plain text using the same param logic as
+// buildIa360TemplateComponents ({{1}} = contact first name, other {{n}} = sample).
+function renderIa360TemplateBody(tpl, record) {
+  const samples = parseTemplateSamples(tpl.samples);
+  return String(tpl.body || '').replace(/\{\{\s*(\d+)\s*\}\}/g, (_, k) =>
+    k === '1' ? firstNameForTemplate(record) : String(samples[k] || ' '));
+}
+
 async function buildIa360TemplateComponents(tpl, account, record) {
   const components = [];
   const headerType = String(tpl.header_type || 'NONE').toUpperCase();
@@ -1604,6 +1614,23 @@ async function enqueueIa360Template({ record, label, templateName, templateId = 
   } catch (err) {
     console.error('[ia360-owner-pipe] template components error:', err.message);
     return { ok: false, status: 'template_components_error', error: err.message };
+  }
+
+  // Pre-Meta validation against the registered template spec. If the
+  // outgoing component shape would be rejected by Meta (#132000/#132012),
+  // do NOT send a broken template. Fall back to free text (rendered body):
+  // inside the 24h service window Meta delivers it; outside it Meta rejects
+  // free text and the row is marked failed (logged). That realizes
+  // "ventana abierta -> texto libre; cerrada -> no enviar y avisar".
+  try {
+    const v = await validateTemplateSend(account, tpl.name, tpl.language || 'es_MX', components);
+    if (!v.valid) {
+      console.error(`[ia360-owner-pipe] template "${tpl.name}" invalid vs Meta (${v.source}): ${v.errors.join('; ')} -> free-text fallback`);
+      const sent = await enqueueIa360Text({ record, label: `${label}_textfallback`, body: renderIa360TemplateBody(tpl, record) });
+      return { ok: !!sent, status: sent ? 'text_fallback' : 'error', error: sent ? null : 'template invalid and text fallback failed' };
+    }
+  } catch (err) {
+    console.error('[ia360-owner-pipe] template validation error:', err.message);
   }
   const handlerFor = `${record.message_id}:${label}`;
   const localId = await insertPendingRow({
