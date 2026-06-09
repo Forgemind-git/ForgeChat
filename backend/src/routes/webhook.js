@@ -1033,17 +1033,36 @@ async function enqueueIa360Interactive({ record, label, messageBody, interactive
   if (resolved.duplicate || resolved.error) return false;
   const { account } = resolved;
 
+  // Audit visibility: persist the full interactive body so the owner can see the
+  // exact selector text + options the client received (not just the short label).
+  let auditBody = messageBody;
+  try {
+    const bodyText = interactive && interactive.body && interactive.body.text ? String(interactive.body.text) : '';
+    const act = (interactive && interactive.action) || {};
+    let opts = [];
+    if (Array.isArray(act.buttons)) {
+      opts = act.buttons.map(b => (b && b.reply && b.reply.title) ? b.reply.title : '').filter(Boolean);
+    } else if (Array.isArray(act.sections)) {
+      opts = act.sections.flatMap(s => Array.isArray(s.rows) ? s.rows.map(r => (r && r.title) ? r.title : '') : []).filter(Boolean);
+    }
+    const parts = [];
+    if (bodyText) parts.push(bodyText);
+    if (opts.length) parts.push('Opciones: ' + opts.join(' | '));
+    if (parts.length) auditBody = messageBody + ' — ' + parts.join(' — ');
+  } catch (e) { /* keep label-only body on any parsing issue */ }
+
   const localId = await insertPendingRow({
     account,
     toNumber: record.contact_number,
     messageType: 'interactive',
-    messageBody,
+    messageBody: auditBody,
     templateMeta: {
       ux: 'ia360_lite',
       label,
       ia360_handler_for: dedupSuffix ? record.message_id + dedupSuffix : record.message_id,
       source: 'webhook_interactive_reply',
     },
+    rawPayloadExtra: interactive,
   });
   await enqueueSend({
     kind: 'interactive',
@@ -1502,9 +1521,11 @@ async function getActiveNonTerminalIa360Deal(record) {
     }
     return null;
   }
-  // "Reunión agendada" pasa solo para reagendar, cancelar o un NUEVO agendamiento
-  // (evita re-disparar en mensajes pasivos: "gracias", "ok", smalltalk → siguen en null).
-  if (deal.stage_name === 'Reunión agendada' && !wantsReschedule && !wantsBooking && !wantsList) return null;
+  // Gap#1: un contacto YA agendado que manda texto SUSTANTIVO (una duda, una pregunta)
+  // debe recibir respuesta conversacional del agente. Solo silenciamos texto PASIVO
+  // ("gracias"/"ok"/"nos vemos"/smalltalk) para no re-disparar el agente sin necesidad;
+  // el resto pasa al agente y cae al reply DEFAULT abajo.
+  if (deal.stage_name === 'Reunión agendada' && !wantsReschedule && !wantsBooking && !wantsList && isIa360PassiveMessage(record.message_body)) return null;
   return deal;
 }
 
@@ -1563,6 +1584,11 @@ async function callIa360Agent({ record, stageName }) {
 
   const url = primaryIa360AgentUrl;
   if (!url) return null;
+  // n8n agent latency is ~16s in normal conditions; bound the call at 30s so a
+  // hung n8n fails fast instead of riding undici's ~300s default. Empty/partial
+  // bodies (n8n returning 200 with no JSON) degrade to null → holding reply.
+  const ia360AgentController = new AbortController();
+  const ia360AgentTimer = setTimeout(() => ia360AgentController.abort(), 30000);
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -1573,12 +1599,25 @@ async function callIa360Agent({ record, stageName }) {
         history,
         source: 'forgechat-ia360-webhook',
       })),
+      signal: ia360AgentController.signal,
     });
     if (!res.ok) { console.error('[ia360-agent] failed:', res.status); return null; }
-    return await res.json();
+    const text = await res.text();
+    if (!text || !text.trim()) {
+      console.error('[ia360-agent] empty body: status=%s len=%s', res.status, text ? text.length : 0);
+      return null;
+    }
+    try {
+      return JSON.parse(text);
+    } catch (parseErr) {
+      console.error('[ia360-agent] bad JSON: status=%s len=%s err=%s', res.status, text.length, parseErr.message);
+      return null;
+    }
   } catch (err) {
-    console.error('[ia360-agent] error:', err.message);
+    console.error('[ia360-agent] error:', err.name === 'AbortError' ? 'timeout 30000ms' : err.message);
     return null;
+  } finally {
+    clearTimeout(ia360AgentTimer);
   }
 }
 
@@ -2838,6 +2877,41 @@ async function loadIa360Bookings(contactNumber) {
   }
 }
 
+// Gap#5: list_bookings debe reflejar la REALIDAD aunque el cache `ia360_bookings` se
+// haya desincronizado (append fallido, edición directa en Calendar, limpieza). Unimos
+// el cache con las citas FUTURAS registradas en `ia360_meeting_links` (fuente durable
+// escrita al agendar), dedup por event_id. El cancel borra de AMBOS (removeIa360Booking),
+// así que una cita cancelada NO reaparece aquí. Solo se usa para LISTAR (read-only); el
+// cancel/append/find siguen usando loadIa360Bookings (que conserva zoom_id).
+async function loadIa360BookingsForList(contactNumber) {
+  const cached = await loadIa360Bookings(contactNumber);
+  try {
+    const { rows } = await pool.query(
+      `SELECT event_id, start_utc
+         FROM coexistence.ia360_meeting_links
+        WHERE contact_number = $1 AND kind = 'cal' AND start_utc > now()
+        ORDER BY start_utc ASC`,
+      [contactNumber]
+    );
+    const seen = new Set(cached.map(b => String(b.event_id || '').toLowerCase()).filter(Boolean));
+    const merged = cached.slice();
+    for (const r of rows) {
+      const eid = String(r.event_id || '').toLowerCase();
+      if (!eid || seen.has(eid)) continue;
+      seen.add(eid);
+      merged.push({ start: r.start_utc ? new Date(r.start_utc).toISOString() : '', event_id: r.event_id || '', zoom_id: '' });
+    }
+    merged.sort((a, b) => String(a.start || '').localeCompare(String(b.start || '')));
+    if (merged.length !== cached.length) {
+      console.log('[ia360-list] reconciled contact=%s cache=%d -> merged=%d (meeting_links)', contactNumber, cached.length, merged.length);
+    }
+    return merged;
+  } catch (err) {
+    console.error('[ia360-multicita] loadIa360BookingsForList error:', err.message);
+    return cached;
+  }
+}
+
 // Append idempotente: agrega una cita al array `ia360_bookings` (read-modify-write).
 // Dedup por event_id (case-insensitive). Conserva los campos sueltos por compat.
 async function appendIa360Booking({ waNumber, contactNumber, booking }) {
@@ -2995,6 +3069,11 @@ async function removeIa360Booking({ waNumber, contactNumber, eventId }) {
   extra.ia360_booking_event_id = next.length ? (next[next.length - 1].event_id || '') : '';
   extra.ia360_booking_zoom_id = next.length ? (next[next.length - 1].zoom_id || '') : '';
   extra.ia360_booking_start = next.length ? (next[next.length - 1].start || '') : '';
+  // Gap#5: mantener `ia360_meeting_links` en sync para que list_bookings (que también
+  // lee de ahí) NO resucite una cita cancelada (la tabla no tiene columna status).
+  try {
+    await pool.query(`DELETE FROM coexistence.ia360_meeting_links WHERE lower(event_id) = lower($1)`, [String(eventId || '')]);
+  } catch (e) { console.error('[ia360-multicita] meeting_links cleanup error:', e.message); }
   await mergeContactIa360State({ waNumber, contactNumber, customFields: extra });
   return next;
 }
@@ -3115,7 +3194,7 @@ async function handleIa360FreeText(record) {
     // Reflejo CRM por interaccion (best-effort; no bloquea dispatch ni regresa agenda).
     reflectIa360ToEspoCrm({ record, agent, channel: 'whatsapp' }).catch(() => {});
     if (agent.action === 'list_bookings' || agent.intent === 'list_bookings') {
-      const bookings = await loadIa360Bookings(record.contact_number);
+      const bookings = await loadIa360BookingsForList(record.contact_number);
       console.log('[ia360-list] contact=%s bookings=%d', record.contact_number, bookings.length);
       let body;
       if (!bookings.length) {
@@ -3233,12 +3312,17 @@ async function handleIa360FreeText(record) {
       // abajo, que consulta disponibilidad real y ofrece el menú multi-día. Por eso NO
       // hacemos return aquí — solo seguimos el flujo. El cfm_ posterior hará append a
       // ia360_bookings (segunda cita), sin tocar la primera.
+      // Gap#1: SOLO una intención REAL de reagendar dispara el handoff a Alek. Un mensaje
+      // normal (nurture/provide_info/ask_pain/smalltalk) NO es reagendar: debe CAER al
+      // reply DEFAULT de abajo (respuesta conversacional), no al handoff de reschedule.
+      const isReschedule = agent.action === 'reschedule' || agent.intent === 'reschedule'
+        || /reagend|reprogram|posponer|adelantar|recorr|mover la (reuni|cita|llamad)|cambi(ar|a|o)?.{0,18}(d[ií]a|hora|fecha|horario)|otro d[ií]a|otra hora|otro horario|otra fecha/i.test(String(record.message_body || ''));
       if (agent.action === 'offer_slots' || agent.action === 'book') {
         // fall-through: el control sale del bloque "Reunión agendada" y continúa al
         // handler de offer_slots/book más abajo (no return).
-      } else {
-        // ── REAGENDAR (u otra intención no-agendamiento): conserva ack + handoff (Alek
-        // mueve el evento a mano via la tarea de EspoCRM). NO se ofrece "Aprobar".
+      } else if (isReschedule) {
+        // ── REAGENDAR: conserva ack + handoff (Alek mueve el evento a mano via la tarea
+        // de EspoCRM). NO se ofrece "Aprobar".
         await enqueueIa360Text({
           record,
           label: 'ia360_ai_reschedule_request',
@@ -3282,6 +3366,12 @@ async function handleIa360FreeText(record) {
     //  - sin fecha (o "¿cuando si hay?"): spread multi-dia desde manana (ignora el
     //    date del LLM, que a veces viene mal). El menu ya trae el dia en cada fila.
     if (agent.action === 'offer_slots' || agent.action === 'book') {
+      // COMPUERTA offer_slots: NO empujar el calendario. El agente puede inferir
+      // agendar de una senal debil; pedimos confirmacion explicita. Solo el boton
+      // gate_slots_yes (manejado abajo con return) muestra los horarios.
+      await enqueueIa360Interactive({ record, label: 'ia360_gate_offer_slots', messageBody: 'IA360: confirmar horarios', interactive: { type: 'button', body: { text: (agent.reply ? agent.reply + String.fromCharCode(10) + String.fromCharCode(10) : '') + '¿Quieres que te pase horarios para una llamada con Alek?' }, action: { buttons: [ { type: 'reply', reply: { id: 'gate_slots_yes', title: 'Sí, ver horarios' } }, { type: 'reply', reply: { id: 'gate_slots_no', title: 'Todavía no' } } ] } } });
+      responded = true;
+      return;
       try {
         const url = process.env.N8N_IA360_AVAILABILITY_WEBHOOK_URL;
         // Sanitiza el date del LLM: solo una fecha ISO real (YYYY-MM-DD) es usable. A
@@ -4552,7 +4642,11 @@ async function handleIa360LiteInteractive(record) {
   // CFM-STEP: re-mostrar el menú de horarios ("Ver otras"). Re-dispara el spread
   // multi-día (nextAvailable) y reconstruye la lista interactiva inline (mismo shape
   // que el path de día). try/catch terminal: si falla, log + texto de respaldo.
-  if (replyId === 'reslots') {
+  if (replyId === 'gate_slots_no') {
+    await enqueueIa360Text({ record, label: 'ia360_gate_slots_no', body: 'Va, sin prisa. Cuando quieras ver horarios para hablar con Alek, dime y te paso opciones.' });
+    return;
+  }
+  if (replyId === 'reslots' || replyId === 'gate_slots_yes') {
     try {
       const availUrl = process.env.N8N_IA360_AVAILABILITY_WEBHOOK_URL;
       let spread = null;
@@ -4662,10 +4756,18 @@ async function handleIa360LiteInteractive(record) {
       dateStyle: 'medium',
       timeStyle: 'short',
     }).format(new Date(booking.start));
+    let calLink = "";
+    try {
+      const _calToken = require("crypto").randomBytes(18).toString("base64url");
+      const _endUtc = (confirmedSlot && confirmedSlot.end) || new Date(new Date(booking.start).getTime() + 3600000).toISOString();
+      const _exp = new Date(new Date(booking.start).getTime() + 36*3600000).toISOString();
+      await pool.query("INSERT INTO coexistence.ia360_meeting_links (token,event_id,contact_number,kind,start_utc,end_utc,summary,zoom_join_url,expires_at) VALUES ($1,$2,$3,\x27cal\x27,$4,$5,$6,$7,$8) ON CONFLICT (token) DO NOTHING", [_calToken, booking.calendarEventId || "", record.contact_number, booking.start, _endUtc, "Reunion con Alek (TransformIA)", booking.zoomJoinUrl || "", _exp]);
+      calLink = "\n\nAgrega la cita a tu calendario:\nhttps://wa.geekstudio.dev/api/r/" + _calToken;
+    } catch (clErr) { console.error("[ia360-cal] booking token failed:", clErr.message); }
     await enqueueIa360Text({
       record,
       label: 'ia360_100m_schedule_confirmed',
-      body: `Listo, tu reunión con Alek quedó agendada para ${confirmedTime} (hora CDMX).\n\n${booking.zoomJoinUrl ? 'Aquí tu enlace de Zoom para conectarte:\n' + booking.zoomJoinUrl : 'En un momento te confirmo el enlace de Zoom.'}\n\n¡Nos vemos!`,
+      body: `Listo, tu reunión con Alek quedó agendada para ${confirmedTime} (hora CDMX).\n\n${booking.zoomJoinUrl ? 'Aquí tu enlace de Zoom para conectarte:\n' + booking.zoomJoinUrl : 'En un momento te confirmo el enlace de Zoom.'}${calLink}\n\n¡Nos vemos!`,
     });
     // W4 D2 — ofrecer "Enviar contexto" ahora que YA hay slot (el helper stage-aware lo manda a
     // pre_call). Aditivo: NO altera el mensaje de confirmacion (critico) y no rompe el booking.

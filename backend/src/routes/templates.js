@@ -809,6 +809,23 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
     const { account, error } = await resolveAccount({ accountId: tpl.whatsapp_account_id });
     if (error) return res.status(400).json({ error });
 
+    // Guardrail (Sergio/Jorge bug): a template whose body has variables MUST
+    // receive every parameter, else WhatsApp renders the literal "{{1}}".
+    // Refuse the send instead of leaking a placeholder.
+    const bodyVars = extractVars(tpl.body);
+    const missingVars = bodyVars.filter(v => !String(sampleValues[v] ?? "").trim());
+    if (missingVars.length > 0) {
+      return res.status(400).json({
+        error: `Template "${tpl.name}" has body variables ${missingVars.map(v => `{{${v}}}`).join(", ")} without values; refusing to send (would render literal placeholders). Provide sampleValues.`,
+      });
+    }
+    // Render the body so chat_history.message_body reflects what WhatsApp
+    // actually renders (real values, not "{{1}}").
+    const renderedBody = bodyVars.reduce(
+      (acc, v) => acc.split(`{{${v}}}`).join(String(sampleValues[v])),
+      tpl.body || ""
+    );
+
     // Build components from sampleValues (sorted numerically by var index)
     const keys = Object.keys(sampleValues).sort((a, b) => +a - +b);
     const components = [];
@@ -829,7 +846,7 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
     }
 
     const localId = await insertPendingRow({
-      account, toNumber: to, messageType: 'template', messageBody: tpl.body || `Template: ${tpl.name}`,
+      account, toNumber: to, messageType: 'template', messageBody: renderedBody || tpl.body || `Template: ${tpl.name}`,
     });
     await enqueueSend({
       kind: 'template',

@@ -9,6 +9,8 @@ const pool = require('./db');
 const { router: authRouter, authMiddleware, ensureTables } = require('./auth');
 const { router: messagesRouter } = require('./routes/messages');
 const { router: webhookRouter } = require('./routes/webhook');
+const { router: ia360IntakeRouter } = require('./routes/ia360-intake');
+const { router: ia360CalendarRouter } = require('./routes/ia360-calendar');
 const { router: categoriesRouter } = require('./routes/categories');
 const { router: contactFieldsRouter } = require('./routes/contactFields');
 const { router: usersRouter } = require('./routes/users');
@@ -24,6 +26,7 @@ const { router: dashboardRouter } = require('./routes/dashboard');
 const { router: pipelinesRouter } = require('./routes/pipelines');
 const { startWorker: startMediaWorker, shutdown: shutdownMediaQueue } = require('./queue/mediaQueue');
 const { startSendWorker, shutdownSendQueue } = require('./queue/sendQueue');
+const { startReminderScheduler } = require('./services/ia360Reminders');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -99,6 +102,8 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 
 // Public routes (webhook from n8n — no auth)
 app.use('/api', webhookRouter);
+app.use('/api', ia360IntakeRouter); // B-28 intake (publico, secreto compartido)
+app.use('/api', ia360CalendarRouter); // IA360 add-to-calendar (publico, token)
 
 // Auth routes (public)
 app.use('/api', authRouter);
@@ -134,6 +139,7 @@ async function start() {
   );
   startMediaWorker();
   startSendWorker();
+  startReminderScheduler(); // IA360 per-meeting reminders (self-contained)
 
   // Stale-pause sweeper: mark paused automation executions that have outlived
   // their expires_at as error. Resume already inline-checks expires_at, so

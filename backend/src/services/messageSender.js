@@ -45,7 +45,7 @@ async function resolveAccount({ accountId, fromPhoneNumber }) {
  * Insert an optimistic chat_history row that the UI shows as "sending…".
  * Returns the local message_id used so caller can correlate later updates.
  */
-async function insertPendingRow({ account, toNumber, messageType, messageBody, mediaUrl = null, mediaMime = null, templateMeta = null, contextMessageId = null }) {
+async function insertPendingRow({ account, toNumber, messageType, messageBody, mediaUrl = null, mediaMime = null, templateMeta = null, contextMessageId = null, rawPayloadExtra = null }) {
   const messageId = localMessageId();
   await pool.query(
     `INSERT INTO coexistence.chat_history
@@ -61,7 +61,7 @@ async function insertPendingRow({ account, toNumber, messageType, messageBody, m
       String(toNumber).replace(/\D/g, ''),
       messageType,
       messageBody || null,
-      JSON.stringify({ origin: 'outbound', queued_at: new Date().toISOString() }),
+      JSON.stringify({ origin: 'outbound', queued_at: new Date().toISOString(), ...(rawPayloadExtra ? { interactive: rawPayloadExtra } : {}) }),
       mediaUrl,
       mediaMime,
       templateMeta ? JSON.stringify(templateMeta) : null,
