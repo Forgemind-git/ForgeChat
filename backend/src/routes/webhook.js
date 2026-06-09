@@ -5,7 +5,7 @@ const { safeEqual, verifyMetaSignature } = require('../util/webhookSignature');
 const { evaluateTriggers, resumeAutomation } = require('../engine/automationEngine');
 const { markPending, MEDIA_TYPES } = require('../services/mediaDownloader');
 const { enqueueMediaDownload } = require('../queue/mediaQueue');
-const { resolveAccount, insertPendingRow } = require('../services/messageSender');
+const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('../services/messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 
@@ -2727,6 +2727,258 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
     targetContact,
     ownerBudget: true,
   });
+  // APPROVE-SEND: tras el readout, el owner decide con una tarjeta (mismo patrón
+  // que la tarjeta de cancelación). Solo si el payload realmente requiere
+  // aprobación humana (no para solo_guardar / no_contactar / copy bloqueado).
+  if (payload.approval.status === 'requires_alek' && payload.sequence_candidate.copy_status !== 'blocked') {
+    await sendIa360ApproveCard({ record, targetContact, name, flow, sequence });
+  }
+}
+
+// ============================================================================
+// APPROVE-SEND — "último metro" del P0: el owner aprueba y el opener de la
+// secuencia sale al CONTACTO (egress único vía messageSender/sendQueue).
+// Gate de seguridad: solo números en IA360_APPROVE_SEND_ALLOWLIST (env, CSV).
+// Sin allowlist o fuera de ella → solo readout, NUNCA envía.
+// ============================================================================
+
+function ia360ApproveSendAllowlist() {
+  return String(process.env.IA360_APPROVE_SEND_ALLOWLIST || '')
+    .split(',')
+    .map(s => s.replace(/\D/g, ''))
+    .filter(Boolean);
+}
+
+async function sendIa360ApproveCard({ record, targetContact, name, flow, sequence }) {
+  return sendOwnerInteractive({
+    record,
+    label: `owner_approve_card_${targetContact}_${sequence.id}`,
+    messageBody: `IA360: aprobar envío a ${name}`,
+    targetContact,
+    ownerBudget: true,
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: 'Aprobar envío' },
+      body: {
+        text: `Alek, el borrador para ${name} (${flow.personaContext}, secuencia ${sequence.label}) está arriba en el readout. ¿Qué hago?`,
+      },
+      footer: { text: 'Solo envío con tu aprobación explícita' },
+      action: {
+        button: 'Decidir',
+        sections: [{
+          title: 'Acciones',
+          rows: [
+            { id: `owner_approve_send:${targetContact}:${sequence.id}`, title: 'Aprobar y enviar', description: 'Envío el opener al contacto y avanzo el pipeline' },
+            { id: `owner_approve_edit:${targetContact}:${sequence.id}`, title: 'Editar copy', description: 'Queda en borrador; lo editas antes de enviar' },
+            { id: `owner_approve_keep:${targetContact}:${sequence.id}`, title: 'Solo guardar', description: 'Captura sin envío ni secuencia' },
+            { id: `owner_approve_dnc:${targetContact}:${sequence.id}`, title: 'No contactar', description: 'Exclusión operativa, sin envío' },
+            { id: `owner_approve_manual:${targetContact}:${sequence.id}`, title: 'Tomar manual', description: 'Tú le escribes; muevo el deal a Requiere Alek' },
+          ],
+        }],
+      },
+    },
+  });
+}
+
+async function ia360ApproveSendDeny({ record, targetContact, reason, body }) {
+  if (targetContact) {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: targetContact,
+      tags: ['ia360-approve-send-blocked'],
+      customFields: {
+        ia360_approve_send_blocked_at: new Date().toISOString(),
+        ia360_approve_send_blocked_reason: reason,
+      },
+    }).catch(e => console.error('[ia360-approve] persist deny:', e.message));
+  }
+  console.warn('[ia360-approve] blocked target=%s reason=%s', targetContact || '-', reason);
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_approve_send_blocked',
+    body,
+    targetContact,
+    ownerBudget: true,
+  });
+}
+
+async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }) {
+  const deny = (reason, body) => ia360ApproveSendDeny({ record, targetContact, reason, body });
+  if (!targetContact) return deny('missing_target', 'No encontré el número del contacto de esa aprobación. No envié nada.');
+  if (isIa360OwnerNumber(targetContact)) return deny('target_is_owner', 'Ese número es el tuyo (owner). No envío secuencias al owner.');
+  if (normalizePhone(targetContact) === normalizePhone(record.wa_number)) return deny('target_is_system_number', 'Ese número es el del propio bot. No envié nada.');
+
+  const found = findIa360SequenceFlow(sequenceId);
+  if (!found) return deny('unknown_sequence', `La secuencia "${sequenceId}" no está en el catálogo persona-first. No envié nada.`);
+  const { flow, sequence } = found;
+
+  // Contexto: el tap debe responder a la tarjeta de aprobación de ESTE contacto+secuencia.
+  const ctx = await validateIa360OwnerContext({
+    record,
+    targetContact,
+    action: 'owner_approve_send',
+    expectedLabelPrefix: `owner_approve_card_${targetContact}_`,
+  });
+  if (!ctx.ok) {
+    await blockIa360OwnerContextMismatch({
+      record,
+      targetContact,
+      action: 'owner_approve_send',
+      reason: ctx.reason,
+      expectedLabel: `owner_approve_card_${targetContact}_${sequenceId}`,
+    });
+    return;
+  }
+  const cardSeq = String(ctx.label || '').slice(`owner_approve_card_${targetContact}_`.length);
+  if (cardSeq !== String(sequenceId)) {
+    await blockIa360OwnerContextMismatch({
+      record,
+      targetContact,
+      action: 'owner_approve_send',
+      reason: 'card_sequence_mismatch',
+      expectedLabel: `owner_approve_card_${targetContact}_${sequenceId}`,
+    });
+    return;
+  }
+
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  if (!contact) return deny('contact_not_found', `No encontré al contacto ${targetContact} en la base. No envié nada.`);
+  const name = contact.name || targetContact;
+
+  // do_not_contact: por tag o por estado persona-first previo.
+  const { rows: dncRows } = await pool.query(
+    `SELECT (tags ? 'no-contactar') AS dnc FROM coexistence.contacts WHERE wa_number=$1 AND contact_number=$2 LIMIT 1`,
+    [record.wa_number, targetContact]
+  );
+  const pf = contact.custom_fields?.ia360_persona_first || null;
+  if (dncRows[0]?.dnc || pf?.classification?.relationship_context === 'no_contactar' || pf?.contact?.consent_status === 'do_not_contact') {
+    return deny('do_not_contact', `${name} está marcado como NO CONTACTAR. No envié nada.`);
+  }
+
+  // El estado persistido debe coincidir con el último readout (misma secuencia).
+  if (!pf || pf.sequence_candidate?.id !== String(sequenceId)) {
+    return deny('readout_state_mismatch', `El estado guardado de ${name} no coincide con el último readout (${sequenceId}). Repite la selección de secuencia. No envié nada.`);
+  }
+  if (pf.sequence_candidate.copy_status === 'blocked') {
+    return deny('copy_blocked', `El borrador de ${name} está bloqueado (placeholder sin resolver). No envié nada.`);
+  }
+
+  // GATE DE SEGURIDAD: allowlist de prueba. Sin allowlist o fuera de ella → NO envía.
+  const allow = ia360ApproveSendAllowlist();
+  if (!allow.length || !allow.includes(normalizePhone(targetContact))) {
+    return deny('not_in_test_allowlist', `Gate de seguridad: ${name} (${targetContact}) no está en IA360_APPROVE_SEND_ALLOWLIST. Aprobación registrada pero NO envié nada al contacto.`);
+  }
+
+  // Ventana de servicio 24h: dentro → texto libre (el draft). Fuera → se requiere
+  // template aprobado por Meta (validado vía templateValidator en enqueueIa360Template);
+  // las secuencias persona-first aún no tienen template mapeado → bloquear con aviso.
+  const { account, error: accErr } = await resolveAccount({ fromPhoneNumber: record.wa_number });
+  if (accErr || !account) return deny('account_resolve_failed', 'No pude resolver la cuenta de WhatsApp. No envié nada.');
+  const secs = await secondsSinceLastIncoming({ accountPhoneNumberId: account.phone_number_id, contactNumber: targetContact });
+  const insideWindow = secs != null && secs < 23.5 * 3600;
+  const targetRecord = { ...record, contact_number: targetContact, contact_name: name };
+  let sendResult = { ok: false, status: 'not_sent', error: null };
+  const openerLabel = `ia360_seq_opener_${sequence.id}`;
+  if (insideWindow) {
+    const sent = await sendIa360DirectText({
+      record,
+      toNumber: targetContact,
+      label: openerLabel,
+      body: pf.sequence_candidate.draft,
+    });
+    if (!sent) return deny('enqueue_failed', `No pude encolar el opener para ${name}. No se envió.`);
+    const status = await waitForIa360OutboundStatus(`${record.message_id}:direct:${targetContact}`);
+    sendResult = { ok: String(status?.status || '').toLowerCase() === 'sent', status: status?.status || 'unknown', error: status?.error_message || null, message_id: status?.message_id || null };
+  } else if (sequence.metaTemplateName) {
+    const res = await enqueueIa360Template({ record: targetRecord, label: openerLabel, templateName: sequence.metaTemplateName });
+    sendResult = { ok: res.ok, status: res.status, error: res.error || null, message_id: null };
+  } else {
+    return deny('outside_window_no_template', `${name} está fuera de la ventana de 24h y la secuencia ${sequence.id} no tiene template aprobado por Meta. No envié nada.`);
+  }
+
+  // Persistencia de la aprobación + resultado del envío.
+  const nowIso = new Date().toISOString();
+  const pfUpdated = {
+    ...pf,
+    dry_run: false,
+    approval: { status: 'approved', approved_by: IA360_OWNER_NUMBER, approved_at: nowIso, reason: 'Aprobado por Alek desde la tarjeta de aprobación.' },
+    guardrail: { ...(pf.guardrail || {}), current_block: 'none', external_send_allowed: true, allowed_recipient: targetContact },
+    send: {
+      sent_at: nowIso,
+      send_status: sendResult.status,
+      send_mode: insideWindow ? 'text_inside_window' : 'template_outside_window',
+      outbound_message_id: sendResult.message_id || null,
+      error: sendResult.error || null,
+    },
+  };
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    tags: ['ia360-approve-send', `approved-seq:${sequence.id}`],
+    customFields: {
+      ia360_persona_first: pfUpdated,
+      approved_by: IA360_OWNER_NUMBER,
+      approved_at: nowIso,
+      sent_at: nowIso,
+      send_status: sendResult.status,
+      outbound_message_id: sendResult.message_id || null,
+    },
+  }).catch(e => console.error('[ia360-approve] persist approval:', e.message));
+
+  if (!sendResult.ok) {
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_approve_send_failed',
+      body: `Aprobado, pero el envío a ${name} quedó en estado "${sendResult.status}"${sendResult.error ? ' (' + sendResult.error + ')' : ''}. Revisa chat_history; no avancé el pipeline.`,
+      targetContact,
+      ownerBudget: true,
+    });
+    return;
+  }
+
+  // Avance del pipeline: el opener salió → "Diagnóstico enviado".
+  await syncIa360Deal({
+    record: targetRecord,
+    targetStageName: 'Diagnóstico enviado',
+    titleSuffix: 'Opener aprobado',
+    notes: `Opener de secuencia ${sequence.id} aprobado por Alek y enviado (${insideWindow ? 'texto, ventana abierta' : 'template'}). Stage → Diagnóstico enviado.`,
+  }).catch(e => console.error('[ia360-approve] syncIa360Deal:', e.message));
+
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_approve_send_done',
+    body: `Listo. Envié el opener de "${sequence.label}" a ${name} (${targetContact}) y moví su deal a "Diagnóstico enviado".`,
+    targetContact,
+    ownerBudget: true,
+  });
+}
+
+async function handleIa360OwnerApproveManual({ record, targetContact }) {
+  const contact = await loadIa360ContactForOwnerAction({ waNumber: record.wa_number, contactNumber: targetContact });
+  const name = contact?.name || targetContact;
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    tags: ['ia360-tomar-manual'],
+    customFields: { ia360_owner_takeover_at: new Date().toISOString(), stage: 'Requiere Alek' },
+  }).catch(e => console.error('[ia360-approve] manual persist:', e.message));
+  await syncIa360Deal({
+    record: { ...record, contact_number: targetContact, contact_name: name },
+    targetStageName: 'Requiere Alek',
+    titleSuffix: 'Tomado manual',
+    notes: 'Alek tomó el contacto manualmente desde la tarjeta de aprobación. Sin envío del bot.',
+  }).catch(e => console.error('[ia360-approve] manual deal:', e.message));
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'owner_approve_manual_ack',
+    body: `Ok, tú le escribes a ${name}. No envié nada y moví su deal a "Requiere Alek".`,
+    targetContact,
+    ownerBudget: true,
+  });
 }
 
 async function handleIa360TerminalVcardChoice({ record, targetContact, terminalChoice }) {
@@ -4149,6 +4401,27 @@ async function handleIa360LiteInteractive(record) {
       }
       if (ownerAction === 'owner_seq') {
         await handleIa360OwnerSequenceChoice({ record, targetContact, sequenceId: ownerPipe });
+        return;
+      }
+      // APPROVE-SEND: decisiones de la tarjeta de aprobación post-readout.
+      if (ownerAction === 'owner_approve_send') {
+        await handleIa360OwnerApproveSend({ record, targetContact, sequenceId: ownerPipe });
+        return;
+      }
+      if (ownerAction === 'owner_approve_edit') {
+        await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_approve_edit_ack', body: `Ok, el borrador para ${targetContact} queda SIN enviar. Edita el copy y vuelve a elegir secuencia cuando esté listo.`, targetContact, ownerBudget: true });
+        return;
+      }
+      if (ownerAction === 'owner_approve_keep') {
+        await handleIa360TerminalVcardChoice({ record, targetContact, terminalChoice: 'guardar' });
+        return;
+      }
+      if (ownerAction === 'owner_approve_dnc') {
+        await handleIa360TerminalVcardChoice({ record, targetContact, terminalChoice: 'excluir' });
+        return;
+      }
+      if (ownerAction === 'owner_approve_manual') {
+        await handleIa360OwnerApproveManual({ record, targetContact });
         return;
       }
       if (ownerAction === 'owner_vcard_pipe' || ownerAction === 'owner_vcard_take' || ownerAction === 'owner_vcard_keep') {
