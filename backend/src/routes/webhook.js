@@ -5347,6 +5347,101 @@ async function handleIa360LiteInteractive(record) {
  * Receives raw Meta WhatsApp webhook payloads forwarded by n8n.
  * No auth required — called by internal n8n instance.
  */
+// ============================================================================
+// CANARY Brain v2 — enrutamiento reversible por allowlist. Fuera de la allowlist
+// (o con el flag off) este codigo es NO-OP: el monolito se comporta igual para
+// todos los demas numeros. Cuando IA360_BRAIN_V2_CANARY='on' y el remitente esta
+// en IA360_BRAIN_V2_ALLOWLIST, el TEXTO entrante se enruta al Brain v2 (workflow
+// b74vYWxP5YT8dQ2H, path /webhook/ia360-brain-v2-test) en vez del monolito.
+// Egress UNICO via messageSender (sendIa360DirectText / handleIa360FreeText).
+//   - Prefijo "/sim " => v2 trata al owner como CONTACTO simulado (force_actor)
+//     y genera respuesta conversacional (rama responder_llm).
+//   - owner directo (sin /sim) => v2 route owner_operator => SIN reply.
+//   - intent agendamiento (con /sim) => handback al booking existente del monolito.
+// SOLO intercepta message_type='text'; interactivos/botones del owner (cancelar,
+// calendario) siguen yendo al monolito intactos. Reversible: apagar el flag o
+// vaciar la allowlist restituye el monolito sin redeploy de codigo.
+// ============================================================================
+const IA360_BRAIN_V2_CANARY_ON = process.env.IA360_BRAIN_V2_CANARY === 'on';
+const IA360_BRAIN_V2_ALLOWLIST = new Set(
+  String(process.env.IA360_BRAIN_V2_ALLOWLIST || '')
+    .split(/[,\s]+/).map(x => x.replace(/\D/g, '')).filter(Boolean)
+);
+const IA360_BRAIN_V2_URL = process.env.N8N_IA360_BRAIN_V2_URL || 'https://n8n.geekstudio.dev/webhook/ia360-brain-v2-test';
+const IA360_BRAIN_V2_SIM_PREFIX = '/sim';
+console.log('[brain-v2-canary] boot canary=%s allowlist=%d url=%s',
+  IA360_BRAIN_V2_CANARY_ON ? 'on' : 'off', IA360_BRAIN_V2_ALLOWLIST.size, IA360_BRAIN_V2_URL);
+
+function ia360BrainV2CanaryEligible(record) {
+  if (!IA360_BRAIN_V2_CANARY_ON) return false;
+  if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return false;
+  if (!String(record.message_body || '').trim()) return false;
+  return IA360_BRAIN_V2_ALLOWLIST.has(normalizePhone(record.contact_number));
+}
+
+async function callBrainV2({ contactWaNumber, message, forceActor }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch(IA360_BRAIN_V2_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ contact_wa_number: contactWaNumber, message, force_actor: forceActor || '' }),
+      signal: controller.signal,
+    });
+    if (!res.ok) { console.error('[brain-v2-canary] n8n failed:', res.status); return null; }
+    const text = await res.text();
+    if (!text || !text.trim()) { console.error('[brain-v2-canary] empty body status=%s', res.status); return null; }
+    let parsed;
+    try { parsed = JSON.parse(text); } catch (e) { console.error('[brain-v2-canary] bad JSON:', e.message); return null; }
+    return Array.isArray(parsed) ? (parsed[0] || null) : parsed;
+  } catch (err) {
+    console.error('[brain-v2-canary] error:', err.name === 'AbortError' ? 'timeout 30000ms' : err.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleBrainV2Canary(record) {
+  const raw = String(record.message_body || '').trim();
+  let message = raw;
+  let forceActor = '';
+  const lower = raw.toLowerCase();
+  if (lower === IA360_BRAIN_V2_SIM_PREFIX || lower.startsWith(IA360_BRAIN_V2_SIM_PREFIX + ' ')) {
+    forceActor = 'contact';
+    message = raw.slice(IA360_BRAIN_V2_SIM_PREFIX.length).trim();
+    if (!message) {
+      await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'brainv2_sim_empty', body: 'Modo simulacion Brain v2: escribe "/sim <tu mensaje>" para que te responda como contacto.' });
+      return;
+    }
+  }
+  console.log('[brain-v2-canary] routing contact=%s force_actor=%s msg=%j', record.contact_number, forceActor || '-', message.slice(0, 80));
+  const out = await callBrainV2({ contactWaNumber: record.contact_number, message, forceActor });
+  if (!out) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'brainv2_holding', body: 'Brain v2: no pude generar respuesta en este momento. Reintenta en un momento.' });
+    return;
+  }
+  const branch = out.branch || out.route || 'fallback';
+  console.log('[brain-v2-canary] branch=%s intent=%s actor=%s', branch, out.intent || '-', out.actor_type || '-');
+  if (branch === 'responder_llm') {
+    const reply = String(out.reply_text || '').trim();
+    if (!reply) { console.warn('[brain-v2-canary] responder_llm sin reply_text'); return; }
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'brainv2_responder', body: reply });
+    return;
+  }
+  if (branch === 'agendamiento_handback') {
+    // El booking vive en el monolito: reinyectamos el texto (sin /sim) al agente
+    // de agenda existente, tratando al owner como contacto simulado.
+    const handbackRecord = Object.assign({}, record, { message_body: message });
+    console.log('[brain-v2-canary] handback -> booking existente del monolito');
+    await handleIa360FreeText(handbackRecord).catch(e => console.error('[brain-v2-canary] handback error:', e.message));
+    return;
+  }
+  // owner_operator / system_excluded / fallback => SIN reply (por diseno).
+  console.log('[brain-v2-canary] sin reply (branch=%s)', branch);
+}
+
 router.post('/webhook/whatsapp', async (req, res) => {
   try {
     // Authenticity: this endpoint is necessarily unauthenticated (public), so
@@ -5473,6 +5568,15 @@ router.post('/webhook/whatsapp', async (req, res) => {
     if (incomingRecords.length > 0) {
       for (const record of incomingRecords) {
         try {
+          // ── CANARY Brain v2 (reversible, allowlist) ──────────────────
+          // Antes de TODO el pipeline del monolito: si el remitente esta en la
+          // allowlist y el flag esta on, el texto se enruta al Brain v2 y NO toca
+          // el monolito. Fire-and-forget (no bloquea el ACK 200 a Meta; el inbound
+          // ya quedo persistido arriba). Fuera de la allowlist => no-op total.
+          if (ia360BrainV2CanaryEligible(record)) {
+            handleBrainV2Canary(record).catch(e => console.error('[brain-v2-canary] fire-and-forget:', e.message));
+            continue;
+          }
           // ── PRODUCTION-HARDENING: CAPTURA DEL COMENTARIO del owner ──────────
           // Va ANTES de TODO (paused-resume, flow, funnel): si el owner (Alek) tocó
           // "Comentar" en una alerta de fallo, su SIGUIENTE texto ES el comentario.
