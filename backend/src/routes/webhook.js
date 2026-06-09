@@ -1923,7 +1923,7 @@ async function callIa360Agent({ record, stageName }) {
   let agentMemory = null;
   try {
     const memContact = await loadIa360ContactContext(record);
-    agentMemory = await lookupIa360MemoryContext({ record, contact: memContact, limit: 8 });
+    agentMemory = await lookupIa360MemoryContext({ record, contact: memContact, limit: 12 });
   } catch (memErr) {
     console.error('[ia360-agent] memory lookup failed:', memErr.message);
   }
