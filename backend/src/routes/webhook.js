@@ -1006,6 +1006,320 @@ async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes 
   return { id: existing.id, moved: shouldMove };
 }
 
+// ============================================================================
+// Pipeline 5 — "WhatsApp Revenue OS": flujo de apertura por dolor (3 pasos).
+// Diseño fuente: "Plan diversificacion pipelines WA … Revenue OS" §2.
+//   PASO 1 (template ia360_os_revenue_apertura, fuera de ventana 24h) → quick
+//          replies [Sí, cuéntame] / [Ahora no].
+//   PASO 2 (texto libre dentro de ventana) → 1 pregunta de diagnóstico; captura
+//          señal en custom_fields (ia360_revenue_canal/dolor/volumen).
+//   PASO 3 (texto libre) → propuesta + bifurcación [Ver cómo se vería] /
+//          [Hablar con Alek].
+// Estado en custom_fields.ia360_revenue_state: apertura_sent → calificacion →
+//   propuesta → demo|handoff|nutricion. Gatea cada paso para no secuestrar el
+//   flujo genérico (agente IA / agenda). GUARDRAIL: NO empuja agenda en pasos
+//   1-2; la agenda es destino del paso 3 SOLO si el contacto lo pide.
+// ============================================================================
+const REVENUE_OS_PIPELINE_NAME = 'WhatsApp Revenue OS';
+const REVENUE_OS_APERTURA_TEMPLATE_ID = 42; // ia360_os_revenue_apertura (APPROVED, es_MX, {{1}}=nombre)
+
+const REVENUE_OS_COPY = {
+  paso2: 'Va. Para no suponer: hoy, cuando entra un prospecto por WhatsApp, ¿cómo le siguen el rastro? (ej. lo anotan aparte, se confían a la memoria, un Excel, o de plano se les pierde alguno). Cuéntame en una línea cómo es hoy.',
+  paso3: 'Eso es justo lo que se nos escapa dinero sin darnos cuenta. Lo que hacemos en TransformIA es montar tu "Revenue OS" sobre el mismo WhatsApp: cada lead entra, se etiqueta solo, sube por etapas (de "nuevo" a "ganado") y tú ves el pipeline completo sin perseguir a nadie. ¿Cómo le seguimos?',
+  ahoraNo: 'Va, sin problema. Te dejo el espacio y no te lleno el WhatsApp. Si más adelante quieres ordenar tus ventas por aquí, me escribes y lo retomamos. Saludos.',
+  demo: 'Va, te lo aterrizo. Tu "Revenue OS" se vería así por aquí: (1) cada prospecto que escribe queda registrado y etiquetado solo; (2) avanza por etapas — nuevo, en conversación, propuesta, ganado — sin que tú lo muevas a mano; (3) ves el pipeline completo y quién se está enfriando, todo dentro de WhatsApp. Te preparo un readout con tu caso y, si quieres, lo vemos en vivo con Alek.',
+};
+
+// Movimiento de deal dedicado a Pipeline 5 (NO toca syncIa360Deal, que es del
+// pipeline de agenda vivo). Create-or-move: si no hay deal, lo crea en el stage
+// destino; si existe, avanza por posición (igual criterio que syncIa360Deal).
+async function syncRevenueOsDeal({ record, targetStageName, titleSuffix = '', notes = '' }) {
+  if (!record || !record.wa_number || !record.contact_number || !targetStageName) return null;
+  const { rows: pipeRows } = await pool.query(
+    `SELECT id FROM coexistence.pipelines WHERE name = $1 LIMIT 1`,
+    [REVENUE_OS_PIPELINE_NAME]
+  );
+  const pipelineId = pipeRows[0]?.id;
+  if (!pipelineId) return null;
+
+  const { rows: stageRows } = await pool.query(
+    `SELECT id, name, position, stage_type
+       FROM coexistence.pipeline_stages
+      WHERE pipeline_id = $1 AND name = $2
+      LIMIT 1`,
+    [pipelineId, targetStageName]
+  );
+  const targetStage = stageRows[0];
+  if (!targetStage) return null;
+
+  const { rows: userRows } = await pool.query(
+    `SELECT id FROM coexistence.forgecrm_users WHERE role='admin' ORDER BY id LIMIT 1`
+  );
+  const createdBy = userRows[0]?.id || null;
+
+  const { rows: contactRows } = await pool.query(
+    `SELECT COALESCE(name, profile_name, $3) AS name
+       FROM coexistence.contacts
+      WHERE wa_number=$1 AND contact_number=$2
+      LIMIT 1`,
+    [record.wa_number, record.contact_number, record.contact_number]
+  );
+  const contactName = contactRows[0]?.name || record.contact_number;
+  const title = `Revenue OS · ${contactName}${titleSuffix ? ' · ' + titleSuffix : ''}`;
+  const nextNote = `[${new Date().toISOString()}] ${notes || `Stage → ${targetStageName}; input=${record.message_body || ''}`}`;
+
+  const { rows: existingRows } = await pool.query(
+    `SELECT d.*, s.position AS current_stage_position, s.name AS current_stage_name
+       FROM coexistence.deals d
+       JOIN coexistence.pipeline_stages s ON s.id=d.stage_id
+      WHERE d.pipeline_id=$1 AND d.contact_wa_number=$2 AND d.contact_number=$3
+      ORDER BY d.updated_at DESC NULLS LAST, d.id DESC
+      LIMIT 1`,
+    [pipelineId, record.wa_number, record.contact_number]
+  );
+
+  if (existingRows.length === 0) {
+    const { rows: posRows } = await pool.query(
+      `SELECT COALESCE(MAX(position),-1)+1 AS pos FROM coexistence.deals WHERE stage_id=$1`,
+      [targetStage.id]
+    );
+    const status = targetStage.stage_type === 'won' ? 'won' : targetStage.stage_type === 'lost' ? 'lost' : 'open';
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.deals
+         (pipeline_id, stage_id, title, value, currency, status, assigned_user_id,
+          contact_wa_number, contact_number, contact_name, notes, position, created_by,
+          won_at, lost_at)
+       VALUES ($1,$2,$3,0,'MXN',$4,$5,$6,$7,$8,$9,$10,$11,
+               ${status === 'won' ? 'NOW()' : 'NULL'}, ${status === 'lost' ? 'NOW()' : 'NULL'})
+       RETURNING id`,
+      [pipelineId, targetStage.id, title, status, createdBy, record.wa_number, record.contact_number, contactName, nextNote, posRows[0].pos, createdBy]
+    );
+    return { id: rows[0].id, created: true, stage: targetStage.name };
+  }
+
+  const existing = existingRows[0];
+  const shouldMove = Number(targetStage.position) >= Number(existing.current_stage_position);
+  const finalStageId = shouldMove ? targetStage.id : existing.stage_id;
+  const finalStatus = targetStage.stage_type === 'won' ? 'won' : targetStage.stage_type === 'lost' ? 'lost' : 'open';
+  const finalNotes = `${existing.notes || ''}${existing.notes ? '\n' : ''}${nextNote}`;
+  await pool.query(
+    `UPDATE coexistence.deals
+        SET stage_id = $1,
+            status = $2,
+            title = $3,
+            contact_name = $4,
+            notes = $5,
+            updated_at = NOW(),
+            won_at = CASE WHEN $2='won' THEN COALESCE(won_at, NOW()) ELSE NULL END,
+            lost_at = CASE WHEN $2='lost' THEN COALESCE(lost_at, NOW()) ELSE NULL END
+      WHERE id = $6`,
+    [finalStageId, shouldMove ? finalStatus : existing.status, title, contactName, finalNotes, existing.id]
+  );
+  return { id: existing.id, moved: shouldMove, stage: shouldMove ? targetStage.name : existing.current_stage_name };
+}
+
+// PASO 1 — dispara la apertura: siembra deal P5 en "Leads desorganizados", marca
+// el estado y envía el template aprobado (con sus 2 quick replies). Egress por el
+// chokepoint único (enqueueIa360Template → sendQueue). El record es sintético
+// (apertura = outbound-first, no hay inbound): message_id único para el dedup.
+async function startRevenueOsOpener({ waNumber, contactNumber, name = '' }) {
+  const wa = normalizePhone(waNumber);
+  const cn = normalizePhone(contactNumber);
+  if (!wa || !cn) return { ok: false, error: 'wa_number_and_contact_number_required' };
+
+  // Upsert contacto + estado (mergeContactIa360State no setea name; lo hacemos aparte
+  // solo si vino un nombre y el contacto aún no tiene uno).
+  await mergeContactIa360State({
+    waNumber: wa,
+    contactNumber: cn,
+    tags: ['pipeline:revenue-os', 'staged'],
+    customFields: { ia360_revenue_state: 'apertura_sent', ia360_revenue_started_at: new Date().toISOString() },
+  });
+  if (name) {
+    await pool.query(
+      `UPDATE coexistence.contacts SET name = COALESCE(name, $3), updated_at = NOW()
+        WHERE wa_number=$1 AND contact_number=$2`,
+      [wa, cn, name]
+    ).catch(e => console.error('[revenue-os] set name:', e.message));
+  }
+
+  const record = {
+    wa_number: wa,
+    contact_number: cn,
+    contact_name: name || cn,
+    message_id: `revenue_opener:${cn}:${Date.now()}`,
+    message_type: 'revenue_opener',
+    message_body: '',
+  };
+
+  await syncRevenueOsDeal({
+    record,
+    targetStageName: 'Leads desorganizados',
+    titleSuffix: 'Apertura',
+    notes: 'PASO 1: apertura Revenue OS enviada (template ia360_os_revenue_apertura).',
+  }).catch(e => console.error('[revenue-os] seed deal:', e.message));
+
+  const sent = await enqueueIa360Template({
+    record,
+    label: 'ia360_os_revenue_apertura',
+    templateName: 'ia360_os_revenue_apertura',
+    templateId: REVENUE_OS_APERTURA_TEMPLATE_ID,
+  });
+  return { ok: !!sent.ok, status: sent.status, error: sent.error || null, handlerFor: `${record.message_id}:ia360_os_revenue_apertura` };
+}
+
+// Heurística ligera para extraer señal del texto de calificación (PASO 2). Se
+// guarda el texto crudo siempre; canal/volumen solo si el contacto los dejó ver.
+function extractRevenueSignal(text) {
+  const t = String(text || '').toLowerCase();
+  let canal = null;
+  if (/excel|hoja|spreadsheet|sheet/.test(t)) canal = 'excel';
+  else if (/crm|pipedrive|hubspot|salesforce|espocrm|zoho/.test(t)) canal = 'crm';
+  else if (/memoria|cabeza|me acuerdo|de memoria/.test(t)) canal = 'memoria';
+  else if (/anot|libreta|cuaderno|papel|post.?it|nota/.test(t)) canal = 'notas';
+  else if (/whats|wa\b|chat/.test(t)) canal = 'whatsapp';
+  const volMatch = t.match(/(\d{1,5})\s*(leads?|prospect|client|mensaj|chats?|al d[ií]a|por d[ií]a|a la semana|mensual|al mes)/);
+  const volumen = volMatch ? volMatch[0] : null;
+  return { canal, volumen };
+}
+
+// PASO 1 (respuesta) + PASO 3 (bifurcación) — botones. Gateado por estado para no
+// secuestrar quick-replies genéricos. Devuelve true si lo manejó (corta el embudo).
+async function handleRevenueOsButton({ record, replyId }) {
+  if (!record || !replyId) return false;
+  const id = String(replyId || '').trim().toLowerCase();
+  const isOpenerYes = id === 'sí, cuéntame' || id === 'si, cuéntame' || id === 'sí, cuentame' || id === 'si, cuentame';
+  const isOpenerNo = id === 'ahora no';
+  const isDemo = id === 'revenue_ver_demo';
+  const isHandoff = id === 'revenue_hablar_alek';
+  if (!isOpenerYes && !isOpenerNo && !isDemo && !isHandoff) return false;
+
+  const contact = await loadIa360ContactContext(record).catch(() => null);
+  const state = contact?.custom_fields?.ia360_revenue_state || '';
+
+  // PASO 1 — respuesta a la apertura (solo si seguimos en apertura_sent).
+  if (isOpenerYes || isOpenerNo) {
+    if (state !== 'apertura_sent') return false; // no es de este flujo / ya avanzó
+    if (isOpenerNo) {
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        tags: ['nutricion-suave'],
+        customFields: { ia360_revenue_state: 'nutricion', ultimo_cta_enviado: 'ia360_os_revenue_ahora_no' },
+      });
+      await enqueueIa360Text({ record, label: 'ia360_os_revenue_ahora_no', body: REVENUE_OS_COPY.ahoraNo });
+      return true;
+    }
+    // "Sí, cuéntame" → abre ventana 24h → PASO 2 (pregunta de calificación, texto libre).
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['revenue-os-interesado'],
+      customFields: { ia360_revenue_state: 'calificacion', ultimo_cta_enviado: 'ia360_os_revenue_paso2' },
+    });
+    await enqueueIa360Text({ record, label: 'ia360_os_revenue_paso2', body: REVENUE_OS_COPY.paso2 });
+    return true;
+  }
+
+  // PASO 3 — bifurcación (solo si ya enviamos la propuesta).
+  if (isDemo || isHandoff) {
+    if (state !== 'propuesta') return false;
+    if (isDemo) {
+      await enqueueIa360Text({ record, label: 'ia360_os_revenue_demo', body: REVENUE_OS_COPY.demo });
+      await syncRevenueOsDeal({
+        record,
+        targetStageName: 'Diseño propuesto',
+        titleSuffix: 'Diseño propuesto',
+        notes: 'PASO 3: "Ver cómo se vería" → readout/mini-demo; deal a Diseño propuesto.',
+      }).catch(e => console.error('[revenue-os] move to Diseño propuesto:', e.message));
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        tags: ['revenue-os-diseno-propuesto'],
+        customFields: { ia360_revenue_state: 'demo', ultimo_cta_enviado: 'ia360_os_revenue_demo' },
+      });
+      return true;
+    }
+    // "Hablar con Alek" → handoff al flujo de agenda EXISTENTE respetando la compuerta
+    // de confirmación: NO empujar offer_slots; preguntamos primero (gate_slots_yes/no),
+    // que ya maneja el router más abajo y consulta disponibilidad REAL.
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_os_revenue_gate_agenda',
+      messageBody: 'IA360: confirmar horarios',
+      interactive: {
+        type: 'button',
+        body: { text: 'Perfecto, te paso con Alek. ¿Quieres que te comparta horarios para una llamada con él?' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'gate_slots_yes', title: 'Sí, ver horarios' } },
+            { type: 'reply', reply: { id: 'gate_slots_no', title: 'Todavía no' } },
+          ],
+        },
+      },
+    });
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['revenue-os-handoff-agenda'],
+      customFields: { ia360_revenue_state: 'handoff', ultimo_cta_enviado: 'ia360_os_revenue_handoff' },
+    });
+    return true;
+  }
+  return false;
+}
+
+// PASO 2 — captura de calificación (texto libre dentro de ventana). Va ANTES del
+// agente genérico en el dispatch y devuelve true para CORTAR el embudo (evita que
+// el agente responda el mismo texto y empuje agenda → guardrail). Solo actúa si el
+// contacto está en estado 'calificacion'.
+async function handleRevenueOsFreeText(record) {
+  try {
+    if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return false;
+    const body = String(record.message_body || '').trim();
+    if (!body) return false;
+    const contact = await loadIa360ContactContext(record).catch(() => null);
+    if (!contact || contact.custom_fields?.ia360_revenue_state !== 'calificacion') return false;
+
+    const { canal, volumen } = extractRevenueSignal(body);
+    const cf = {
+      ia360_revenue_state: 'propuesta',
+      ia360_revenue_dolor: body,
+      ia360_revenue_calificacion_raw: body,
+      ultimo_cta_enviado: 'ia360_os_revenue_paso3',
+    };
+    if (canal) cf.ia360_revenue_canal = canal;
+    if (volumen) cf.ia360_revenue_volumen = volumen;
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['revenue-os-calificado'],
+      customFields: cf,
+    });
+
+    // PASO 3 — propuesta + bifurcación (quick replies). Titles ≤ 20 chars.
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_os_revenue_paso3',
+      messageBody: 'IA360: propuesta Revenue OS',
+      interactive: {
+        type: 'button',
+        body: { text: REVENUE_OS_COPY.paso3 },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'revenue_ver_demo', title: 'Ver cómo se vería' } },
+            { type: 'reply', reply: { id: 'revenue_hablar_alek', title: 'Hablar con Alek' } },
+          ],
+        },
+      },
+    });
+    return true;
+  } catch (err) {
+    console.error('[revenue-os] free-text handler error (no route):', err.message);
+    return false;
+  }
+}
+
 async function resolveIa360Outbound(record, dedupSuffix = '') {
   // dedupSuffix permite mandar UN segundo mensaje al mismo contacto para el mismo inbound
   // sin que el dedup (por ia360_handler_for) lo descarte. Default '' = comportamiento idéntico.
@@ -3944,6 +4258,11 @@ async function handleIa360LiteInteractive(record) {
   const answer = String(record.message_body || '').trim().toLowerCase();
   const replyId = getInteractiveReplyId(record);
 
+  // Pipeline 5 "WhatsApp Revenue OS": respuesta a la apertura (PASO 1) y bifurcación
+  // (PASO 3). Gateado por custom_fields.ia360_revenue_state; si no aplica, devuelve
+  // false y el flujo sigue normal. Va ANTES del embudo 100m / agenda.
+  if (await handleRevenueOsButton({ record, replyId })) return;
+
   // W4 — boton "Enviar contexto" (stage-aware): sin slot abre diagnostico, con slot abre
   // pre_call. Va ANTES del embudo para no confundirse con un micro-paso. Si el Flow no se
   // pudo encolar (dedup/cuenta), cae al flujo normal (este id no matchea = no-op silencioso).
@@ -5218,8 +5537,14 @@ router.post('/webhook/whatsapp', async (req, res) => {
             continue; // do not also fire fresh triggers
           }
           await handleIa360LiteInteractive(record);
+          // PASO 2 Revenue OS (calificación) — DEBE ir antes del agente genérico y
+          // gatearlo: si el contacto está en estado 'calificacion', este handler captura
+          // la señal, manda la propuesta (PASO 3) y CORTA el embudo (return true) para que
+          // el agente no responda el mismo texto ni empuje agenda (guardrail). El owner
+          // tiene deal vivo en P2, así que sin este gate el agente respondería en paralelo.
+          const revHandled = await handleRevenueOsFreeText(record).catch(e => { console.error('[revenue-os] dispatch:', e.message); return false; });
           // Free text (no button) inside an active funnel → AI agent (fire-and-forget; never blocks the Meta ack).
-          handleIa360FreeText(record).catch(e => console.error('[ia360-agent] fire-and-forget:', e.message));
+          if (!revHandled) handleIa360FreeText(record).catch(e => console.error('[ia360-agent] fire-and-forget:', e.message));
           await evaluateTriggers(record);
         } catch (triggerErr) {
           console.error('[webhook] Trigger evaluation error:', triggerErr.message);
@@ -5352,6 +5677,30 @@ router.post('/internal/ia360-memory/lookup', async (req, res) => {
   } catch (err) {
     console.error('[ia360-memory] lookup endpoint error:', err.message);
     return res.status(500).json({ ok: false, error: 'lookup_failed' });
+  }
+});
+
+// PASO 1 Revenue OS (Pipeline 5) — dispara la apertura para un contacto. Auth =
+// X-IA360-Directive-Secret (mismo patrón que los demás endpoints internos). Egress
+// por el chokepoint único (enqueueIa360Template). Pensado para campaña/broadcast o
+// siembra E2E staged. wa_number default = cuenta IA360 única.
+router.post('/internal/ia360-revenue/opener', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    const waNumber = normalizePhone(b.wa_number || process.env.IA360_WA_NUMBER || '5213321594582');
+    const contactNumber = normalizePhone(b.contact_number || b.contact?.contact_number || '');
+    const name = String(b.name || b.contact?.name || '').trim();
+    if (!waNumber || !contactNumber) {
+      return res.status(422).json({ ok: false, error: 'wa_number_and_contact_number_required' });
+    }
+    const result = await startRevenueOsOpener({ waNumber, contactNumber, name });
+    return res.status(result.ok ? 200 : 502).json({ schema: 'ia360_revenue_opener.v1', ...result });
+  } catch (err) {
+    console.error('[revenue-os] opener endpoint error:', err.message);
+    return res.status(500).json({ ok: false, error: 'opener_failed' });
   }
 });
 
