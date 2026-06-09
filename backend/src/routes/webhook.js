@@ -1918,6 +1918,16 @@ async function callIa360Agent({ record, stageName }) {
   );
   const history = hist.reverse().map(h => ({ dir: h.dir, body: h.body }));
 
+  // EXPEDIENTE: memoria por contacto (facts+events) para que el agente responda
+  // con contexto real del negocio del contacto, no en frio. Best-effort.
+  let agentMemory = null;
+  try {
+    const memContact = await loadIa360ContactContext(record);
+    agentMemory = await lookupIa360MemoryContext({ record, contact: memContact, limit: 8 });
+  } catch (memErr) {
+    console.error('[ia360-agent] memory lookup failed:', memErr.message);
+  }
+
   const primaryIa360AgentUrl = process.env.N8N_IA360_AGENT_WEBHOOK_URL;
   if (N8N_IA360_CONTACT_INTEL_WEBHOOK_URL && N8N_IA360_CONTACT_INTEL_WEBHOOK_URL !== primaryIa360AgentUrl) {
     shadowIa360ContactIntelligence({ record, stageName, history }).catch(() => {});
@@ -1934,12 +1944,15 @@ async function callIa360Agent({ record, stageName }) {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(buildIa360AgentPayload({
-        record,
-        stageName,
-        history,
-        source: 'forgechat-ia360-webhook',
-      })),
+      body: JSON.stringify({
+        ...buildIa360AgentPayload({
+          record,
+          stageName,
+          history,
+          source: 'forgechat-ia360-webhook',
+        }),
+        memory: agentMemory,
+      }),
       signal: ia360AgentController.signal,
     });
     if (!res.ok) { console.error('[ia360-agent] failed:', res.status); return null; }
