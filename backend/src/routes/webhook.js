@@ -2865,8 +2865,10 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
   }
 
   // GATE DE SEGURIDAD: allowlist de prueba. Sin allowlist o fuera de ella → NO envía.
+  // '*' = la aprobación explícita del owner autoriza a cualquier contacto.
+  const allowRaw = String(process.env.IA360_APPROVE_SEND_ALLOWLIST || '').trim();
   const allow = ia360ApproveSendAllowlist();
-  if (!allow.length || !allow.includes(normalizePhone(targetContact))) {
+  if (allowRaw !== '*' && (!allow.length || !allow.includes(normalizePhone(targetContact)))) {
     return deny('not_in_test_allowlist', `Gate de seguridad: ${name} (${targetContact}) no está en IA360_APPROVE_SEND_ALLOWLIST. Aprobación registrada pero NO envié nada al contacto.`);
   }
 
@@ -2875,7 +2877,7 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
   // las secuencias persona-first aún no tienen template mapeado → bloquear con aviso.
   const { account, error: accErr } = await resolveAccount({ fromPhoneNumber: record.wa_number });
   if (accErr || !account) return deny('account_resolve_failed', 'No pude resolver la cuenta de WhatsApp. No envié nada.');
-  const secs = await secondsSinceLastIncoming({ accountPhoneNumberId: account.phone_number_id, contactNumber: targetContact });
+  const secs = await secondsSinceLastIncoming({ accountPhoneNumberId: account.phoneNumberId, contactNumber: targetContact });
   const insideWindow = secs != null && secs < 23.5 * 3600;
   const targetRecord = { ...record, contact_number: targetContact, contact_name: name };
   let sendResult = { ok: false, status: 'not_sent', error: null };
