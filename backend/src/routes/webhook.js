@@ -5381,7 +5381,7 @@ function ia360BrainV2CanaryEligible(record) {
 
 async function callBrainV2({ contactWaNumber, message, forceActor }) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30000);
+  const timer = setTimeout(() => controller.abort(), 90000);
   try {
     const res = await fetch(IA360_BRAIN_V2_URL, {
       method: 'POST',
