@@ -845,7 +845,24 @@ function inferIa360QaPersonaHint(name) {
 async function upsertIa360SharedContact({ record, shared }) {
   if (!record?.wa_number || !shared?.contactNumber) return null;
   const qaPersonaExpectedChoice = inferIa360QaPersonaHint(shared.name);
+  // quien_intro (D6): si el vCard lo comparte un CONTACTO (no el owner), esa
+  // persona es quien hizo la introducción. Se guarda el NOMBRE para que el
+  // opener referido_contexto pueda decir "nos presentó X". Si lo manda el owner,
+  // el dato queda pendiente (el placeholder {{quien_intro}} bloquea el copy).
+  let quienIntro = null;
+  if (record.contact_number && normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
+    try {
+      const { rows: introRows } = await pool.query(
+        `SELECT name, profile_name FROM coexistence.contacts WHERE wa_number=$1 AND contact_number=$2 LIMIT 1`,
+        [record.wa_number, normalizePhone(record.contact_number)]
+      );
+      quienIntro = String(introRows[0]?.name || introRows[0]?.profile_name || record.contact_name || '').trim() || null;
+    } catch (e) {
+      console.error('[ia360-vcard] quien_intro lookup:', e.message);
+    }
+  }
   const customFields = {
+    ...(quienIntro ? { quien_intro: quienIntro } : {}),
     staged: true,
     stage: 'Capturado / Por rutear',
     captured_at: new Date().toISOString(),
@@ -2074,7 +2091,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'feedback sobre claridad, límites y arquitectura del flujo',
         nextAction: 'Alek revisa si la explicación técnica tiene sentido antes de pedir feedback real.',
         cta: 'pedir permiso para una pregunta corta de validación',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió guardar tu contacto para una prueba controlada de IA360. No quiero venderte nada: quiere validar si este flujo de WhatsApp, CRM y memoria tiene sentido técnico. ¿Te puedo dejar una pregunta corta o prefieres que Alek te escriba directo?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek está construyendo IA360, un sistema que conecta WhatsApp, CRM y memoria de clientes, y me pidió validarlo con gente de su confianza antes de usarlo con clientes reales. No te quiero vender nada: solo necesito tu ojo técnico. ¿Me dejas hacerte una pregunta corta?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_beta_architectura:si_pregunta', title: 'Sí, pregúntame' },
+            { id: 'seq_beta_architectura:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_beta_architectura:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
       {
         id: 'beta_feedback',
@@ -2084,7 +2109,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'comentario técnico accionable sobre una parte del sistema',
         nextAction: 'Alek edita la pregunta técnica y decide si la manda como prueba controlada.',
         cta: 'pedir una crítica concreta del flujo',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek está probando IA360 con contactos de confianza y quiere una crítica concreta, no venderte nada. ¿Te puedo dejar una pregunta breve sobre el flujo de WhatsApp, CRM y memoria, o prefieres que Alek te escriba directo?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek está probando IA360 (su sistema de WhatsApp + CRM con memoria) con contactos de confianza y quiere críticas directas, no cumplidos. ¿Me dejas hacerte una pregunta breve sobre cómo se siente recibir mensajes de una IA como esta?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_beta_feedback:si_pregunta', title: 'Sí, pregúntame' },
+            { id: 'seq_beta_feedback:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_beta_feedback:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
       {
         id: 'beta_memoria',
@@ -2094,7 +2127,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'validación de si el contexto guardado ayuda o estorba',
         nextAction: 'Alek confirma qué contexto usar en la prueba antes de escribir.',
         cta: 'probar memoria con una pregunta controlada',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek quiere probar si IA360 puede recordar contexto útil sin volverse invasiva. ¿Te puedo hacer una pregunta corta para validar memoria y seguimiento, o prefieres que Alek lo revise contigo?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Estoy aprendiendo a recordar el contexto de cada persona sin volverme invasiva, y Alek me pidió probarlo contigo porque te tiene confianza. ¿Me dejas hacerte una pregunta corta para poner a prueba mi memoria?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_beta_memoria:si_a_ver', title: 'Sí, a ver' },
+            { id: 'seq_beta_memoria:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_beta_memoria:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
     ],
   },
@@ -2113,7 +2154,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'origen de la introducción, dolor probable o permiso para avanzar',
         nextAction: 'Alek completa el contexto del referidor antes de mandar cualquier mensaje.',
         cta: 'pedir contexto breve de la introducción',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Te tengo registrado como referido de una introducción. Antes de mandarte una propuesta fuera de contexto, Alek quiere entender si tiene sentido hablar de IA360 para tu área o dolor principal. ¿Prefieres una pregunta breve o que Alek te escriba directo?`,
+        draft: ({ name, quienIntro }) => `Hola ${name}, soy la IA de Alek. Te escribo porque nos presentó ${quienIntro || '{{quien_intro}}'} y, antes de mandarte cualquier propuesta, Alek quiere entender tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_referido_contexto:pregunta', title: 'Hazme una pregunta' },
+            { id: 'seq_referido_contexto:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_referido_contexto:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
       {
         id: 'referido_oneliner',
@@ -2123,7 +2172,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'interés inicial sin romper la confianza del canal',
         nextAction: 'Alek ajusta el one-liner según quién hizo la introducción.',
         cta: 'pedir permiso para explicar IA360 en una línea',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de abrir una conversación larga, Alek quiere darte una versión simple: IA360 ayuda a que WhatsApp, CRM y seguimiento no se caigan entre personas, datos y agenda. ¿Te hace sentido que te deje una pregunta para ver si aplica a tu caso?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Nos presentaron hace poco y Alek prefiere darte la versión corta antes que una llamada a ciegas: IA360 evita que el seguimiento se caiga entre WhatsApp, el CRM, la agenda y la gente. ¿Quieres explorar si aplica a tu caso?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_referido_oneliner:si_cuentame', title: 'Sí, cuéntame más' },
+            { id: 'seq_referido_oneliner:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_referido_oneliner:ahora_no', title: 'Por ahora no' },
+          ],
+        },
       },
       {
         id: 'referido_permiso_agenda',
@@ -2133,7 +2190,16 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'permiso explícito para explorar una llamada o siguiente paso',
         nextAction: 'Alek confirma que la introducción justifica proponer agenda.',
         cta: 'pedir permiso para sugerir una llamada',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para cuidar la introducción, no quiero mandarte agenda sin contexto. Si el tema de IA360 te suena útil, ¿te puedo dejar una pregunta breve para saber si conviene que Alek te proponga una llamada?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Vienes de una introducción y Alek no quiere mandarte una agenda sin contexto. Si ordenar WhatsApp, CRM y seguimiento te suena útil, puedo proponerte una llamada corta con él. ¿Cómo lo ves?`,
+        metaTemplateName: 'ia360_referido_apertura',
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_referido_permiso_agenda:horarios', title: 'Proponme horarios' },
+            { id: 'seq_referido_permiso_agenda:pregunta', title: 'Primero una pregunta' },
+            { id: 'seq_referido_permiso_agenda:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
     ],
   },
@@ -2152,7 +2218,16 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'tipo de colaboración posible y segmento de clientes compatible',
         nextAction: 'Alek define si la conversación es canal, proveedor, implementación o co-venta.',
         cta: 'mapear fit de colaboración',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió ubicar si tiene sentido explorar una colaboración alrededor de IA360. La idea no es venderte algo genérico, sino ver si tus clientes suelen tener fricción en WhatsApp, CRM, datos o procesos repetidos. ¿Te hago una pregunta corta para mapear fit?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió escribirte porque te ve como posible aliado, no como cliente: quiere explorar si IA360 les sirve a los clientes que tú ya atiendes cuando tienen fricción en WhatsApp, CRM o procesos repetidos. ¿Te hago una pregunta corta para mapear si hay fit?`,
+        metaTemplateName: 'ia360_aliado_mapa_colaboracion',
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_aliado_mapa_colaboracion:si_pregunta', title: 'Sí, pregúntame' },
+            { id: 'seq_aliado_mapa_colaboracion:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_aliado_mapa_colaboracion:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
       {
         id: 'aliado_criterios_fit',
@@ -2162,7 +2237,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'criterios de cliente ideal o señales para descartar',
         nextAction: 'Alek valida criterios de fit antes de pedir intros.',
         cta: 'pedir señales de cliente compatible',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para no pedir intros a ciegas, Alek quiere definir qué tipo de cliente sí tendría sentido para IA360. ¿Te puedo preguntar qué señales ves cuando una empresa ya necesita ordenar WhatsApp, CRM, datos o seguimiento?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek no quiere pedirte intros a ciegas: primero quiere definir contigo qué tipo de empresa sí tiene sentido para IA360. ¿Me dejas preguntarte qué señales ves cuando un cliente ya necesita ordenar su WhatsApp, CRM o seguimiento?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_aliado_criterios_fit:si_pregunta', title: 'Sí, pregúntame' },
+            { id: 'seq_aliado_criterios_fit:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_aliado_criterios_fit:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
       {
         id: 'aliado_caso_reventa',
@@ -2172,7 +2255,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'interés en caso seguro para presentar o revender',
         nextAction: 'Alek elige el caso NDA-safe correcto antes de compartirlo.',
         cta: 'ofrecer caso seguro y resumido',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si quieres explicar IA360 sin exponer datos de clientes, Alek puede compartirte un caso NDA-safe: problema, operación antes y resultado esperado. ¿Te serviría para detectar si hay fit con tus clientes?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek preparó un caso NDA-safe de IA360 (el problema, la operación antes y el resultado esperado) para que puedas explicárselo a tus clientes sin exponer datos de nadie. ¿Te lo comparto?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_aliado_caso_reventa:si_comparte', title: 'Sí, compártelo' },
+            { id: 'seq_aliado_caso_reventa:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_aliado_caso_reventa:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
     ],
   },
@@ -2191,7 +2282,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'avance confirmado, evidencia o siguiente punto pendiente',
         nextAction: 'Alek revisa el avance real del proyecto antes de enviar readout.',
         cta: 'pedir validación del avance',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de proponerte algo nuevo, quiero ubicar si hay algún avance, fricción o siguiente paso pendiente en lo que ya estamos trabajando. ¿Quieres que te deje una pregunta breve o prefieres que Alek lo revise contigo?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Como ya estamos trabajando juntos, Alek me pidió darle seguimiento a tu proyecto sin esperar a la siguiente reunión. ¿Hay algún avance, fricción o pendiente que quieras que le ponga enfrente hoy?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_cliente_readout:si_cuento', title: 'Sí, te cuento' },
+            { id: 'seq_cliente_readout:todo_bien', title: 'Todo va bien' },
+            { id: 'seq_cliente_readout:alek_directo', title: 'Que me escriba Alek' },
+          ],
+        },
       },
       {
         id: 'cliente_soporte',
@@ -2201,7 +2300,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'bloqueo operativo, duda o necesidad de soporte',
         nextAction: 'Alek confirma si hay soporte pendiente antes de abrir expansión.',
         cta: 'detectar fricción concreta',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Quiero revisar si algo se atoró antes de hablar de siguientes pasos. ¿Hay una fricción concreta que quieras que Alek vea primero?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de hablar de siguientes pasos en tu proyecto, Alek quiere asegurarse de que nada esté atorado de su lado. ¿Hay alguna fricción concreta que quieras que vea primero?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_cliente_soporte:hay_tema', title: 'Sí, hay un tema' },
+            { id: 'seq_cliente_soporte:todo_orden', title: 'Todo en orden' },
+            { id: 'seq_cliente_soporte:alek_directo', title: 'Que me escriba Alek' },
+          ],
+        },
       },
       {
         id: 'cliente_expansion',
@@ -2211,7 +2318,20 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'área donde el cliente ya ve oportunidad de continuidad',
         nextAction: 'Alek valida que exista adopción o evidencia antes de proponer expansión.',
         cta: 'identificar siguiente módulo con permiso',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si lo actual ya está avanzando, Alek quiere ubicar el siguiente punto con más impacto, sin empujar algo fuera de tiempo. ¿El mayor siguiente paso está en WhatsApp, CRM, datos, agenda o seguimiento?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Te escribo de su parte porque tú y Alek ya tienen un proyecto andando, y Alek quiere ubicar dónde estaría el siguiente paso con más impacto, sin empujarte nada fuera de tiempo. De estas áreas, ¿cuál te quita más tiempo hoy?`,
+        requiresLiveDeal: true,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir área',
+          options: [
+            { id: 'seq_cliente_expansion:whatsapp', title: 'WhatsApp y mensajes' },
+            { id: 'seq_cliente_expansion:crm', title: 'CRM y clientes' },
+            { id: 'seq_cliente_expansion:datos', title: 'Datos y reportes' },
+            { id: 'seq_cliente_expansion:agenda', title: 'Agenda y citas' },
+            { id: 'seq_cliente_expansion:seguimiento', title: 'Seguimiento de ventas' },
+            { id: 'seq_cliente_expansion:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
     ],
   },
@@ -2230,7 +2350,18 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'cuello ejecutivo prioritario y disposición a conversar',
         nextAction: 'Alek decide si la pregunta va a operación, ventas, datos o seguimiento.',
         cta: 'detectar cuello ejecutivo',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para no mandarte una demo genérica, primero quiero ubicar dónde podría haber valor real: operación, ventas, datos o seguimiento. ¿Te dejo una pregunta rápida para detectar el cuello que más mueve la aguja?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió contactarte antes de mandarte una demo genérica: prefiere ubicar primero dónde habría valor real para tu operación. De estas áreas, ¿dónde sientes el cuello de botella que más mueve la aguja?`,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir área',
+          options: [
+            { id: 'seq_sponsor_diagnostico:operacion', title: 'Operación' },
+            { id: 'seq_sponsor_diagnostico:ventas', title: 'Ventas' },
+            { id: 'seq_sponsor_diagnostico:datos', title: 'Datos y reportes' },
+            { id: 'seq_sponsor_diagnostico:seguimiento', title: 'Seguimiento' },
+            { id: 'seq_sponsor_diagnostico:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
       {
         id: 'sponsor_fuga_valor',
@@ -2240,7 +2371,18 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'mención de costo, demora, retrabajo o pérdida de visibilidad',
         nextAction: 'Alek prepara una lectura de impacto antes de sugerir solución.',
         cta: 'pedir síntoma de fuga de valor',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando IA360 sí aplica, normalmente se nota en tiempo perdido, seguimiento que se cae, datos poco confiables o decisiones lentas. ¿Cuál de esas fugas te preocupa más hoy?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando IA360 sí aplica, se nota en cuatro fugas: tiempo perdido en tareas manuales, seguimiento que se cae, datos poco confiables y decisiones lentas. ¿Cuál de esas te preocupa más hoy?`,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir fuga',
+          options: [
+            { id: 'seq_sponsor_fuga_valor:tiempo', title: 'Tiempo perdido' },
+            { id: 'seq_sponsor_fuga_valor:seguimiento', title: 'Seguimiento que se cae' },
+            { id: 'seq_sponsor_fuga_valor:datos', title: 'Datos poco confiables' },
+            { id: 'seq_sponsor_fuga_valor:decisiones', title: 'Decisiones lentas' },
+            { id: 'seq_sponsor_fuga_valor:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
       {
         id: 'sponsor_caso_ndasafe',
@@ -2250,7 +2392,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'interés en evidencia ejecutiva sin datos sensibles',
         nextAction: 'Alek elige el caso más parecido antes de compartirlo.',
         cta: 'ofrecer prueba segura',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si prefieres ver evidencia antes de hablar de solución, Alek puede compartirte un caso NDA-safe con problema, enfoque y resultado esperado. ¿Te serviría como punto de partida?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si prefieres ver evidencia antes de hablar de soluciones, Alek puede compartirte un caso NDA-safe de IA360: el problema, el enfoque y el resultado esperado, sin exponer datos de ningún cliente. ¿Te lo mando?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_sponsor_caso_ndasafe:si_manda', title: 'Sí, mándalo' },
+            { id: 'seq_sponsor_caso_ndasafe:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_sponsor_caso_ndasafe:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
     ],
   },
@@ -2269,7 +2419,17 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'fuga en generación, seguimiento, cierre o visibilidad',
         nextAction: 'Alek confirma si conviene hacer diagnóstico comercial antes de proponer.',
         cta: 'ubicar fuga principal del pipeline',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si el problema está en ventas, casi siempre aparece en tres lugares: leads que no llegan, seguimiento que se cae o WhatsApp/CRM sin contexto. ¿Cuál de esos te duele más hoy?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek trabaja ayudando a equipos comerciales y casi siempre el problema aparece en uno de tres lugares. En tu equipo, ¿cuál duele más hoy?`,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir',
+          options: [
+            { id: 'seq_comercial_pipeline:leads', title: 'Leads que no llegan' },
+            { id: 'seq_comercial_pipeline:seguimiento', title: 'Seguimiento que se cae' },
+            { id: 'seq_comercial_pipeline:contexto', title: 'WhatsApp sin contexto' },
+            { id: 'seq_comercial_pipeline:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
       {
         id: 'comercial_wa_crm',
@@ -2279,7 +2439,18 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'dolor entre conversaciones, CRM y seguimiento comercial',
         nextAction: 'Alek revisa si el caso pide orden operativo o motor de ventas.',
         cta: 'mapear seguimiento WhatsApp/CRM',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Muchas fugas comerciales no vienen del vendedor, sino de WhatsApp y CRM trabajando sin contexto compartido. ¿Hoy qué se pierde más: historial, seguimiento, prioridad o datos para decidir?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Muchas fugas comerciales no vienen del vendedor, sino de WhatsApp y el CRM trabajando sin contexto compartido. En tu operación, ¿qué se pierde más hoy?`,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir',
+          options: [
+            { id: 'seq_comercial_wa_crm:historial', title: 'Historial de clientes' },
+            { id: 'seq_comercial_wa_crm:seguimiento', title: 'Seguimiento' },
+            { id: 'seq_comercial_wa_crm:prioridad', title: 'Prioridad de leads' },
+            { id: 'seq_comercial_wa_crm:datos', title: 'Datos para decidir' },
+            { id: 'seq_comercial_wa_crm:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
       {
         id: 'comercial_motor_prospeccion',
@@ -2289,7 +2460,17 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'canal, segmento o proceso que podría convertirse en motor comercial',
         nextAction: 'Alek valida segmento y oferta antes de hablar de prospección.',
         cta: 'detectar si hay motor comercial repetible',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si IA360 se aplica a prospección, primero hay que saber si existe un segmento claro, un mensaje repetible y seguimiento medible. ¿Qué parte de ese motor está más débil hoy?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para aplicar IA360 a prospección hacen falta tres piezas: un segmento claro, un mensaje repetible y un seguimiento medible. ¿Qué parte de ese motor está más débil en tu equipo hoy?`,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir',
+          options: [
+            { id: 'seq_comercial_motor_prospeccion:segmento', title: 'Segmento claro' },
+            { id: 'seq_comercial_motor_prospeccion:mensaje', title: 'Mensaje repetible' },
+            { id: 'seq_comercial_motor_prospeccion:seguimiento', title: 'Seguimiento medible' },
+            { id: 'seq_comercial_motor_prospeccion:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
     ],
   },
@@ -2308,7 +2489,18 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'dolor de control, visibilidad o retrabajo financiero',
         nextAction: 'Alek decide si el ángulo financiero es control, cartera o comisiones.',
         cta: 'detectar punto de control débil',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando finanzas no puede confiar rápido en los datos, la operación termina trabajando a mano. ¿El mayor dolor está en cartera, comisiones, reportes o conciliación?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek trabaja con equipos de finanzas que terminan operando a mano porque no pueden confiar rápido en sus datos. En tu caso, ¿dónde está el mayor dolor hoy?`,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir área',
+          options: [
+            { id: 'seq_cfo_control:cartera', title: 'Cartera' },
+            { id: 'seq_cfo_control:comisiones', title: 'Comisiones' },
+            { id: 'seq_cfo_control:reportes', title: 'Reportes' },
+            { id: 'seq_cfo_control:conciliacion', title: 'Conciliación' },
+            { id: 'seq_cfo_control:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
       {
         id: 'cfo_cartera_datos',
@@ -2318,7 +2510,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'mención de cartera, cobranza, datos dispersos o visibilidad lenta',
         nextAction: 'Alek confirma si hay un flujo de datos que se pueda ordenar sin invadir sistemas.',
         cta: 'ubicar datos financieros poco visibles',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si cartera o datos viven dispersos, la decisión financiera llega tarde. ¿Qué información te cuesta más tener confiable y a tiempo?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando la cartera o los datos viven dispersos, la decisión financiera llega tarde. ¿Qué información te cuesta más tener confiable y a tiempo?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_cfo_cartera_datos:respondo', title: 'Te respondo aquí' },
+            { id: 'seq_cfo_cartera_datos:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_cfo_cartera_datos:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
       {
         id: 'cfo_comisiones',
@@ -2329,6 +2529,16 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek valida si el caso se puede convertir en diagnóstico de reglas y datos.',
         cta: 'detectar reglas financieras propensas a error',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. En comisiones y conciliación, el problema suele estar en reglas manuales, excepciones y datos que no cuadran. ¿Dónde se te va más tiempo revisando o corrigiendo?`,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir',
+          options: [
+            { id: 'seq_cfo_comisiones:reglas', title: 'Reglas manuales' },
+            { id: 'seq_cfo_comisiones:excepciones', title: 'Excepciones' },
+            { id: 'seq_cfo_comisiones:datos', title: 'Datos que no cuadran' },
+            { id: 'seq_cfo_comisiones:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
     ],
   },
@@ -2347,7 +2557,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'preguntas sobre permisos, datos, sistemas o alcance técnico',
         nextAction: 'Alek prepara mapa técnico mínimo antes de pedir acceso o integración.',
         cta: 'pedir revisión de mapa de integración',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si revisamos IA360 desde lo técnico, la conversación debe empezar por permisos, datos, trazabilidad y rollback. ¿Quieres que te deje el mapa de integración o prefieres que Alek lo revise contigo?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió contactarte porque eres quien cuida la parte técnica, y una revisión seria de IA360 empieza por permisos, datos, trazabilidad y rollback. ¿Cómo prefieres revisarlo?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_tecnico_arquitectura:mapa', title: 'Mándame el mapa' },
+            { id: 'seq_tecnico_arquitectura:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_tecnico_arquitectura:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
       {
         id: 'tecnico_rollback',
@@ -2357,7 +2575,19 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'riesgo técnico prioritario o condición para prueba segura',
         nextAction: 'Alek define guardrails técnicos antes de proponer piloto.',
         cta: 'identificar riesgo técnico principal',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de hablar de funciones, Alek quiere entender qué riesgo técnico habría que controlar: permisos, datos, trazabilidad, reversibilidad o dependencia operativa. ¿Cuál revisarías primero?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de hablar de funciones, Alek quiere entender qué riesgo técnico habría que controlar primero en una integración con IA360. ¿Cuál revisarías antes que nada?`,
+        openerOptions: {
+          kind: 'list',
+          button: 'Elegir riesgo',
+          options: [
+            { id: 'seq_tecnico_rollback:permisos', title: 'Permisos' },
+            { id: 'seq_tecnico_rollback:datos', title: 'Datos' },
+            { id: 'seq_tecnico_rollback:trazabilidad', title: 'Trazabilidad' },
+            { id: 'seq_tecnico_rollback:reversibilidad', title: 'Reversibilidad' },
+            { id: 'seq_tecnico_rollback:dependencia', title: 'Dependencia operativa' },
+            { id: 'seq_tecnico_rollback:alek_directo', title: 'Hablar con Alek' },
+          ],
+        },
       },
       {
         id: 'tecnico_integracion',
@@ -2367,7 +2597,15 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'condiciones para una prueba limitada y auditable',
         nextAction: 'Alek confirma límites de piloto antes de tocar sistemas.',
         cta: 'definir prueba técnica controlada',
-        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si hacemos una prueba técnica, debe ser limitada, trazable y reversible. ¿Qué condición tendría que cumplirse para que una integración controlada te parezca segura?`,
+        draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si hacemos una prueba técnica de IA360, Alek la quiere limitada, trazable y reversible. ¿Qué condición tendría que cumplirse para que te parezca segura?`,
+        openerOptions: {
+          kind: 'buttons',
+          options: [
+            { id: 'seq_tecnico_integracion:respondo', title: 'Te respondo aquí' },
+            { id: 'seq_tecnico_integracion:alek_directo', title: 'Que me escriba Alek' },
+            { id: 'seq_tecnico_integracion:ahora_no', title: 'Ahora no' },
+          ],
+        },
       },
     ],
   },
@@ -2426,10 +2664,49 @@ function hasUnresolvedIa360Placeholder(text) {
   return /\{\{\s*(?:\d+|nombre|referidor)[^}]*\}\}|\{\{[^}]+\}\}/i.test(String(text || ''));
 }
 
+// Openers v2: saludo con primer nombre (D9). Limpia el sufijo de QA y toma el
+// primer token; si no hay nada usable devuelve el valor original.
+function ia360FirstNameFrom(name) {
+  const raw = String(name || '').trim().replace(/\s+WhatsApp IA360$/i, '').trim();
+  return raw.split(/\s+/).filter(Boolean)[0] || raw;
+}
+
+// Openers v2: arma el objeto `interactive` de un opener desde sequence.openerOptions
+// (kind 'buttons' ≤3 opciones, kind 'list' 4+). Sin header ni footer: el copy
+// aprobado por Alek va fiel en body.text. Devuelve null si la secuencia no tiene
+// openerOptions (esas siguen saliendo como texto plano).
+function buildIa360OpenerInteractive({ sequence, bodyText }) {
+  const opts = sequence && sequence.openerOptions;
+  if (!opts || !Array.isArray(opts.options) || !opts.options.length) return null;
+  if (opts.kind === 'list') {
+    return {
+      type: 'list',
+      body: { text: bodyText },
+      action: {
+        button: opts.button || 'Elegir',
+        sections: [{
+          title: 'Opciones',
+          rows: opts.options.map(o => ({ id: o.id, title: o.title, ...(o.description ? { description: o.description } : {}) })),
+        }],
+      },
+    };
+  }
+  return {
+    type: 'button',
+    body: { text: bodyText },
+    action: {
+      buttons: opts.options.slice(0, 3).map(o => ({ type: 'reply', reply: { id: o.id, title: o.title } })),
+    },
+  };
+}
+
 function buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction = 'sequence_selected' }) {
   const customFields = contact?.custom_fields || {};
   const name = contact?.name || targetContact;
-  const draft = typeof sequence.draft === 'function' ? sequence.draft({ name }) : String(sequence.draft || '');
+  // Openers v2: saludo con primer nombre (D9) + quién hizo la introducción (D6).
+  const draftName = ia360FirstNameFrom(name);
+  const quienIntro = String(customFields.quien_intro || '').trim() || null;
+  const draft = typeof sequence.draft === 'function' ? sequence.draft({ name: draftName, quienIntro }) : String(sequence.draft || '');
   const relationshipContext = flow.relationshipContext || '';
   const isCapturedOnly = relationshipContext === 'solo_guardar';
   const isDoNotContact = relationshipContext === 'no_contactar';
@@ -2534,6 +2811,9 @@ function buildIa360SequenceReadout({ name, targetContact, flow, sequence, payloa
     '',
     'Borrador propuesto:',
     payload.sequence_candidate.draft,
+    ...(sequence.openerOptions && Array.isArray(sequence.openerOptions.options)
+      ? ['', `Opciones del mensaje (${sequence.openerOptions.kind === 'list' ? 'lista' : 'botones'}): ${sequence.openerOptions.options.map(o => o.title).join(' | ')}`]
+      : []),
     '',
     `Bloqueo actual: ${describeIa360CurrentBlock(payload)}`,
     `Siguiente acción recomendada: ${sequence.nextAction || 'Alek revisa y aprueba solo si el contexto lo justifica.'}`,
@@ -2877,6 +3157,26 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     return deny('copy_blocked', `El borrador de ${name} está bloqueado (placeholder sin resolver). No envié nada.`);
   }
 
+  // GUARDIA cliente_expansion (D7): la secuencia presupone un proyecto andando.
+  // Solo dispara si el contacto tiene un deal vivo (status='open') en P2 (IA360
+  // WhatsApp Revenue Pipeline) o P7 (Champions). Sin deal vivo → bloquear con aviso.
+  if (sequence.requiresLiveDeal) {
+    const { rows: liveRows } = await pool.query(
+      `SELECT 1
+         FROM coexistence.deals d
+         JOIN coexistence.pipelines p ON p.id = d.pipeline_id
+        WHERE p.name IN ('IA360 WhatsApp Revenue Pipeline', 'Champions — Adopción y expansión')
+          AND d.contact_wa_number = $1
+          AND d.contact_number = $2
+          AND d.status = 'open'
+        LIMIT 1`,
+      [record.wa_number, targetContact]
+    );
+    if (!liveRows.length) {
+      return deny('no_live_deal', `${name} no tiene un proyecto activo (deal vivo en P2/P7). La secuencia ${sequence.id} solo aplica a clientes con proyecto en curso; elige otra secuencia. No envié nada.`);
+    }
+  }
+
   // GATE DE SEGURIDAD: allowlist de prueba. Sin allowlist o fuera de ella → NO envía.
   // '*' = la aprobación explícita del owner autoriza a cualquier contacto.
   const allowRaw = String(process.env.IA360_APPROVE_SEND_ALLOWLIST || '').trim();
@@ -2896,14 +3196,31 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
   let sendResult = { ok: false, status: 'not_sent', error: null };
   const openerLabel = `ia360_seq_opener_${sequence.id}`;
   if (insideWindow) {
-    const sent = await sendIa360DirectText({
-      record,
-      toNumber: targetContact,
-      label: openerLabel,
-      body: pf.sequence_candidate.draft,
-    });
+    // Openers v2: dentro de ventana el opener sale como interactive (botones/lista)
+    // con el copy aprobado en el readout; secuencias sin openerOptions siguen en texto.
+    const openerInteractive = buildIa360OpenerInteractive({ sequence, bodyText: pf.sequence_candidate.draft });
+    let sent;
+    let handlerFor;
+    if (openerInteractive) {
+      sent = await enqueueIa360Interactive({
+        record: targetRecord,
+        label: openerLabel,
+        messageBody: `IA360 opener: ${sequence.label}`,
+        interactive: openerInteractive,
+        dedupSuffix: `:opener:${targetContact}`,
+      });
+      handlerFor = `${record.message_id}:opener:${targetContact}`;
+    } else {
+      sent = await sendIa360DirectText({
+        record,
+        toNumber: targetContact,
+        label: openerLabel,
+        body: pf.sequence_candidate.draft,
+      });
+      handlerFor = `${record.message_id}:direct:${targetContact}`;
+    }
     if (!sent) return deny('enqueue_failed', `No pude encolar el opener para ${name}. No se envió.`);
-    const status = await waitForIa360OutboundStatus(`${record.message_id}:direct:${targetContact}`);
+    const status = await waitForIa360OutboundStatus(handlerFor);
     sendResult = { ok: String(status?.status || '').toLowerCase() === 'sent', status: status?.status || 'unknown', error: status?.error_message || null, message_id: status?.message_id || null };
   } else if (sequence.metaTemplateName) {
     const res = await enqueueIa360Template({ record: targetRecord, label: openerLabel, templateName: sequence.metaTemplateName });
@@ -5916,6 +6233,41 @@ async function handleIa360LiteInteractive(record) {
     });
     return;
   }
+
+  // ── FALLBACK GLOBAL DE INTERACTIVE (openers v2) ────────────────────────────
+  // Si llegamos aquí, NINGÚN handler reconoció el button/list reply (id viejo,
+  // id de opener v2 sin ruteo todavía, o quick reply de template sin estado,
+  // p. ej. "Sí, cuéntame" de ia360_referido_apertura). Antes el contacto quedaba
+  // MUDO; ahora siempre recibe acuse y el owner se entera. try/catch terminal:
+  // nunca tumba el webhook.
+  try {
+    const fallbackId = replyId || answer || '(sin id)';
+    console.warn('[ia360-fallback] unhandled interactive reply contact=%s id=%s body=%s', record.contact_number || '-', fallbackId, String(record.message_body || '').slice(0, 80));
+    if (normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'owner_interactive_fallback_ack',
+        body: `Recibí tu respuesta "${String(record.message_body || fallbackId).slice(0, 60)}", pero aún no tengo una acción conectada para ese botón (${fallbackId}). No hice ningún cambio.`,
+      });
+      return;
+    }
+    await enqueueIa360Text({
+      record,
+      label: 'ia360_interactive_fallback',
+      body: 'Recibí tu respuesta y la estoy ubicando para darte una respuesta útil. Si es urgente, Alek también puede escribirte directo.',
+    });
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_interactive_fallback_notice',
+      body: `Alek, ${record.contact_name || record.contact_number} (${record.contact_number}) respondió "${String(record.message_body || fallbackId).slice(0, 60)}" (id: ${fallbackId}) y no tengo un manejador para esa opción. Le acusé recibo; revisa si quieres tomarlo tú.`,
+      targetContact: record.contact_number,
+      ownerBudget: true,
+    });
+  } catch (fbErr) {
+    console.error('[ia360-fallback] interactive fallback error:', fbErr.message);
+  }
 }
 
 
@@ -6407,6 +6759,64 @@ router.post('/internal/ia360-revenue/opener', async (req, res) => {
   } catch (err) {
     console.error('[revenue-os] opener endpoint error:', err.message);
     return res.status(500).json({ ok: false, error: 'opener_failed' });
+  }
+});
+
+// OPENERS V2 — vista previa de un opener al WhatsApp del OWNER (nunca a un
+// contacto). Renderiza el draft v2 (primer nombre + quien_intro opcional) y el
+// interactive (botones/lista) tal como lo vería el contacto. Único egress:
+// sendOwnerInteractive / sendIa360DirectText -> messageSender. Auth =
+// X-IA360-Directive-Secret (mismo patrón que los demás endpoints internos).
+router.post('/internal/ia360-openers/preview', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    const sequenceId = String(b.sequence_id || '').trim().toLowerCase();
+    const found = findIa360SequenceFlow(sequenceId);
+    if (!found) return res.status(422).json({ ok: false, error: 'unknown_sequence', sequence_id: sequenceId });
+    const { sequence } = found;
+    const sampleName = ia360FirstNameFrom(String(b.name || 'Alek').trim() || 'Alek');
+    const quienIntro = String(b.quien_intro || '').trim() || null;
+    const bodyText = typeof sequence.draft === 'function' ? sequence.draft({ name: sampleName, quienIntro }) : String(sequence.draft || '');
+    const waNumber = normalizePhone(b.wa_number || process.env.IA360_WA_NUMBER || '5213321594582');
+    const synthetic = {
+      wa_number: waNumber,
+      contact_number: IA360_OWNER_NUMBER,
+      message_id: `opener-preview-${sequenceId}-${Date.now()}`,
+      message_type: 'text',
+      direction: 'incoming',
+    };
+    const interactive = buildIa360OpenerInteractive({ sequence, bodyText });
+    let sent;
+    if (interactive) {
+      // ownerBudget=false: la preview es una petición explícita del owner; no debe
+      // caer en el presupuesto anti-spam de notificaciones.
+      sent = await sendOwnerInteractive({
+        record: synthetic,
+        label: `ia360_opener_preview_${sequenceId}`,
+        messageBody: `IA360 preview opener ${sequenceId}`,
+        interactive,
+      });
+    } else {
+      sent = await sendIa360DirectText({
+        record: synthetic,
+        toNumber: IA360_OWNER_NUMBER,
+        label: `ia360_opener_preview_${sequenceId}`,
+        body: bodyText,
+      });
+    }
+    return res.status(sent ? 200 : 502).json({
+      ok: Boolean(sent),
+      schema: 'ia360_opener_preview.v1',
+      sequence_id: sequenceId,
+      kind: interactive ? (interactive.type === 'list' ? 'list' : 'buttons') : 'text',
+      body_preview: bodyText,
+    });
+  } catch (err) {
+    console.error('[ia360-openers] preview endpoint error:', err.message);
+    return res.status(500).json({ ok: false, error: 'preview_failed' });
   }
 });
 
