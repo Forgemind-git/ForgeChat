@@ -138,6 +138,8 @@ export const api = {
     update: (id, data) => req(`/chatbots/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
     duplicate: (id) => req(`/chatbots/${id}/duplicate`, { method: 'POST' }),
     delete: (id) => req(`/chatbots/${id}`, { method: 'DELETE' }),
+    exportOne: (id) => req(`/chatbots/${id}/export`),
+    import: (payload) => req('/chatbots/import', { method: 'POST', body: JSON.stringify(payload) }),
     executions: (id, { page = 1, limit = 20, status = 'all', startDate = '', endDate = '', messageStatus = 'all' } = {}) => {
       const qs = new URLSearchParams({ page: String(page), limit: String(limit) });
       if (status && status !== 'all') qs.set('status', status);
@@ -194,6 +196,8 @@ export const api = {
     create: (data) => req('/agents', { method: 'POST', body: JSON.stringify(data) }),
     update: (id, data) => req(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
     delete: (id) => req(`/agents/${id}`, { method: 'DELETE' }),
+    exportOne: (id) => req(`/agents/${id}/export`),
+    import: (payload) => req('/agents/import', { method: 'POST', body: JSON.stringify(payload) }),
     runs: (id, limit = 50) => req(`/agents/${id}/runs?limit=${limit}`),
     run: (id, runId) => req(`/agents/${id}/runs/${runId}`),
     addTool: (id, data) => req(`/agents/${id}/tools`, { method: 'POST', body: JSON.stringify(data) }),
@@ -216,6 +220,25 @@ export const api = {
         return res.json();
       });
     },
+  },
+  // Per-conversation bot control (Chats header 🤖 toggle).
+  agentConversation: {
+    status: (waNumber, contactNumber) =>
+      req(`/agent-conversation?waNumber=${encodeURIComponent(waNumber)}&contactNumber=${encodeURIComponent(contactNumber)}`),
+    pause: (waNumber, contactNumber) =>
+      req('/agent-conversation/pause', { method: 'POST', body: JSON.stringify({ waNumber, contactNumber }) }),
+    resume: (waNumber, contactNumber) =>
+      req('/agent-conversation/resume', { method: 'POST', body: JSON.stringify({ waNumber, contactNumber }) }),
+  },
+  // External MCP access — admin management of keys + capability toggles.
+  mcp: {
+    getSettings: () => req('/mcp/settings'),
+    updateSettings: (data) => req('/mcp/settings', { method: 'PUT', body: JSON.stringify(data) }),
+    listKeys: () => req('/mcp/keys'),
+    createKey: (label) => req('/mcp/keys', { method: 'POST', body: JSON.stringify({ label }) }),
+    updateKey: (id, data) => req(`/mcp/keys/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+    deleteKey: (id) => req(`/mcp/keys/${id}`, { method: 'DELETE' }),
+    install: () => req('/mcp/install'),
   },
   pipelines: {
     list: () => req('/pipelines'),

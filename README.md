@@ -256,6 +256,52 @@ In the **Meta dashboard** → **WhatsApp → Configuration → Webhook → Edit*
 
 ---
 
+## 🔌 Build agents from Claude (MCP server)
+
+ForgeChat ships an **MCP server** so you can **build and manage your WhatsApp AI agents by chatting with Claude** (Claude Desktop, or any MCP client) — it asks what you need, looks up your real WhatsApp numbers, AI models, Google Sheets, media and templates, and creates a fully-configured agent for you. No dashboard required.
+
+### Step 1 — Turn it on and get a key
+In ForgeChat, open **Settings → MCP Tools**:
+1. Flip the **master switch** on, and enable the **capabilities** you want (discovery, create/update agents, manage tools, delete).
+2. Click **Generate key** and copy the `fck_live_…` value — it's shown **once**.
+
+### Step 2 — Connect Claude (pick one)
+
+**A) Remote — just a URL (easiest)**
+The MCP Tools page shows a ready-to-paste connect URL:
+
+```
+https://your-domain/api/mcp/http/<your-key>
+```
+
+In Claude (web/desktop/mobile) → **Settings → Connectors → Add custom connector** → paste that URL. Done.
+
+**B) Local — run the bundled server**
+Use the server in [`mcp-server/`](mcp-server/) (`npm install` once), then add this to your `claude_desktop_config.json`
+(macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`, Windows: `%APPDATA%\Claude\claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "forgechat-agents": {
+      "command": "node",
+      "args": ["/path/to/ForgeChat/mcp-server/src/index.js"],
+      "env": {
+        "FORGECHAT_API_URL": "https://your-domain/api/mcp/v1",
+        "FORGECHAT_API_KEY": "fck_live_PASTE_YOUR_KEY"
+      }
+    }
+  }
+}
+```
+
+### Step 3 — Use it
+Fully quit and reopen Claude, then say **“create a ForgeChat agent”** — it walks you through the setup questions and builds the agent. Each capability is gated by the toggles in **Settings → MCP Tools** (a disabled one returns a clear error), and the key can be revoked any time from the same page.
+
+> Replace `your-domain` with wherever ForgeChat is hosted. The bearer key works over the internet; your ForgeChat login cookie is never involved. See [`mcp-server/README.md`](mcp-server/README.md) for the full tool list and debugging tips.
+
+---
+
 ## 🔄 Keeping it running
 
 **Update to the latest version** (run on your server, inside the `ForgeChat` folder):

@@ -18,10 +18,12 @@ async function runWithTools({
 }) {
   const client = new Anthropic({ apiKey });
 
-  // Translate our generic messages to Anthropic's format. v1: text only.
+  // Translate our generic messages to Anthropic's format. `content` may be a
+  // plain string (text) OR an array of generic parts: { type:'text', text } and
+  // { type:'image', mime, data /* base64, no data: prefix */ }.
   const history = messages.map(m => ({
     role: m.role,
-    content: [{ type: 'text', text: m.content }],
+    content: toAnthropicContent(m.content),
   }));
 
   let totalInputTokens = 0;
@@ -110,6 +112,21 @@ async function runWithTools({
   }
 
   return { finalText, totalInputTokens, totalOutputTokens, iterations, capped: true };
+}
+
+// Generic content → Anthropic content blocks. A bare string becomes one text
+// block; an array of {type:'text'|'image'} parts is mapped block-by-block.
+function toAnthropicContent(content) {
+  if (typeof content === 'string') return [{ type: 'text', text: content }];
+  if (Array.isArray(content)) {
+    return content.map(part => {
+      if (part?.type === 'image' && part.data) {
+        return { type: 'image', source: { type: 'base64', media_type: part.mime || 'image/jpeg', data: part.data } };
+      }
+      return { type: 'text', text: String(part?.text ?? '') };
+    });
+  }
+  return [{ type: 'text', text: String(content ?? '') }];
 }
 
 function safeParse(s) {

@@ -31,7 +31,7 @@ async function runWithTools({
 
   const history = [
     { role: 'system', content: systemPrompt },
-    ...messages.map(m => ({ role: m.role, content: m.content })),
+    ...messages.map(m => ({ role: m.role, content: toOpenAIContent(m.content) })),
   ];
 
   let totalInputTokens = 0;
@@ -114,6 +114,22 @@ async function runWithTools({
   }
 
   return { finalText, totalInputTokens, totalOutputTokens, iterations, capped: true };
+}
+
+// Generic content → OpenAI content. A bare string passes through unchanged; an
+// array of {type:'text'|'image'} parts becomes OpenAI's multimodal parts
+// ({type:'text'} / {type:'image_url', image_url:{url:'data:<mime>;base64,...'}}).
+function toOpenAIContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(part => {
+      if (part?.type === 'image' && part.data) {
+        return { type: 'image_url', image_url: { url: `data:${part.mime || 'image/jpeg'};base64,${part.data}` } };
+      }
+      return { type: 'text', text: String(part?.text ?? '') };
+    });
+  }
+  return String(content ?? '');
 }
 
 function safeParse(s) {

@@ -115,7 +115,7 @@ Keep all eight design principles regardless of flow.
 
 ---
 
-## Phase 4 — Build the agent in ForgeChat over MCP (optional)
+## Phase 4 — Build the agent in ForgeChat over MCP
 
 Phases 1–3 produce the **system prompt**. If a ForgeChat **MCP connector** is connected, you can also **create and configure the agent directly in ForgeChat** instead of pasting the prompt by hand — Claude drives the build through the MCP tools.
 
@@ -130,12 +130,12 @@ Build flow:
 4. Trigger: `"any"` (every message) or `"keyword"` (ask keyword, match type exact/contains/starts, case sensitivity, session minutes — default 30).
 5. Inbound understanding: set `transcribeAudio:true` to transcribe voice notes (needs an OpenAI key), `acceptImages:true` to let it see images (pick a vision-capable model, e.g. GPT-4o / Claude).
 6. Tools:
-   - **Google Sheets** (per connected Google account): `list_google_accounts` → `search_spreadsheets` (with that `googleAccountId`) → `list_sheet_tabs` → ask which ops (read/append/update), then `add_google_sheets_tool` (`googleAccountId` + spreadsheet + tab + ops).
+   - **Google Sheets** (per connected Google account): `list_google_accounts` → `search_spreadsheets` (with that `googleAccountId`) → `list_sheet_tabs` → if the agent will LOG rows, call `read_sheet_values` (range `A1:Z1`) to read the real header row and map fields to the exact column names. Ask which ops to allow — read / append / update / **upsert** — then `add_google_sheets_tool` (`googleAccountId` + spreadsheet + tab + ops). **For logging a contact's data, prefer `upsert`:** it finds the contact's existing row by a key column (e.g. phone number) and updates only the columns you name, or adds a new row if none exists — so a contact never gets duplicate rows and you never track row numbers or column order.
    - **HTTP request** (call an external API / device / webhook): `add_http_tool` with method + URL (use `{name}` for path params) + static auth headers + the params the AI fills (each: name, location path/query/body/header, type, description, required).
 7. Media groups (optional): for each, a "when to send" **description** + media (`list_media`) and/or an approved template (`list_templates` → `get_template` to confirm content before using its id).
 8. Summarize the full config, get a "yes", then `create_agent`; attach any tools; report the new agent id and offer to activate it (Go Live).
 
-**MCP tools available** — discovery: `list_wa_accounts`, `list_models`, `list_google_accounts`, `search_spreadsheets`, `list_sheet_tabs`, `list_media`, `list_templates`, `get_template`, `list_agents`, `get_agent`. Mutations: `create_agent`, `update_agent`, `add_google_sheets_tool`, `add_http_tool`, `add_tool`, `update_tool`, `delete_tool`, `delete_agent`. The master switch + per-capability toggles in Admin Settings → MCP Tools gate what's allowed (a disabled capability returns 403); always confirm destructive actions first.
+**MCP tools available** — discovery: `list_wa_accounts`, `list_models`, `list_google_accounts`, `search_spreadsheets`, `list_sheet_tabs`, `read_sheet_values`, `list_media`, `list_templates`, `get_template`, `list_agents`, `get_agent`. Mutations: `create_agent`, `update_agent`, `add_google_sheets_tool`, `add_http_tool`, `add_tool`, `update_tool`, `delete_tool`, `delete_agent`. The master switch + per-capability toggles in Admin Settings → MCP Tools gate what's allowed (a disabled capability returns 403); always confirm destructive actions first.
 
 **Constraints to respect** (the server enforces them too): OpenAI / Anthropic providers only; one active agent per WhatsApp number; a keyword-triggered active agent needs a keyword; context window 1–100 messages; max tool iterations 1–20; trigger session 1–1440 minutes; `acceptImages` requires a vision-capable model.
 

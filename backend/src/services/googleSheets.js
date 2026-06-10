@@ -11,6 +11,30 @@
 const { google } = require('googleapis');
 const { getAccessToken } = require('./googleAuth');
 
+// ── helpers for the `upsert` op ────────────────────────────────────────────
+function colLetter(idx) {
+  let s = ''; let n = Number(idx);
+  do { s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
+  return s;
+}
+function normCell(v) { return String(v == null ? '' : v).trim().toLowerCase(); }
+function digitsOnly(v) { return String(v == null ? '' : v).replace(/\D/g, ''); }
+// Match a cell against a key — exact (case-insensitive) OR digits-only (so
+// "+91 94877 22330" matches "919487722330" for phone-number keys).
+function keyMatch(cell, key) {
+  if (normCell(cell) !== '' && normCell(cell) === normCell(key)) return true;
+  const dc = digitsOnly(cell); const dk = digitsOnly(key);
+  return dc !== '' && dc === dk;
+}
+// Parse the start row/col index from a returned A1 range like
+// "'Enquiry tracker'!A1:G23" → { row: 1, col: 0 } (1-based row, 0-based col).
+function parseStart(rangeA1) {
+  const m = String(rangeA1 || '').match(/!\$?([A-Z]+)\$?(\d+)/);
+  if (!m) return { row: 1, col: 0 };
+  let col = 0; for (const ch of m[1]) col = col * 26 + (ch.charCodeAt(0) - 64);
+  return { row: parseInt(m[2], 10), col: col - 1 };
+}
+
 async function authedSheets(credentialId) {
   const token = await getAccessToken(credentialId);
   const oauth2 = new google.auth.OAuth2();
@@ -100,17 +124,37 @@ async function append({ credentialId, spreadsheetId, sheetName, args = {} }) {
     throw new Error('append requires args.values (array)');
   }
   const sheets = await authedSheets(credentialId);
-  const { data } = await sheets.spreadsheets.values.append({
+  // Deterministic placement: read the tab, find the LAST non-empty row, and
+  // write the new row right after it via values.update at an explicit range.
+  // We do NOT use values.append — its "table detection" lands on the styled
+  // header row when the tab is a Sheets "Table" (title banner in row 1 +
+  // dark-blue header in row 2), which made rows overwrite the header band.
+  // This way the agent never chooses a row number; the code computes it.
+  const { data: read } = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `'${sheetName}'`,
+    range: `'${sheetName}'!A1:Z2000`,
+    valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+  const rows = read.values || [];
+  const start = parseStart(read.range); // 1-based first row of the read window
+  let lastNonEmpty = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if ((rows[i] || []).some(c => String(c == null ? '' : c).trim() !== '')) lastNonEmpty = i;
+  }
+  const targetRow = start.row + lastNonEmpty + 1; // first empty row after content
+  const endCol = colLetter(Math.max(0, args.values.length - 1));
+  const { data } = await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `'${sheetName}'!A${targetRow}:${endCol}${targetRow}`,
     valueInputOption: 'USER_ENTERED',
-    insertDataOption: 'INSERT_ROWS',
     requestBody: { values: [args.values] },
   });
   return {
-    updatedRange: data.updates?.updatedRange,
-    updatedRows: data.updates?.updatedRows,
-    updatedCells: data.updates?.updatedCells,
+    action: 'appended',
+    row: targetRow,
+    updatedRange: data.updatedRange,
+    updatedRows: data.updatedRows,
+    updatedCells: data.updatedCells,
   };
 }
 
@@ -139,6 +183,90 @@ async function update({ credentialId, spreadsheetId, sheetName, args = {} }) {
 }
 
 /**
+ * Tool op: find-or-create a row by a key column, writing only named columns.
+ * The engine handles header discovery, row numbers and the column offset so the
+ * LLM never deals with A1 ranges — it just gives
+ * { key_column, key_value, fields:{ "Header Name": value } }. The reliable way
+ * to keep a single evolving row per contact (vs. raw append/update).
+ */
+async function upsert({ credentialId, spreadsheetId, sheetName, args = {} }) {
+  const keyColumn = args.key_column;
+  const keyValue = args.key_value;
+  const fields = args.fields;
+  if (!keyColumn) throw new Error('upsert requires args.key_column (a header name, e.g. "Phone Number")');
+  if (keyValue == null || keyValue === '') throw new Error('upsert requires args.key_value');
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
+    throw new Error('upsert requires args.fields as an object of { "Column Header": value, ... }');
+  }
+  const sheets = await authedSheets(credentialId);
+  const { data: readData } = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `'${sheetName}'!A1:Z2000`, valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+  const rows = readData.values || [];
+  const start = parseStart(readData.range);
+
+  // 1. Locate the header row (first row that contains the key column name).
+  let hIdx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if ((rows[i] || []).some(c => normCell(c) === normCell(keyColumn))) { hIdx = i; break; }
+  }
+  if (hIdx === -1) throw new Error(`Could not find a header row containing "${keyColumn}" in tab "${sheetName}". Check the column name.`);
+  const header = rows[hIdx];
+  const colOf = (name) => header.findIndex(c => normCell(c) === normCell(name));
+  const keyCol = colOf(keyColumn);
+
+  // 2. Resolve each field name → its column index (skip unknown columns).
+  const writes = []; const skippedUnknownColumns = [];
+  for (const [name, value] of Object.entries(fields)) {
+    const c = colOf(name);
+    if (c === -1) skippedUnknownColumns.push(name); else writes.push({ col: c, value });
+  }
+  if (writes.length === 0) throw new Error(`None of the given field names matched a column header in "${sheetName}". Headers are: ${header.filter(Boolean).join(', ')}`);
+
+  // 3. Find the existing data row whose key column matches key_value.
+  let dIdx = -1;
+  for (let i = hIdx + 1; i < rows.length; i++) {
+    if (keyMatch((rows[i] || [])[keyCol], keyValue)) { dIdx = i; break; }
+  }
+
+  const writeSpan = async (absRow, minC, maxC, span) => {
+    const { data } = await sheets.spreadsheets.values.update({
+      spreadsheetId, range: `'${sheetName}'!${colLetter(minC)}${absRow}:${colLetter(maxC)}${absRow}`,
+      valueInputOption: 'USER_ENTERED', requestBody: { values: [span] },
+    });
+    return data;
+  };
+
+  if (dIdx !== -1) {
+    const absRow = start.row + dIdx;
+    const cols = writes.map(w => w.col);
+    const minC = Math.min(...cols); const maxC = Math.max(...cols);
+    const existing = rows[dIdx] || [];
+    const span = [];
+    for (let c = minC; c <= maxC; c++) {
+      const w = writes.find(x => x.col === c);
+      span.push(w ? w.value : (existing[c] != null ? existing[c] : ''));
+    }
+    await writeSpan(absRow, minC, maxC, span);
+    return { action: 'updated', row: absRow, key: { column: keyColumn, value: keyValue }, wrote: writes.map(w => header[w.col]), skippedUnknownColumns };
+  }
+
+  // 4. No match → write a new positioned row after the last non-empty line
+  // (deterministic; avoids Google append landing on a Tables header banner).
+  let lastNonEmpty = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if ((rows[i] || []).some(c => String(c == null ? '' : c).trim() !== '')) lastNonEmpty = i;
+  }
+  const targetRow = start.row + lastNonEmpty + 1;
+  const maxC = Math.max(keyCol, ...writes.map(w => w.col));
+  const rowArr = new Array(maxC + 1).fill('');
+  rowArr[keyCol] = keyValue;
+  for (const w of writes) rowArr[w.col] = w.value;
+  await writeSpan(targetRow, 0, maxC, rowArr);
+  return { action: 'appended', row: targetRow, key: { column: keyColumn, value: keyValue }, wrote: writes.map(w => header[w.col]), skippedUnknownColumns };
+}
+
+/**
  * Dispatcher used by the agent engine. Looks at the tool's `config.ops` to
  * gate which operations the LLM is allowed to call — defense in depth, since
  * the LLM only ever sees the ops we expose to it in the tool schema anyway.
@@ -157,6 +285,7 @@ async function executeOp({ op, toolConfig, args }) {
   if (op === 'read')   return read(ctx);
   if (op === 'append') return append(ctx);
   if (op === 'update') return update(ctx);
+  if (op === 'upsert') return upsert(ctx);
   throw new Error(`Unknown Sheets op: ${op}`);
 }
 
@@ -166,5 +295,6 @@ module.exports = {
   read,
   append,
   update,
+  upsert,
   executeOp,
 };

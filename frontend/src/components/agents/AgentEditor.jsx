@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Save, Trash2, Loader2, AlertCircle, ExternalLink, ChevronDown, ChevronUp } from 'lucide-react';
+import { Save, Trash2, Loader2, AlertCircle, ExternalLink, ChevronDown, ChevronUp, Download } from 'lucide-react';
 import { api } from '../../api.js';
-import { C, FONT, MONO } from '../../constants.js';
+import { C, FONT, MONO, downloadJson, slugifyName } from '../../constants.js';
 import DeleteConfirmModal from '../DeleteConfirmModal.jsx';
 import SearchableSelect from '../SearchableSelect.jsx';
 import InfoDot from '../InfoDot.jsx';
@@ -22,6 +22,13 @@ const BLANK = {
   contextWindowMessages: 20,
   maxToolIterations: 6,
   transcribeAudio: false,
+  acceptImages: false,
+  crmToolsEnabled: false,
+  handoffEnabled: false,
+  handoffUserIds: [],
+  handoffKeywords: '',
+  closeSummaryEnabled: false,
+  closeIdleMinutes: 30,
   triggerMode: 'any',
   triggerKeyword: '',
   triggerMatchType: 'contains',
@@ -41,16 +48,19 @@ export default function AgentEditor({ agentId, waAccounts, user, navigate, onDon
   const [error, setError] = useState('');
   const [pendingDelete, setPendingDelete] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [bdaUsers, setBdaUsers] = useState([]); // eligible users for handoff round-robin
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const [models, a] = await Promise.all([
+      const [models, a, usrs] = await Promise.all([
         api.aiModels.list().catch(() => []),
         isCreate ? Promise.resolve(null) : api.agents.get(agentId),
+        api.users.list().catch(() => []),
       ]);
       setAiModels(models);
+      setBdaUsers(Array.isArray(usrs) ? usrs.filter(u => u.is_active !== false) : []);
       if (a) {
         setForm({
           name: a.name || '',
@@ -64,6 +74,13 @@ export default function AgentEditor({ agentId, waAccounts, user, navigate, onDon
           contextWindowMessages: a.contextWindowMessages || 20,
           maxToolIterations: a.maxToolIterations || 6,
           transcribeAudio: !!a.transcribeAudio,
+          acceptImages: !!a.acceptImages,
+          crmToolsEnabled: !!a.crmToolsEnabled,
+          handoffEnabled: !!a.handoffEnabled,
+          handoffUserIds: Array.isArray(a.handoffUserIds) ? a.handoffUserIds : [],
+          handoffKeywords: a.handoffKeywords || '',
+          closeSummaryEnabled: !!a.closeSummaryEnabled,
+          closeIdleMinutes: a.closeIdleMinutes || 30,
           triggerMode: a.triggerMode || 'any',
           triggerKeyword: a.triggerKeyword || '',
           triggerMatchType: a.triggerMatchType || 'contains',
@@ -126,6 +143,13 @@ export default function AgentEditor({ agentId, waAccounts, user, navigate, onDon
       contextWindowMessages: form.contextWindowMessages,
       maxToolIterations: form.maxToolIterations,
       transcribeAudio: form.transcribeAudio,
+      acceptImages: form.acceptImages,
+      crmToolsEnabled: form.crmToolsEnabled,
+      handoffEnabled: form.handoffEnabled,
+      handoffUserIds: form.handoffUserIds,
+      handoffKeywords: form.handoffKeywords,
+      closeSummaryEnabled: form.closeSummaryEnabled,
+      closeIdleMinutes: form.closeIdleMinutes,
       triggerMode: form.triggerMode,
       triggerKeyword: form.triggerKeyword,
       triggerMatchType: form.triggerMatchType,
@@ -151,6 +175,20 @@ export default function AgentEditor({ agentId, waAccounts, user, navigate, onDon
     } catch (e) {
       setError(prettyError(e));
       setSaving(false);
+    }
+  };
+
+  const [exporting, setExporting] = useState(false);
+  const handleExport = async () => {
+    if (agentId == null) { setError('Save the agent first, then export it.'); return; }
+    setExporting(true);
+    try {
+      const data = await api.agents.exportOne(agentId);
+      downloadJson(`agent-${slugifyName(form.name)}`, data);
+    } catch (e) {
+      setError(prettyError(e));
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -236,6 +274,23 @@ export default function AgentEditor({ agentId, waAccounts, user, navigate, onDon
               {form.isActive ? '● Live — answering WhatsApp messages' : 'Inactive — not answering messages'}
             </div>
           </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button
+            type="button"
+            onClick={handleExport}
+            disabled={exporting}
+            title="Download this agent as a JSON file you can import elsewhere"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 7,
+              padding: '9px 16px', borderRadius: 99,
+              border: `1px solid ${C.border}`, background: C.cardBg,
+              color: C.text, fontSize: 13, fontFamily: FONT, fontWeight: 600, whiteSpace: 'nowrap',
+              cursor: exporting ? 'wait' : 'pointer', opacity: exporting ? 0.6 : 1,
+            }}
+          >
+            {exporting ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <Download size={13} />}
+            Export
+          </button>
           <button
             type="button"
             onClick={handleToggleLive}
@@ -257,6 +312,7 @@ export default function AgentEditor({ agentId, waAccounts, user, navigate, onDon
               : <span style={{ width: 8, height: 8, borderRadius: 99, background: form.isActive ? '#1D9E75' : '#fff' }} />}
             {togglingLive ? 'Saving…' : (form.isActive ? 'Live' : 'Go Live')}
           </button>
+          </div>
         </div>
       )}
 
@@ -335,6 +391,37 @@ export default function AgentEditor({ agentId, waAccounts, user, navigate, onDon
                   </div>
                   <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
                     Needs an OpenAI key connected in Integrations → AI Models.
+                  </div>
+                </div>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', marginTop: 14 }}>
+                <input
+                  type="checkbox"
+                  checked={form.acceptImages}
+                  onChange={e => setForm(f => ({ ...f, acceptImages: e.target.checked }))}
+                  style={{ width: 16, height: 16, marginTop: 2, cursor: 'pointer' }}
+                />
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', fontSize: 13, fontWeight: 600, color: C.text }}>
+                    Accept images
+                    <InfoDot text="When on, an incoming WhatsApp image is sent to the agent's model (with any caption) so it can 'see' the picture. Use a vision-capable model (e.g. GPT-4o, Claude). Adds tokens per image." />
+                  </div>
+                  <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+                    Use a vision-capable model (GPT-4o, Claude). Adds tokens per image.
+                  </div>
+                </div>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', marginTop: 14 }}>
+                <input type="checkbox" checked={form.crmToolsEnabled}
+                  onChange={e => setForm(f => ({ ...f, crmToolsEnabled: e.target.checked }))}
+                  style={{ width: 16, height: 16, marginTop: 2, cursor: 'pointer' }} />
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', fontSize: 13, fontWeight: 600, color: C.text }}>
+                    Update CRM (Contacts &amp; tags)
+                    <InfoDot text="When on, the agent can act on the chatting contact inside ForgeChat — save their name, add tags, and set custom fields — so enquiries land in your CRM, not just a sheet. The agent only ever touches the contact it's chatting with." />
+                  </div>
+                  <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+                    Lets the agent set the contact's name, tags &amp; custom fields.
                   </div>
                 </div>
               </label>
@@ -419,6 +506,81 @@ export default function AgentEditor({ agentId, waAccounts, user, navigate, onDon
           </div>
         </Section>
       )}
+
+      {advancedOpen && (<>
+      <Section title="Human handoff" subtitle="Let the agent hand a conversation to a real person — when the customer asks for one, says a keyword, or a team member takes over from the chat.">
+        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+          <input type="checkbox" checked={form.handoffEnabled}
+            onChange={e => setForm(f => ({ ...f, handoffEnabled: e.target.checked }))}
+            style={{ width: 16, height: 16, marginTop: 2, cursor: 'pointer' }} />
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: 13, fontWeight: 600, color: C.text }}>
+              Enable human handoff
+              <InfoDot text="Gives the agent an 'escalate to human' tool, enables handoff keywords, and shows a take-over toggle in the chat. While handed off, the bot stays silent until someone returns control." />
+            </div>
+            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+              Adds the escalate tool + keyword trigger + the chat take-over toggle.
+            </div>
+          </div>
+        </label>
+        {form.handoffEnabled && (
+          <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <Field label="Hand off to (round-robin)" info="Conversations are assigned one-by-one across the people you pick here. The manual take-over button assigns to whoever clicks it.">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 200, overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: 8, padding: 8 }}>
+                {bdaUsers.length === 0 && <div style={{ fontSize: 12, color: C.textMuted }}>No team members found.</div>}
+                {bdaUsers.map(u => {
+                  const checked = form.handoffUserIds.map(String).includes(String(u.id));
+                  return (
+                    <label key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: C.text }}>
+                      <input type="checkbox" checked={checked}
+                        onChange={e => setForm(f => {
+                          const cur = f.handoffUserIds.map(String);
+                          const next = e.target.checked ? [...new Set([...cur, String(u.id)])] : cur.filter(x => x !== String(u.id));
+                          return { ...f, handoffUserIds: next.map(n => parseInt(n, 10)) };
+                        })}
+                        style={{ width: 15, height: 15, cursor: 'pointer' }} />
+                      <span>{u.display_name || u.username}</span>
+                      <span style={{ fontSize: 11, color: C.textMuted }}>· {u.role}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </Field>
+            <Field label="Handoff keywords (optional)" info="Comma-separated. If the customer's message contains any of these, the chat is handed to a human instead of the bot replying. e.g. human, agent, talk to someone.">
+              <input value={form.handoffKeywords}
+                onChange={e => setForm(f => ({ ...f, handoffKeywords: e.target.value }))}
+                placeholder="human, agent, talk to someone" style={inputStyle} />
+            </Field>
+          </div>
+        )}
+      </Section>
+
+      <Section title="Auto-summary on close" subtitle="When a conversation goes quiet, the agent writes a final summary (and updates your sheet/CRM) so you don't get only the first line.">
+        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+          <input type="checkbox" checked={form.closeSummaryEnabled}
+            onChange={e => setForm(f => ({ ...f, closeSummaryEnabled: e.target.checked }))}
+            style={{ width: 16, height: 16, marginTop: 2, cursor: 'pointer' }} />
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: 13, fontWeight: 600, color: C.text }}>
+              Summarise the conversation when it goes idle
+              <InfoDot text="After the chat has no new messages for the idle window, the agent generates a concise summary of the whole conversation and (if it has a Sheets upsert tool / CRM access) logs it — so a row reflects the full chat, not just the opening message." />
+            </div>
+            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+              Needs the agent to have a Sheets (upsert) tool and/or CRM access to write the summary.
+            </div>
+          </div>
+        </label>
+        {form.closeSummaryEnabled && (
+          <div style={{ marginTop: 14 }}>
+            <Field label="Idle window (minutes)" info="How long with no new messages before the conversation counts as 'closed' and gets summarised.">
+              <input type="number" min={1} max={1440} value={form.closeIdleMinutes}
+                onChange={e => setForm(f => ({ ...f, closeIdleMinutes: parseInt(e.target.value, 10) || 30 }))}
+                style={{ ...inputStyle, maxWidth: 140 }} />
+            </Field>
+          </div>
+        )}
+      </Section>
+      </>)}
 
       {!isCreate && <AgentRunsViewer agentId={agentId} />}
 
@@ -551,17 +713,37 @@ function Field({ label, info, children }) {
 // builder (pills + fields), not the automation flow-canvas node.
 function TriggerConfig({ form, setForm }) {
   const set = (patch) => setForm(f => ({ ...f, ...patch }));
-  const isKeyword = form.triggerMode === 'keyword';
+  const mode = form.triggerMode || 'any';
+  const isKeyword = mode === 'keyword';
   return (
     <div>
       <FieldRow>
-        <Field label="When does it run?" info="Any message: the agent replies to every inbound on its number (that no keyword automation caught). Keyword: it only engages when a message matches — then it keeps replying to that contact's follow-ups for the session window below.">
-          <div style={{ display: 'flex', gap: 8 }}>
-            <Pill active={!isKeyword} onClick={() => set({ triggerMode: 'any' })}>Any message</Pill>
+        <Field label="When does it run?" info="Any message: replies to every inbound on its number. New conversations only: engages a contact ONLY on their first-ever message (a new lead), then keeps replying to that conversation — it never joins conversations that already existed. Keyword: engages only when a message matches a keyword, then keeps replying for the session.">
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <Pill active={mode === 'any'} onClick={() => set({ triggerMode: 'any' })}>Any message</Pill>
+            <Pill active={mode === 'new'} onClick={() => set({ triggerMode: 'new' })}>New conversations only</Pill>
             <Pill active={isKeyword} onClick={() => set({ triggerMode: 'keyword' })}>Keyword</Pill>
           </div>
         </Field>
       </FieldRow>
+
+      {mode === 'new' && (
+        <>
+          <div style={{ fontSize: 11, color: C.textMuted, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
+            The agent answers a contact only on their <strong>first message</strong> to this number, then continues that conversation for the session window below. Existing/ongoing chats are left untouched.
+          </div>
+          <FieldRow>
+            <Field label="Session window (minutes)" info="After the agent engages a new conversation, it keeps handling that contact's messages for this long since their last message — so it holds the back-and-forth.">
+              <input
+                type="number" min={1} max={1440}
+                value={form.triggerSessionMinutes}
+                onChange={e => set({ triggerSessionMinutes: parseInt(e.target.value, 10) || 30 })}
+                style={inputStyle}
+              />
+            </Field>
+          </FieldRow>
+        </>
+      )}
 
       {isKeyword && (
         <>

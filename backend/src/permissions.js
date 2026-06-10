@@ -17,7 +17,7 @@ const PAGES = [
   'chatbot-builder', 'media-library', 'about',
   'admin-settings:general', 'admin-settings:tags', 'admin-settings:category',
   'admin-settings:fields', 'admin-settings:whatsapp-accounts',
-  'admin-settings:users',
+  'admin-settings:users', 'admin-settings:mcp',
 ];
 
 const ROLE_PAGE_DEFAULTS = {
