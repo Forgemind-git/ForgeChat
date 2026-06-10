@@ -4814,9 +4814,9 @@ async function handleIa360LiteInteractive(record) {
       ],
     },
     'quiero mapa': {
-      stage: 'Diagnóstico enviado', tag: 'mapa-30-60-90-solicitado', title: 'Quiero mapa',
+      stage: 'Diagnóstico enviado', tag: 'mapa-30-60-90-solicitado', title: 'Mapa 30-60-90',
       mediaKey: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
-      body: 'Perfecto. Para armar mapa sin humo necesito prioridad real: ¿esto urge, estás explorando o no es prioridad todavía?',
+      body: 'Mapa base 30-60-90:\n\n30 días: detectar cuello de botella, quick win y reglas de control humano.\n60 días: conectar WhatsApp/CRM/ERP/BI y medir tiempos, fugas y seguimiento.\n90 días: primer agente o tablero operativo con gobierno, métricas y handoff humano.\n\nAhora sí: ¿qué tan prioritario es aterrizarlo a tu caso?',
       buttons: [
         { id: '100m_urgent', title: 'Sí, urgente' },
         { id: '100m_exploring', title: 'Estoy explorando' },
@@ -4933,25 +4933,9 @@ async function handleIa360LiteInteractive(record) {
         console.error('[ia360-flowwire] diagnostico flow send failed, falling back to buttons:', flowErr.message);
       }
     }
-    // W4 D1 — offer_router: estado dolor+mecanismo+mapa solicitado. REEMPLAZA los botones de
-    // urgencia (fallback abajo si el envio falla). Replica el patron del diagnostico.
-    if (flow100m.tag === 'mapa-30-60-90-solicitado') {
-      try {
-        const flowSent = await enqueueIa360FlowMessage({
-          record,
-          flowId: '2185399508915155',
-          screen: 'PERFIL_EMPRESA',
-          cta: 'Ver mi oferta',
-          bodyText: 'Para darte la oferta correcta y sin humo, contéstame 5 datos rápidos: tamaño de tu empresa, equipo afectado, presupuesto, tu nivel de decisión y qué tipo de solución prefieres.',
-          mediaUrl: 'https://wa.geekstudio.dev/ia360-bca/transformacion.jpg',
-          flowToken: 'ia360_offer_router',
-          label: `ia360_100m_${flow100m.tag}`,
-        });
-        if (flowSent) return;
-      } catch (flowErr) {
-        console.error('[ia360-flowwire] offer_router flow send failed, falling back to buttons:', flowErr.message);
-      }
-    }
+    // UX guardrail: si el usuario pide mapa, primero se entrega un mapa real en el
+    // mensaje interactivo de abajo. No abrir offer_router aquí; eso cambiaba la promesa
+    // de "Quiero mapa" a "Ver mi oferta" y generaba fricción/loop comercial.
     // W4 — preferences: nodos "Baja" (no-contactar) y "No ahora"/"Más adelante" (nutricion-suave).
     // Lanza el Flow de preferencias granular; fallback al texto/botones del nodo si el envio falla.
     if (flow100m.tag === 'no-contactar' || flow100m.tag === 'nutricion-suave') {
@@ -5777,9 +5761,8 @@ async function handleIa360LiteInteractive(record) {
         footer: { text: 'Siguiente micro-paso' },
         action: {
           buttons: [
-            { type: 'reply', reply: { id: 'wa_apply', title: 'Aplicarlo' } },
             { type: 'reply', reply: { id: 'wa_schedule', title: 'Agendar' } },
-            { type: 'reply', reply: { id: 'apply_scope', title: 'Alcance' } },
+            { type: 'reply', reply: { id: 'apply_call', title: 'Llamada' } },
           ],
         },
       },
