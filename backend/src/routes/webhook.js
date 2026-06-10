@@ -3427,6 +3427,153 @@ async function sendIa360DirectText({ record, toNumber, body, label, targetContac
   }
 }
 
+// ─── Expediente del owner: "qué sabes de <nombre|número>" ──────────────────
+// Comando read-only del owner: arma un expediente con los facts y eventos de
+// coexistence.ia360_memory_* para un contacto, resuelto por número o por
+// nombre (tolerante a acentos y a typos simples tipo Emmanuel/Emanuel).
+// Egress SOLO vía sendIa360DirectText; nunca escribe memoria y SIEMPRE
+// responde algo (sin expediente / candidatos / error), nunca queda mudo.
+const IA360_BOT_WA_NUMBER = '5213321594582'; // número del bot: jamás es contacto
+
+function parseIa360OwnerMemoryQuery(body) {
+  const text = String(body || '').trim();
+  const m = text.match(/^¿?\s*(?:qu[eé]|qui[eé]n)\s+sabes\s+(?:de\s+la|de\s+el|del|de|sobre)\s+(.+?)\s*\?*$/i);
+  if (!m) return null;
+  const q = m[1].trim();
+  return q || null;
+}
+
+// Normaliza para comparar nombres: minúsculas, sin acentos y con letras
+// repetidas colapsadas ("Emmanuel" y "Emanuel" → "emanuel").
+function ia360NormalizeNameForMatch(s) {
+  return String(s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/(.)\1+/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function resolveIa360MemoryTarget(query) {
+  const digits = String(query || '').replace(/\D/g, '');
+  if (digits.length >= 10) {
+    // Número directo: 10 dígitos MX → prefijo 521 (formato ForgeChat).
+    const number = digits.length === 10 ? `521${digits}` : digits;
+    return { kind: 'number', candidates: [{ contact_number: number, contact_name: null }] };
+  }
+  const { rows } = await pool.query(
+    `SELECT DISTINCT contact_number, contact_name FROM (
+       SELECT contact_number, contact_name
+         FROM coexistence.ia360_memory_events
+        WHERE contact_name IS NOT NULL AND contact_number IS NOT NULL
+       UNION ALL
+       SELECT contact_number, COALESCE(name, profile_name) AS contact_name
+         FROM coexistence.contacts
+        WHERE COALESCE(name, profile_name) IS NOT NULL AND contact_number IS NOT NULL
+     ) t
+     WHERE contact_number <> $1`,
+    [IA360_BOT_WA_NUMBER]
+  );
+  const needle = ia360NormalizeNameForMatch(query);
+  if (!needle) return { kind: 'none', candidates: [] };
+  const byNumber = new Map();
+  for (const r of rows) {
+    if (!ia360NormalizeNameForMatch(r.contact_name).includes(needle)) continue;
+    if (!byNumber.has(r.contact_number)) byNumber.set(r.contact_number, r);
+  }
+  const candidates = [...byNumber.values()];
+  if (!candidates.length) return { kind: 'none', candidates: [] };
+  if (candidates.length > 1) return { kind: 'ambiguous', candidates };
+  return { kind: 'name', candidates };
+}
+
+async function buildIa360ContactDossier(contactNumber) {
+  const num = normalizePhone(contactNumber);
+  const { rows: factRows } = await pool.query(
+    `SELECT project_name, persona, role, account_name, preference, objection,
+            recurring_pain, affected_process, missing_metric
+       FROM coexistence.ia360_memory_facts
+      WHERE contact_number = $1
+      ORDER BY last_seen_at DESC, id DESC`,
+    [num]
+  );
+  const { rows: eventRows } = await pool.query(
+    `SELECT contact_name, area, signal_type, summary
+       FROM coexistence.ia360_memory_events
+      WHERE contact_number = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 12`,
+    [num]
+  );
+  if (!factRows.length && !eventRows.length) return null;
+
+  const name = eventRows.find(e => e.contact_name)?.contact_name || null;
+  const header = [`Expediente IA360: ${name || 'contacto'} (${num})`];
+  const meta = [];
+  const accountRow = factRows.find(f => f.account_name);
+  const projectRow = factRows.find(f => f.project_name);
+  const personaRow = factRows.find(f => f.persona);
+  if (accountRow) meta.push(`Cuenta: ${accountRow.account_name}`);
+  if (projectRow) meta.push(`Proyecto: ${projectRow.project_name}`);
+  if (personaRow) meta.push(`Persona: ${personaRow.persona}`);
+  if (meta.length) header.push(meta.join(' · '));
+
+  // Los facts viven duplicados por el doble keying de contact_wa_number
+  // (monolito vs lookup v2): dedupe por contenido, no por fila.
+  const factLines = [];
+  const seenFacts = new Set();
+  for (const f of factRows) {
+    for (const field of ['preference', 'objection', 'recurring_pain', 'affected_process', 'missing_metric']) {
+      const val = String(f[field] || '').trim();
+      if (!val) continue;
+      const key = `${field}:${val}`;
+      if (seenFacts.has(key)) continue;
+      seenFacts.add(key);
+      factLines.push(`- ${val.length > 300 ? `${val.slice(0, 297)}...` : val}`);
+    }
+  }
+  const eventLines = [];
+  const seenEvents = new Set();
+  for (const e of eventRows) {
+    const val = String(e.summary || '').trim();
+    if (!val) continue;
+    const key = `${e.area}|${e.signal_type}|${val}`;
+    if (seenEvents.has(key)) continue;
+    seenEvents.add(key);
+    eventLines.push(`- [${e.area}/${e.signal_type}] ${val.length > 220 ? `${val.slice(0, 217)}...` : val}`);
+  }
+
+  const lines = [...header, ''];
+  if (factLines.length) lines.push(`Facts (${factLines.length}):`, ...factLines, '');
+  if (eventLines.length) lines.push(`Eventos recientes (${eventLines.length}):`, ...eventLines);
+  let body = lines.join('\n').trim();
+  // Límite duro de WhatsApp: 4096 chars por texto.
+  if (body.length > 3900) body = `${body.slice(0, 3880)}\n... (recortado)`;
+  return body;
+}
+
+async function handleIa360OwnerMemoryQuery({ record, query }) {
+  let body;
+  try {
+    const target = await resolveIa360MemoryTarget(query);
+    if (target.kind === 'none') {
+      body = `Sin expediente: no encontré facts ni eventos para "${query}". Revisa el nombre o mándame el número completo.`;
+    } else if (target.kind === 'ambiguous') {
+      const list = target.candidates.slice(0, 8)
+        .map(c => `- ${c.contact_name || 'sin nombre'} (${c.contact_number})`).join('\n');
+      body = `Encontré varios contactos que coinciden con "${query}". ¿De cuál quieres el expediente?\n${list}\n\nMándame "qué sabes de <número>" para verlo.`;
+    } else {
+      const dossier = await buildIa360ContactDossier(target.candidates[0].contact_number);
+      body = dossier
+        || `Sin expediente: el contacto ${target.candidates[0].contact_number} no tiene facts ni eventos guardados todavía.`;
+    }
+  } catch (err) {
+    console.error('[ia360-expediente] dossier error:', err.message);
+    body = `No pude leer el expediente de "${query}" ahora mismo (error interno). Inténtalo de nuevo en un momento.`;
+  }
+  await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_memory_dossier', body });
+}
+
 // ─── Bandeja de ideas del owner ─────────────────────────────────────────────
 // Una idea (comando del owner "idea: <texto>", detección en conversación vía
 // Brain v2, o un agente) se persiste en coexistence.ia360_ideas y genera una
@@ -6007,6 +6154,19 @@ router.post('/webhook/whatsapp', async (req, res) => {
             if (ideaMatch && ideaMatch[1].trim()) {
               await handleIa360OwnerIdeaCommand({ record, texto: ideaMatch[1].trim() })
                 .catch(e => console.error('[ia360-ideas] owner command error:', e.message));
+              continue; // no procesar como mensaje normal
+            }
+          }
+          // ── EXPEDIENTE: comando del owner "qué sabes de <nombre|número>" ──
+          // Mismo patrón que "idea:": va ANTES del canary Brain v2 (el owner
+          // está en la allowlist y el canary haría continue). Read-only sobre
+          // ia360_memory_facts/events; responde SIEMPRE (nunca queda mudo).
+          if (record.message_type === 'text'
+              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
+            const memQuery = parseIa360OwnerMemoryQuery(record.message_body);
+            if (memQuery) {
+              await handleIa360OwnerMemoryQuery({ record, query: memQuery })
+                .catch(e => console.error('[ia360-expediente] owner command error:', e.message));
               continue; // no procesar como mensaje normal
             }
           }
