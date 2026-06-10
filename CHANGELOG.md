@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-10
+
+### Added
+- **Google Sheets `upsert` for agents** — an agent finds a contact's existing
+  row by a key column (e.g. phone number) and updates only the columns you name,
+  or adds a new row if none exists. No duplicate rows and no row-number/column
+  tracking — the reliable way to keep one evolving row per contact.
+- **CRM write-back tools** — an agent can act on its own conversation's contact
+  inside ForgeChat: save the name, add tags, and set custom fields (gated by an
+  "Update CRM" toggle on the agent).
+- **Human handoff** — an `escalate_to_human` tool, configurable handoff keywords,
+  and round-robin assignment to a chosen set of team members. Handing off pauses
+  the bot for that conversation; a take-over toggle in the chat header lets a
+  teammate take over or return the chat to the bot.
+- **Auto-summary on close** — when a conversation goes idle, the agent writes a
+  final summary to the sheet/CRM, so a row reflects the whole chat.
+- **"New conversations only" trigger** — an agent engages a contact only on
+  their first-ever message and never joins conversations that already existed.
+- **MCP agent-builder server** (stdio + remote HTTP) — build and configure
+  agents by chatting with Claude, including `read_sheet_values` and the Sheets
+  `upsert` op over MCP.
+
 ## [1.1.0] - 2026-06-04
 
 ### Added
