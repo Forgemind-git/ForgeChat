@@ -550,9 +550,9 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
       setAssignableUsers(usrs);
     });
     // Is an AI agent active on this number, and is it paused for a human?
-    api.agentConversation.status(waNumber, contactNumber)
-      .then(setAgentConv)
-      .catch(() => setAgentConv(null));
+    // Guarded so a missing endpoint / api shape never breaks the chat header.
+    api.agentConversation?.status?.(waNumber, contactNumber)
+      ?.then(setAgentConv, () => setAgentConv(null));
   }, [waNumber, contactNumber]);
 
   // Take over / return to bot.
