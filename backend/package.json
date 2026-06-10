@@ -1,6 +1,7 @@
 {
   "name": "forgecrm-backend",
   "version": "1.2.0",
+  "author": "sthirumalairajan2212",
   "description": "ForgeChat backend API for WhatsApp chat viewer",
   "private": true,
   "license": "LicenseRef-Sustainable-Use-License",
