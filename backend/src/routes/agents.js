@@ -36,6 +36,7 @@ function agentShape(row) {
     contextWindowMessages: row.context_window_messages,
     maxToolIterations: row.max_tool_iterations,
     transcribeAudio: !!row.transcribe_audio,
+    acceptImages: !!row.accept_images,
     triggerMode: row.trigger_mode || 'any',
     triggerKeyword: row.trigger_keyword || '',
     triggerMatchType: row.trigger_match_type || 'contains',
@@ -119,6 +120,79 @@ function toolShape(row) {
     isEnabled: row.is_enabled,
     createdAt: row.created_at,
   };
+}
+
+/* ----------------------- tool config validation ---------------------- */
+
+const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
+const PARAM_LOCATIONS = new Set(['path', 'query', 'body', 'header']);
+const PARAM_TYPES = new Set(['string', 'number', 'boolean']);
+
+class ToolError extends Error {} // thrown → 400
+
+// Validate + normalise an http_request tool config. The admin owns method/url/
+// static headers; the agent's LLM only fills the declared params at call time.
+function validateHttpConfig(cfg = {}) {
+  const label = String(cfg.label || '').trim();
+  if (!label) throw new ToolError('Give the HTTP tool a name (label).');
+  const description = String(cfg.description || '').trim();
+  if (!description) throw new ToolError('Describe when the agent should use this HTTP tool — the AI needs it to decide.');
+
+  const method = String(cfg.method || 'GET').trim().toUpperCase();
+  if (!HTTP_METHODS.has(method)) throw new ToolError(`Method must be one of ${[...HTTP_METHODS].join(', ')}.`);
+
+  const url = normalizeUrl(cfg.url);
+  if (!url) throw new ToolError('Enter a valid http(s) URL for the HTTP tool.');
+
+  const headers = Array.isArray(cfg.headers)
+    ? cfg.headers.map(h => ({ k: String(h?.k || '').trim(), v: String(h?.v ?? '').trim() })).filter(h => h.k).slice(0, 30)
+    : [];
+
+  const seen = new Set();
+  const params = Array.isArray(cfg.params)
+    ? cfg.params.map((p, idx) => {
+        const name = String(p?.name || '').trim();
+        if (!name) throw new ToolError(`Parameter #${idx + 1} needs a name.`);
+        if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) throw new ToolError(`Parameter "${name}" must be a simple identifier (letters, numbers, underscore; no leading digit).`);
+        if (seen.has(name)) throw new ToolError(`Duplicate parameter name "${name}".`);
+        seen.add(name);
+        return {
+          name,
+          in: PARAM_LOCATIONS.has(p?.in) ? p.in : 'body',
+          type: PARAM_TYPES.has(p?.type) ? p.type : 'string',
+          description: String(p?.description || '').trim().slice(0, 500),
+          required: !!p?.required,
+        };
+      }).slice(0, 30)
+    : [];
+
+  for (const ph of [...url.matchAll(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g)].map(m => m[1])) {
+    const p = params.find(x => x.name === ph);
+    if (!p) throw new ToolError(`URL placeholder {${ph}} has no matching parameter — add a "path" parameter named "${ph}".`);
+    if (p.in !== 'path') throw new ToolError(`Parameter "${ph}" is used in the URL path, so its location must be "path".`);
+  }
+
+  const timeoutMs = Math.max(1000, Math.min(30000, parseInt(cfg.timeout_ms || 10000, 10) || 10000));
+  return { label: label.slice(0, 120), description: description.slice(0, 1000), method, url, headers, params, timeout_ms: timeoutMs };
+}
+
+// Validate a tool body by type; returns the cleaned config to persist. Throws
+// ToolError (→ 400) on invalid input.
+function validateToolConfig(toolType, config) {
+  if (toolType === 'google_sheets') {
+    const cfg = config;
+    if (!cfg.google_account_id || !cfg.spreadsheet_id || !cfg.sheet_name) {
+      throw new ToolError('Sheets tool needs google_account_id, spreadsheet_id, sheet_name');
+    }
+    if (!Array.isArray(cfg.ops) || cfg.ops.length === 0) {
+      throw new ToolError('Sheets tool needs at least one op enabled (read/append/update)');
+    }
+    return cfg;
+  }
+  if (toolType === 'http_request') {
+    return validateHttpConfig(config);
+  }
+  return config;
 }
 
 router.get('/agents', async (req, res) => {
@@ -213,8 +287,8 @@ router.post('/agents', adminOnly, async (req, res) => {
           context_window_messages, max_tool_iterations,
           trigger_mode, trigger_keyword, trigger_match_type,
           trigger_case_sensitive, trigger_session_minutes, media_groups,
-          transcribe_audio)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+          transcribe_audio, accept_images)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
        RETURNING id`,
       [
         b.name.trim(), b.description?.trim() || null,
@@ -227,6 +301,7 @@ router.post('/agents', adminOnly, async (req, res) => {
         Math.max(1, Math.min(1440, parseInt(b.triggerSessionMinutes || 30, 10))),
         JSON.stringify(mediaGroups),
         !!b.transcribeAudio,
+        !!b.acceptImages,
       ],
     );
     res.status(201).json(await fetchAgent(rows[0].id));
@@ -295,6 +370,7 @@ router.put('/agents/:id', adminOnly, async (req, res) => {
       push('context_window_messages', Math.max(1, Math.min(100, parseInt(b.contextWindowMessages, 10) || 20)));
     }
     if (b.transcribeAudio !== undefined) push('transcribe_audio', !!b.transcribeAudio);
+    if (b.acceptImages !== undefined) push('accept_images', !!b.acceptImages);
     if (b.maxToolIterations !== undefined) {
       push('max_tool_iterations', Math.max(1, Math.min(20, parseInt(b.maxToolIterations, 10) || 6)));
     }
@@ -336,6 +412,154 @@ router.delete('/agents/:id', adminOnly, async (req, res) => {
   }
 });
 
+/* --------------------------- Export / Import -------------------------- */
+
+// Resolve an exported model reference to a local ai_models id: exact id first,
+// then provider+label, then provider alone. Returns null when nothing matches.
+async function resolveModelId({ aiModelId, aiProvider, aiModelLabel }) {
+  if (aiModelId) {
+    const m = await getAiModel(aiModelId);
+    if (m) return aiModelId;
+  }
+  if (aiProvider) {
+    const { rows } = await pool.query(
+      `SELECT id FROM coexistence.ai_models WHERE provider = $1 AND ($2::text IS NULL OR label = $2) ORDER BY id LIMIT 1`,
+      [aiProvider, aiModelLabel || null],
+    );
+    if (rows[0]) return rows[0].id;
+    const { rows: any } = await pool.query(
+      `SELECT id FROM coexistence.ai_models WHERE provider = $1 ORDER BY id LIMIT 1`,
+      [aiProvider],
+    );
+    if (any[0]) return any[0].id;
+  }
+  return null;
+}
+
+// GET /agents/:id/export — portable JSON (admin-only; the file can carry tool
+// secrets like HTTP auth headers).
+router.get('/agents/:id/export', adminOnly, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT a.*, am.provider AS ai_provider, am.label AS ai_label
+         FROM coexistence.agents a
+         LEFT JOIN coexistence.ai_models am ON am.id = a.ai_model_id
+        WHERE a.id = $1`,
+      [req.params.id],
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const { rows: tools } = await pool.query(
+      `SELECT * FROM coexistence.agent_tools WHERE agent_id = $1 ORDER BY id`,
+      [req.params.id],
+    );
+    const full = agentShape(rows[0]);
+    res.json({
+      type: 'forgechat.agent',
+      version: 1,
+      agent: {
+        name: full.name,
+        description: full.description,
+        systemPrompt: full.systemPrompt,
+        llmModel: full.llmModel,
+        aiProvider: full.aiProvider,
+        aiModelLabel: full.aiModelLabel,
+        aiModelId: full.aiModelId,
+        waAccountId: full.waAccountId,
+        contextWindowMessages: full.contextWindowMessages,
+        maxToolIterations: full.maxToolIterations,
+        transcribeAudio: full.transcribeAudio,
+        acceptImages: full.acceptImages,
+        triggerMode: full.triggerMode,
+        triggerKeyword: full.triggerKeyword,
+        triggerMatchType: full.triggerMatchType,
+        triggerCaseSensitive: full.triggerCaseSensitive,
+        triggerSessionMinutes: full.triggerSessionMinutes,
+        mediaGroups: full.mediaGroups,
+      },
+      tools: tools.map(t => ({ toolType: t.tool_type, config: t.config || {}, isEnabled: t.is_enabled })),
+    });
+  } catch (err) {
+    console.error('[agents] export error:', err.message);
+    res.status(500).json({ error: 'Failed to export agent' });
+  }
+});
+
+// POST /agents/import — create a NEW draft agent from an export file (admin-only).
+// Relinks model/number when they resolve here (else clears + warns); re-adds
+// every tool (skipping any that fail validation).
+router.post('/agents/import', adminOnly, async (req, res) => {
+  try {
+    const payload = req.body || {};
+    if (payload.type !== 'forgechat.agent' || !payload.agent) {
+      return res.status(400).json({ error: 'That file is not a ForgeChat agent export.' });
+    }
+    const a = payload.agent;
+    if (!a.name || !a.systemPrompt) {
+      return res.status(400).json({ error: 'The export file is missing required agent fields (name / system prompt).' });
+    }
+
+    const aiModelId = await resolveModelId(a);
+    const llmModel = aiModelId ? (a.llmModel || null) : null;
+    let waAccountId = null;
+    if (a.waAccountId) {
+      const { rows } = await pool.query('SELECT id FROM coexistence.whatsapp_accounts WHERE id = $1', [a.waAccountId]);
+      if (rows[0]) waAccountId = a.waAccountId;
+    }
+
+    const mediaGroups = normalizeMediaGroups(a.mediaGroups);
+    const { rows: ins } = await pool.query(
+      `INSERT INTO coexistence.agents
+         (name, description, system_prompt, ai_model_id, llm_model,
+          status, wa_account_id, is_active,
+          context_window_messages, max_tool_iterations,
+          trigger_mode, trigger_keyword, trigger_match_type,
+          trigger_case_sensitive, trigger_session_minutes, media_groups,
+          transcribe_audio, accept_images)
+       VALUES ($1,$2,$3,$4,$5,'draft',$6,false,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       RETURNING id`,
+      [
+        `${a.name} (imported)`.slice(0, 200), a.description?.trim() || null,
+        a.systemPrompt, aiModelId, llmModel,
+        waAccountId,
+        Math.max(1, Math.min(100, parseInt(a.contextWindowMessages || 20, 10))),
+        Math.max(1, Math.min(20, parseInt(a.maxToolIterations || 6, 10))),
+        (a.triggerMode === 'keyword' ? 'keyword' : 'any'),
+        (typeof a.triggerKeyword === 'string' ? a.triggerKeyword.trim().slice(0, 200) : null) || null,
+        cleanMatchType(a.triggerMatchType),
+        !!a.triggerCaseSensitive,
+        Math.max(1, Math.min(1440, parseInt(a.triggerSessionMinutes || 30, 10))),
+        JSON.stringify(mediaGroups),
+        !!a.transcribeAudio,
+        !!a.acceptImages,
+      ],
+    );
+    const newId = ins[0].id;
+
+    const warnings = [];
+    if (a.aiModelId && !aiModelId) warnings.push('The AI model from the file was not found here — pick a model before going live.');
+    if (a.waAccountId && !waAccountId) warnings.push('The WhatsApp number from the file was not found here — pick a number before going live.');
+
+    for (const t of (Array.isArray(payload.tools) ? payload.tools : [])) {
+      try {
+        const cleanConfig = validateToolConfig(t.toolType, t.config || {});
+        await pool.query(
+          `INSERT INTO coexistence.agent_tools (agent_id, tool_type, config, is_enabled) VALUES ($1,$2,$3,$4)`,
+          [newId, t.toolType, JSON.stringify(cleanConfig), t.isEnabled !== false],
+        );
+      } catch (e) {
+        warnings.push(`Skipped a ${t.toolType || 'tool'}: ${e.message}`);
+      }
+    }
+
+    const full = await fetchAgent(newId);
+    const { rows: tools } = await pool.query(`SELECT * FROM coexistence.agent_tools WHERE agent_id = $1 ORDER BY id`, [newId]);
+    res.status(201).json({ agent: { ...full, tools: tools.map(toolShape) }, warnings });
+  } catch (err) {
+    console.error('[agents] import error:', err.message);
+    res.status(500).json({ error: 'Failed to import agent' });
+  }
+});
+
 /* --------------------------- Tools (nested) --------------------------- */
 
 router.post('/agents/:id/tools', adminOnly, async (req, res) => {
@@ -344,19 +568,13 @@ router.post('/agents/:id/tools', adminOnly, async (req, res) => {
     if (!b.toolType || !b.config) {
       return res.status(400).json({ error: 'toolType and config are required' });
     }
-    if (b.toolType === 'google_sheets') {
-      const cfg = b.config;
-      if (!cfg.google_account_id || !cfg.spreadsheet_id || !cfg.sheet_name) {
-        return res.status(400).json({ error: 'Sheets tool needs google_account_id, spreadsheet_id, sheet_name' });
-      }
-      if (!Array.isArray(cfg.ops) || cfg.ops.length === 0) {
-        return res.status(400).json({ error: 'Sheets tool needs at least one op enabled (read/append/update)' });
-      }
-    }
+    let cleanConfig;
+    try { cleanConfig = validateToolConfig(b.toolType, b.config); }
+    catch (e) { if (e instanceof ToolError) return res.status(400).json({ error: e.message }); throw e; }
     const { rows } = await pool.query(
       `INSERT INTO coexistence.agent_tools (agent_id, tool_type, config, is_enabled)
        VALUES ($1,$2,$3,$4) RETURNING *`,
-      [req.params.id, b.toolType, JSON.stringify(b.config), b.isEnabled !== false],
+      [req.params.id, b.toolType, JSON.stringify(cleanConfig), b.isEnabled !== false],
     );
     res.status(201).json(toolShape(rows[0]));
   } catch (err) {
@@ -371,7 +589,18 @@ router.put('/agents/:id/tools/:toolId', adminOnly, async (req, res) => {
     const sets = [];
     const params = [];
     let i = 1;
-    if (b.config !== undefined) { sets.push(`config = $${i++}`); params.push(JSON.stringify(b.config)); }
+    if (b.config !== undefined) {
+      // Re-validate against the existing tool's type so an edit can't store junk.
+      const { rows: cur } = await pool.query(
+        'SELECT tool_type FROM coexistence.agent_tools WHERE agent_id = $1 AND id = $2',
+        [req.params.id, req.params.toolId],
+      );
+      if (cur.length === 0) return res.status(404).json({ error: 'Not found' });
+      let cleanConfig;
+      try { cleanConfig = validateToolConfig(cur[0].tool_type, b.config); }
+      catch (e) { if (e instanceof ToolError) return res.status(400).json({ error: e.message }); throw e; }
+      sets.push(`config = $${i++}`); params.push(JSON.stringify(cleanConfig));
+    }
     if (b.isEnabled !== undefined) { sets.push(`is_enabled = $${i++}`); params.push(!!b.isEnabled); }
     if (sets.length === 0) return res.status(400).json({ error: 'No updatable fields provided' });
     params.push(req.params.id, req.params.toolId);

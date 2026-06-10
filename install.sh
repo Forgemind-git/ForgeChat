@@ -46,7 +46,7 @@ command -v docker >/dev/null 2>&1 \
 docker compose version >/dev/null 2>&1 \
   || die "Docker Compose v2 isn't available. Update Docker, then re-run."
 if [ ! -f docker-compose.yml ] || [ ! -f docker-compose.prod.yml ]; then
-  die "Run this from the cloned ForgeChat directory (compose files not found here)."
+  die "Run this from the cloned Forge-Chat directory (compose files not found here)."
 fi
 ok "Docker and Compose detected"
 

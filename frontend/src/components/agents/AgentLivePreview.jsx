@@ -1,8 +1,36 @@
 import { useState, useRef, useEffect } from 'react';
-import { RotateCcw, AlertCircle, Mic, Square, Loader2, FileText, Music } from 'lucide-react';
+import { RotateCcw, AlertCircle, Mic, Square, Loader2, FileText, Music, ImagePlus, X } from 'lucide-react';
 import { api } from '../../api.js';
 import { C, FONT } from '../../constants.js';
 import { PhoneFrame } from '../WhatsAppPreview.jsx';
+
+// Downscale + JPEG-compress an image File to keep the base64 payload well under
+// the backend's JSON limit. Returns { dataUrl, mime, data (base64, no prefix) }.
+function downscaleImage(file, maxDim = 1024, quality = 0.8) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read the image.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Could not load the image.'));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          const scale = Math.min(maxDim / width, maxDim / height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        resolve({ dataUrl, mime: 'image/jpeg', data: dataUrl.split(',')[1] });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 /**
  * Live agent test, rendered inside the shared iPhone frame so it looks exactly
@@ -19,6 +47,7 @@ import { PhoneFrame } from '../WhatsAppPreview.jsx';
 export default function AgentLivePreview({ agentId, headerTitle, canTest = true }) {
   const [messages, setMessages] = useState([]); // see message shape below
   const [input, setInput] = useState('');
+  const [pendingImage, setPendingImage] = useState(null); // { dataUrl, mime, data }
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
@@ -26,6 +55,7 @@ export default function AgentLivePreview({ agentId, headerTitle, canTest = true 
   const bodyRef = useRef(null);
   const recorderRef = useRef(null);
   const chunksRef = useRef([]);
+  const fileRef = useRef(null);
 
   useEffect(() => {
     if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
@@ -38,7 +68,19 @@ export default function AgentLivePreview({ agentId, headerTitle, canTest = true 
     setSending(true);
     setError('');
     try {
-      const payload = next.filter(m => m.content).map(m => ({ role: m.role, content: m.content }));
+      const payload = next.filter(m => m.content || m.image).map(m => {
+        if (m.image) {
+          const cap = (m.content || '').trim();
+          return {
+            role: m.role,
+            content: [
+              { type: 'image', mime: m.image.mime, data: m.image.data },
+              { type: 'text', text: cap || 'The customer sent this image.' },
+            ],
+          };
+        }
+        return { role: m.role, content: m.content };
+      });
       const res = await api.agents.test(agentId, payload);
       setMessages(prev => [...prev, {
         role: 'assistant',
@@ -56,14 +98,46 @@ export default function AgentLivePreview({ agentId, headerTitle, canTest = true 
 
   const handleSend = () => {
     const text = input.trim();
-    if (!text || sending || recording || transcribing || !canTest) return;
+    if ((!text && !pendingImage) || sending || recording || transcribing || !canTest) return;
+    const msg = { role: 'user', content: text };
+    if (pendingImage) msg.image = pendingImage;
     setInput('');
-    runTurn([...messages, { role: 'user', content: text }]);
+    setPendingImage(null);
+    runTurn([...messages, msg]);
   };
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
   };
+
+  // ── Image attach (file picker + Ctrl+V paste) ─────────────────────
+  const attachImageFile = async (file) => {
+    if (!file || !canTest) return;
+    if (!file.type?.startsWith('image/')) { setError('Only image files can be attached.'); return; }
+    setError('');
+    try {
+      setPendingImage(await downscaleImage(file));
+    } catch (e) {
+      setError(e.message || 'Could not attach the image.');
+    }
+  };
+
+  const handlePickImage = (e) => {
+    const file = e.target.files?.[0];
+    if (file) attachImageFile(file);
+    e.target.value = '';
+  };
+
+  useEffect(() => {
+    if (!canTest) return;
+    const onPaste = (e) => {
+      const item = [...(e.clipboardData?.items || [])].find(it => it.type.startsWith('image/'));
+      if (item) { const f = item.getAsFile(); if (f) { e.preventDefault(); attachImageFile(f); } }
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canTest, sending]);
 
   // ── Voice note recording → transcription ──────────────────────────
   const startRecording = async () => {
@@ -115,10 +189,21 @@ export default function AgentLivePreview({ agentId, headerTitle, canTest = true 
   };
 
   const busy = sending || transcribing;
-  const showSend = !!input.trim() && !recording;
+  const showSend = (!!input.trim() || !!pendingImage) && !recording;
 
   const composer = (
-    <div style={{ padding: '7px 9px 22px', display: 'flex', alignItems: 'center', gap: 6 }}>
+    <div style={{ padding: '7px 9px 22px' }}>
+      {pendingImage && !recording && !transcribing && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '0 2px 7px', padding: 5, background: 'var(--c-cardBg)', border: '1px solid var(--c-border)', borderRadius: 10, width: 'fit-content' }}>
+          <img src={pendingImage.dataUrl} alt="attachment" style={{ width: 44, height: 44, objectFit: 'cover', borderRadius: 6, display: 'block' }} />
+          <span style={{ fontSize: 11, color: C.textMuted, fontFamily: FONT, paddingRight: 4 }}>Image attached</span>
+          <button type="button" onClick={() => setPendingImage(null)} title="Remove image"
+            style={{ background: 'var(--c-pageBg)', border: '1px solid var(--c-border)', borderRadius: 99, cursor: 'pointer', color: C.text, display: 'flex', padding: 2 }}>
+            <X size={12} />
+          </button>
+        </div>
+      )}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
       {recording ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'var(--c-cardBg)', borderRadius: 99, border: '1px solid var(--c-border)' }}>
           <span style={{ width: 8, height: 8, borderRadius: 99, background: '#EF4444', animation: 'agentRecPulse 1s ease-in-out infinite' }} />
@@ -130,18 +215,30 @@ export default function AgentLivePreview({ agentId, headerTitle, canTest = true 
           <span style={{ fontSize: 12, color: C.textMuted, fontFamily: FONT }}>Transcribing…</span>
         </div>
       ) : (
-        <input
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={!canTest || sending}
-          placeholder={canTest ? 'Message' : 'Save the agent to test'}
-          style={{
-            flex: 1, minWidth: 0, background: 'var(--c-cardBg)', borderRadius: 99,
-            padding: '8px 12px', fontSize: 12, color: C.text, fontFamily: FONT,
-            border: '1px solid var(--c-border)', outline: 'none', opacity: canTest ? 1 : 0.6,
-          }}
-        />
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 6, background: 'var(--c-cardBg)', borderRadius: 99, padding: '3px 4px 3px 6px', border: '1px solid var(--c-border)', opacity: canTest ? 1 : 0.6 }}>
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={!canTest || sending}
+            title="Attach image"
+            aria-label="Attach image"
+            style={{ background: 'none', border: 'none', cursor: canTest && !sending ? 'pointer' : 'not-allowed', color: C.textMuted, display: 'flex', padding: 2, flexShrink: 0 }}
+          >
+            <ImagePlus size={17} />
+          </button>
+          <input ref={fileRef} type="file" accept="image/*" onChange={handlePickImage} style={{ display: 'none' }} />
+          <input
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={!canTest || sending}
+            placeholder={canTest ? (pendingImage ? 'Add a caption (optional)' : 'Message') : 'Save the agent to test'}
+            style={{
+              flex: 1, minWidth: 0, background: 'transparent', border: 'none',
+              padding: '5px 2px', fontSize: 12, color: C.text, fontFamily: FONT, outline: 'none',
+            }}
+          />
+        </div>
       )}
 
       {showSend ? (
@@ -161,6 +258,7 @@ export default function AgentLivePreview({ agentId, headerTitle, canTest = true 
           {recording ? <Square size={13} fill="#fff" stroke="#fff" /> : <Mic size={15} />}
         </CircleBtn>
       )}
+      </div>
     </div>
   );
 
@@ -239,7 +337,15 @@ function MessageBlock({ message }) {
         </Bubble>
       )}
 
-      {!message.voice && message.content && (
+      {message.image && (
+        <Bubble isUser={isUser} pad={3}>
+          <img src={message.image.dataUrl} alt="sent attachment" style={{ display: 'block', width: '100%', maxWidth: 230, borderRadius: 5 }} />
+          {message.content && <div style={{ ...textStyle, padding: '4px 6px 0' }}>{message.content}</div>}
+          <div style={{ padding: '0 6px' }}><MetaRow isUser={isUser} /></div>
+        </Bubble>
+      )}
+
+      {!message.voice && !message.image && message.content && (
         <Bubble isUser={isUser}>
           <div style={textStyle}>{message.content}</div>
           {message.status === 'capped' && (

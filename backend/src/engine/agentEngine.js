@@ -108,6 +108,48 @@ async function buildToolsForAgent(agent, sendCtx = null) {
         });
         executors[name] = (args) => googleSheets.executeOp({ op: 'update', toolConfig: cfg, args });
       }
+
+      if (ops.includes('upsert')) {
+        const name = `google_sheets_upsert_${row.id}`;
+        tools.push({
+          name,
+          description: `Find-or-update one row in ${baseDesc} by a key column. PREFER THIS over append/update for logging a contact's enquiry/order/lead: it finds the existing row by key (e.g. their phone number) and writes only the columns you name, or adds a new row if none exists — so a contact never gets duplicate rows and you never track row numbers or column order. Give the key column's exact header + the contact's value for it, plus the fields to write keyed by their EXACT column headers.`,
+          input_schema: {
+            type: 'object',
+            properties: {
+              key_column: { type: 'string', description: 'Exact header of the column that identifies the row, e.g. "Phone Number".' },
+              key_value: { type: ['string', 'number'], description: "The contact's value for the key column (e.g. their phone number)." },
+              fields: { type: 'object', description: 'Object of { "Exact Column Header": value } — only these columns are written. e.g. { "Conversation summary": "…", "Query on which facility": "Personal Training", "Status": "Trial Scheduled" }.' },
+            },
+            required: ['key_column', 'key_value', 'fields'],
+          },
+        });
+        executors[name] = (args) => googleSheets.executeOp({ op: 'upsert', toolConfig: cfg, args });
+      }
+    }
+
+    if (row.tool_type === 'http_request') {
+      const cfg = row.config || {};
+      const params = Array.isArray(cfg.params) ? cfg.params : [];
+      const name = `http_${slugForTool(cfg.label)}_${row.id}`;
+
+      const properties = {};
+      const required = [];
+      for (const p of params) {
+        properties[p.name] = {
+          type: p.type === 'number' ? 'number' : p.type === 'boolean' ? 'boolean' : 'string',
+          description: p.description || `The ${p.name} value.`,
+        };
+        if (p.required) required.push(p.name);
+      }
+
+      tools.push({
+        name,
+        description:
+          `${cfg.description}\n(Performs an HTTP ${cfg.method} request to an external system.)`,
+        input_schema: { type: 'object', properties, required },
+      });
+      executors[name] = (args) => executeHttpTool(cfg, args || {});
     }
     // Future: gmail_send, calendar_create_event, etc. — same pattern.
   }
@@ -166,7 +208,146 @@ async function buildToolsForAgent(agent, sendCtx = null) {
     };
   }
 
+  // CRM write-back tools — only when the agent opts in AND there's a real live
+  // contact (skip in the test preview, where contactNumber is 'test').
+  const liveContact = sendCtx && sendCtx.live && sendCtx.contactNumber && sendCtx.contactNumber !== 'test';
+  if (agent.crm_tools_enabled && liveContact) {
+    const { buildCrmTools, resolveWaNumber } = require('../services/agentCrmTools');
+    const waNumber = sendCtx.waNumber || await resolveWaNumber(sendCtx.waAccountId);
+    if (waNumber) {
+      const crm = buildCrmTools({ waNumber, contactNumber: sendCtx.contactNumber });
+      tools.push(...crm.tools);
+      Object.assign(executors, crm.executors);
+    }
+  }
+
+  // Human handoff — let the agent hand the conversation to a person.
+  if (agent.handoff_enabled && liveContact) {
+    const { performHandoff } = require('../services/agentHandoff');
+    const { resolveWaNumber } = require('../services/agentCrmTools');
+    const waNumber = sendCtx.waNumber || await resolveWaNumber(sendCtx.waAccountId);
+    if (waNumber) {
+      tools.push({
+        name: 'escalate_to_human',
+        description: "Hand this conversation to a human team member. Call this when the customer asks to talk to a person, is upset/complaining, asks something you genuinely can't answer, or it's a high-value or sensitive case. AFTER calling it: tell the customer a team member will take over shortly, then STOP — you won't reply again on this chat until a human returns control.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            reason: { type: 'string', description: 'Short reason for escalating (for the team).' },
+            summary: { type: 'string', description: 'A 1–2 line summary of the conversation so the human has context.' },
+          },
+          required: ['reason'],
+        },
+      });
+      executors['escalate_to_human'] = async ({ reason, summary }) => {
+        const r = await performHandoff({
+          agentId: agent.id,
+          handoffUserIds: agent.handoff_user_ids,
+          waNumber,
+          contactNumber: sendCtx.contactNumber,
+          reason: [reason, summary].filter(Boolean).join(' — '),
+          by: 'agent',
+        });
+        return {
+          ok: true,
+          handed_off: true,
+          assigned_to: r.assignedUserName || 'the team',
+          note: 'Tell the customer a team member will take over shortly, then stop replying.',
+        };
+      };
+    }
+  }
+
   return { tools, executors };
+}
+
+// Turn an HTTP tool label into a safe tool-name fragment (LLM tool names must
+// match ^[a-zA-Z0-9_-]+). Falls back to "call" when nothing usable remains.
+function slugForTool(label) {
+  const s = String(label || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40);
+  return s || 'call';
+}
+
+/**
+ * Execute a configured http_request tool. The admin owns method/url/static
+ * headers; the LLM supplies the declared params (path → URL substitution,
+ * query → querystring, body → JSON body, header → request header). Returns a
+ * compact { ok, status, body } the model can read; never throws (errors come
+ * back as { ok:false, error } so the LLM can react).
+ */
+async function executeHttpTool(cfg, args) {
+  try {
+    const method = String(cfg.method || 'GET').toUpperCase();
+    const params = Array.isArray(cfg.params) ? cfg.params : [];
+
+    let url = String(cfg.url || '');
+    const query = new URLSearchParams();
+    const bodyObj = {};
+    const dynHeaders = {};
+    let hasBody = false;
+
+    for (const p of params) {
+      let val = args[p.name];
+      if (val === undefined || val === null || val === '') {
+        if (p.required) return { ok: false, error: `Missing required parameter "${p.name}".` };
+        continue;
+      }
+      if (p.type === 'number') { const n = Number(val); if (!Number.isNaN(n)) val = n; }
+      else if (p.type === 'boolean') { val = val === true || val === 'true' || val === 1 || val === '1'; }
+
+      if (p.in === 'path') {
+        url = url.replace(new RegExp(`\\{${p.name}\\}`, 'g'), encodeURIComponent(String(val)));
+      } else if (p.in === 'query') {
+        query.append(p.name, String(val));
+      } else if (p.in === 'header') {
+        dynHeaders[p.name] = String(val);
+      } else { // body
+        bodyObj[p.name] = val;
+        hasBody = true;
+      }
+    }
+
+    const qs = query.toString();
+    if (qs) url += (url.includes('?') ? '&' : '?') + qs;
+
+    const headers = {};
+    for (const h of (Array.isArray(cfg.headers) ? cfg.headers : [])) {
+      if (h && h.k) headers[h.k] = h.v;
+    }
+    Object.assign(headers, dynHeaders);
+
+    const init = { method, headers };
+    if (method !== 'GET' && method !== 'DELETE' && hasBody) {
+      if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+        headers['Content-Type'] = 'application/json';
+      }
+      init.body = JSON.stringify(bodyObj);
+    }
+
+    const ctrl = new AbortController();
+    const timeout = Math.max(1000, Math.min(30000, parseInt(cfg.timeout_ms || 10000, 10) || 10000));
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    let res;
+    try {
+      res = await fetch(url, { ...init, signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const raw = await res.text();
+    let body;
+    try { body = JSON.parse(raw); }
+    catch { body = raw.length > 4000 ? raw.slice(0, 4000) + '…[truncated]' : raw; }
+    if (typeof body !== 'string') {
+      const asStr = JSON.stringify(body);
+      if (asStr.length > 4000) body = asStr.slice(0, 4000) + '…[truncated]';
+    }
+
+    return { ok: res.ok, status: res.status, body };
+  } catch (err) {
+    if (err.name === 'AbortError') return { ok: false, error: 'Request timed out.' };
+    return { ok: false, error: err.message || 'HTTP request failed.' };
+  }
 }
 
 /**
@@ -451,6 +632,51 @@ async function transcribeInboundIfAudio({ agent, inboundMessageId, agentApiKey }
   }
 }
 
+/**
+ * Load an inbound image as base64 so it can be shown to a vision model. Reads
+ * the already-downloaded file (media_storage_path) when present, else downloads
+ * it on demand via the same mediaDownloader the chat UI uses. Returns
+ * { mime, data } or null (not an image / too large / fetch failed).
+ */
+async function loadInboundImageBase64({ inboundMessageId }) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT message_id, message_type, media_mime_type, media_storage_path, media_status
+         FROM coexistence.chat_history WHERE message_id = $1`,
+      [inboundMessageId],
+    );
+    const msg = rows[0];
+    if (!msg || msg.message_type !== 'image') return null;
+
+    const fs = require('fs');
+    let absPath = (msg.media_status === 'stored' && msg.media_storage_path) ? msg.media_storage_path : null;
+    let mime = msg.media_mime_type || 'image/jpeg';
+
+    if (!absPath) {
+      const { downloadOne } = require('../services/mediaDownloader');
+      const dl = await downloadOne(inboundMessageId);
+      if (!dl || !dl.ok || !dl.path) {
+        console.warn('[agentEngine] could not fetch inbound image:', dl && dl.error);
+        return null;
+      }
+      absPath = dl.path;
+      if (dl.mime) mime = dl.mime;
+    }
+
+    if (!fs.existsSync(absPath)) return null;
+    const buf = fs.readFileSync(absPath);
+    if (!buf || !buf.length) return null;
+    if (buf.length > 5 * 1024 * 1024) {
+      console.warn('[agentEngine] inbound image too large for vision:', buf.length);
+      return null;
+    }
+    return { mime, data: buf.toString('base64') };
+  } catch (e) {
+    console.error('[agentEngine] loadInboundImage failed:', e.message);
+    return null;
+  }
+}
+
 async function recordStep(runId, stepIndex, step) {
   await pool.query(
     `INSERT INTO coexistence.agent_run_steps
@@ -477,8 +703,14 @@ async function recordStep(runId, stepIndex, step) {
  */
 function withContactContext(systemPrompt, contactNumber) {
   const base = systemPrompt || '';
-  if (!contactNumber) return base;
-  return `${base}\n\n## Conversation context\n- The customer's WhatsApp number is ${contactNumber}. When you need their mobile number (e.g. saving an order to a sheet), use this exact number — never ask the customer for it.`;
+  // Always tell the model today's date/time (IST). Without it the LLM guesses,
+  // and was logging stale dates (e.g. a 2023 date) into the "Date" sheet column.
+  const now = new Date();
+  const today = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
+  const time = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+  const dateCtx = `\n\n## Current date & time\n- Today is ${today} at ${time} (Asia/Kolkata, IST). Use this whenever you need the current date/time — e.g. a "Date" column when logging to a sheet. Format dates as YYYY-MM-DD unless instructed otherwise.`;
+  if (!contactNumber) return base + dateCtx;
+  return `${base}${dateCtx}\n\n## Conversation context\n- The customer's WhatsApp number is ${contactNumber}. When you need their mobile number (e.g. saving an order to a sheet), use this exact number — never ask the customer for it.`;
 }
 
 /**
@@ -508,11 +740,20 @@ async function runAgent({ agentId, contactNumber, inboundMessageId, inboundText 
   // (no text body), turn it into text via Whisper before running the LLM loop.
   let messageText = inboundText;
   if (!messageText && inboundMessageId && agent.transcribe_audio) {
+    // May be empty (no transcript) — don't bail yet; it could still be an image.
     messageText = await transcribeInboundIfAudio({ agent, inboundMessageId, agentApiKey: apiKey });
-    if (!messageText) {
-      console.warn(`[agentEngine] agent ${agent.id}: inbound ${inboundMessageId} had no usable transcript; skipping run.`);
-      return { skipped: true, reason: 'no_transcript' };
-    }
+  }
+
+  // Vision: when the agent accepts images and the inbound is a picture, load its
+  // bytes so the (vision-capable) model can actually see it.
+  let inboundImage = null;
+  if (inboundMessageId && agent.accept_images) {
+    inboundImage = await loadInboundImageBase64({ inboundMessageId });
+  }
+
+  if (!messageText && !inboundImage) {
+    console.warn(`[agentEngine] agent ${agent.id}: inbound ${inboundMessageId} had no usable text/transcript/image; skipping run.`);
+    return { skipped: true, reason: 'nothing_actionable' };
   }
 
   // Open the run row immediately so a crash mid-loop is still visible in the UI.
@@ -548,6 +789,22 @@ async function runAgent({ agentId, contactNumber, inboundMessageId, inboundText 
       currentInboundText: messageText,
     });
 
+    // If the inbound was an image, make the final user turn multimodal (image +
+    // caption) so the model sees the picture.
+    if (inboundImage) {
+      const caption = (messageText || '').trim();
+      const parts = [
+        { type: 'image', mime: inboundImage.mime, data: inboundImage.data },
+        { type: 'text', text: caption || 'The customer sent this image.' },
+      ];
+      const last = history[history.length - 1];
+      if (last && last.role === 'user' && last.content === caption && caption) {
+        last.content = parts;
+      } else {
+        history.push({ role: 'user', content: parts });
+      }
+    }
+
     const provider = getProvider(agent.ai_provider);
     const result = await provider.runWithTools({
       systemPrompt: withContactContext(agent.system_prompt, contactNumber),
@@ -573,6 +830,20 @@ async function runAgent({ agentId, contactNumber, inboundMessageId, inboundText 
       [finalStatus, result.totalInputTokens, result.totalOutputTokens,
        result.finalText || null, runId],
     );
+
+    // Idle-close bookkeeping: stamp the last run time + mark a summary pending,
+    // so the close-summary sweeper picks the conversation up once it goes quiet.
+    if (agent.close_summary_enabled) {
+      await pool.query(
+        `UPDATE coexistence.contacts c
+            SET agent_close_pending = TRUE, agent_last_run_at = NOW()
+           FROM coexistence.whatsapp_accounts w
+          WHERE w.id = $1
+            AND regexp_replace(c.wa_number, '\\D', '', 'g') = regexp_replace(w.display_phone_number, '\\D', '', 'g')
+            AND c.contact_number = $2`,
+        [agent.wa_account_id, contactNumber],
+      ).catch(e => console.error('[agentEngine] close-pending stamp failed:', e.message));
+    }
 
     if (result.finalText) {
       // Insert an optimistic chat_history row FIRST so the agent's reply shows
@@ -739,4 +1010,59 @@ async function transcribeForAgent({ agentId, filePath }) {
   return await transcribeAudioFile({ filePath, apiKey: openaiKey });
 }
 
-module.exports = { runAgent, runAgentTest, buildToolsForAgent, buildMessageHistory, transcribeForAgent };
+// Idle-close summary: when a conversation has gone quiet, re-run the agent ONCE
+// with a directive to write its final complete summary using its own logging
+// tools (Sheets upsert / CRM) — and send NOTHING to the customer. Driven by the
+// close-summary sweeper (services/agentCloseSummary.js).
+async function runCloseSummary({ agentId, waNumber, contactNumber }) {
+  const { rows } = await pool.query(
+    `SELECT a.*, am.provider AS ai_provider, am.api_key_encrypted AS ai_api_key_encrypted
+       FROM coexistence.agents a
+       LEFT JOIN coexistence.ai_models am ON am.id = a.ai_model_id
+      WHERE a.id = $1`,
+    [agentId],
+  );
+  const agent = rows[0];
+  if (!agent || !agent.is_active || !agent.close_summary_enabled || !agent.ai_provider) return { skipped: true };
+  const apiKey = pickApiKey(agent);
+  if (!apiKey) return { skipped: 'no_api_key' };
+
+  const { tools, executors } = await buildToolsForAgent(agent, {
+    live: true, waAccountId: agent.wa_account_id, waNumber, contactNumber,
+  });
+  // Only worth a model call if the agent can actually log somewhere.
+  const canLog = tools.some(t => /google_sheets_(upsert|append|update)|set_contact_field|add_contact_tag/.test(t.name));
+  const history = await buildMessageHistory({
+    waAccountId: agent.wa_account_id, contactNumber, limit: agent.context_window_messages,
+  });
+  if (!canLog || history.length === 0) return { skipped: 'nothing_to_do' };
+
+  const directive = '\n\n## Conversation ended — final logging\n- The customer has gone quiet and this conversation is over. Write the FINAL, COMPLETE record now using your logging tool(s): a full conversation summary and the correct final status. Prefer your sheet "upsert" tool (match the existing row by the customer\'s phone number) and/or your CRM tools. Do NOT write any reply to the customer — only call the tools. If everything is already logged and up to date, do nothing.';
+  try {
+    const provider = getProvider(agent.ai_provider);
+    const result = await provider.runWithTools({
+      systemPrompt: withContactContext(agent.system_prompt, contactNumber) + directive,
+      messages: [...history, { role: 'user', content: '(end of conversation — log the final summary now, do not reply)' }],
+      tools,
+      onToolCall: async ({ name, args }) => {
+        const exec = executors[name];
+        if (!exec) throw new Error(`Unknown tool '${name}'`);
+        return await exec(args);
+      },
+      onStep: async () => {},
+      model: agent.llm_model,
+      apiKey,
+      maxIterations: Math.max(1, Math.min(20, agent.max_tool_iterations || 6)),
+      conversationKey: `${agent.id}:${contactNumber}:close`,
+      contactNumber,
+      agentId: agent.id,
+    });
+    // We intentionally do NOT send result.finalText to the customer.
+    return { ok: true, outputTokens: result?.totalOutputTokens || 0 };
+  } catch (e) {
+    console.error('[closeSummary] provider error:', e.message);
+    return { error: e.message };
+  }
+}
+
+module.exports = { runAgent, runAgentTest, buildToolsForAgent, buildMessageHistory, transcribeForAgent, runCloseSummary };

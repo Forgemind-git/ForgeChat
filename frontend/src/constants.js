@@ -89,6 +89,24 @@ export function darkenColor(hex, factor = 0.5) {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
+// Trigger a client-side download of a JS object as a pretty-printed .json file.
+export function downloadJson(filename, obj) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename.endsWith('.json') ? filename : `${filename}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Slugify a name into a safe filename fragment.
+export function slugifyName(name) {
+  return String(name || 'export').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'export';
+}
+
 export function formatDate(ts) {
   const d = new Date(ts);
   const now = new Date();

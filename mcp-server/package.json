@@ -1,0 +1,21 @@
+{
+  "name": "forgechat-mcp",
+  "version": "1.2.0",
+  "description": "MCP server for building and managing ForgeChat WhatsApp AI agents from Claude Desktop.",
+  "type": "module",
+  "bin": {
+    "forgechat-mcp": "src/index.js"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "inspect": "npx @modelcontextprotocol/inspector node src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  }
+}

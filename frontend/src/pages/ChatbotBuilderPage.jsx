@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo } from 'react';
-import { Plus, Pencil, Trash2, Loader2, Search, Bot, X, Copy } from 'lucide-react';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { Plus, Pencil, Trash2, Loader2, Search, Bot, X, Copy, Upload } from 'lucide-react';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
 import AutomationBuilderView from '../components/AutomationBuilderView.jsx';
 import { useTableSelection, SelectAllCheckbox, RowCheckbox, BulkDeleteButton, runBulkDelete } from '../components/TableSelection.jsx';
@@ -113,9 +113,10 @@ function NewAutomationModal({ open, onClose, onCreate }) {
   );
 }
 
-function ChatbotList({ chatbots, loading, onAdd, onEdit, onDelete, onDuplicate, onBulkDelete }) {
+function ChatbotList({ chatbots, loading, onAdd, onEdit, onDelete, onDuplicate, onBulkDelete, onImport }) {
   const [deleteModal, setDeleteModal] = useState({ open: false, chatbot: null });
   const [search, setSearch] = useState('');
+  const importRef = useRef(null);
 
   const filtered = useMemo(() => {
     if (!search.trim()) return chatbots;
@@ -137,14 +138,30 @@ function ChatbotList({ chatbots, loading, onAdd, onEdit, onDelete, onDuplicate, 
           <h1 style={{ fontSize: 22, fontWeight: 700, color: B.t1, margin: 0, letterSpacing: '-.02em' }}>Automations</h1>
           <p style={{ fontSize: 12, color: B.t5, margin: '4px 0 0' }}>Build and manage automated conversation flows.</p>
         </div>
-        <button
-          onClick={onAdd}
-          style={{ padding: '10px 18px', background: C.primary, color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: FONT, display: 'flex', alignItems: 'center', gap: 6, transition: 'background .15s' }}
-          onMouseEnter={e => e.currentTarget.style.background = C.primaryHover}
-          onMouseLeave={e => e.currentTarget.style.background = C.primary}
-        >
-          <Plus size={16} /> New Automation
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {onImport && (
+            <>
+              <input ref={importRef} type="file" accept="application/json,.json"
+                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) onImport(f); }}
+                style={{ display: 'none' }} />
+              <button
+                onClick={() => importRef.current?.click()}
+                title="Import an automation from a .json export file"
+                style={{ padding: '10px 16px', background: 'var(--c-cardBg)', color: B.t2, border: '1.5px solid #D5D5D0', borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: FONT, display: 'flex', alignItems: 'center', gap: 6 }}
+              >
+                <Upload size={16} /> Import
+              </button>
+            </>
+          )}
+          <button
+            onClick={onAdd}
+            style={{ padding: '10px 18px', background: C.primary, color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: FONT, display: 'flex', alignItems: 'center', gap: 6, transition: 'background .15s' }}
+            onMouseEnter={e => e.currentTarget.style.background = C.primaryHover}
+            onMouseLeave={e => e.currentTarget.style.background = C.primary}
+          >
+            <Plus size={16} /> New Automation
+          </button>
+        </div>
       </div>
 
       {/* Search + bulk-delete */}
@@ -323,6 +340,19 @@ export default function ChatbotBuilderPage({ subParts = [], navigate }) {
     }
   };
 
+  // Import an automation from a .json export file. Lands disabled; opens it in
+  // the builder so the user can review references and enable it.
+  const handleImport = async (file) => {
+    try {
+      const payload = JSON.parse(await file.text());
+      const created = await api.chatbots.import(payload);
+      setChatbots(prev => [created, ...prev]);
+      if (navigate) navigate('chatbot-builder', created.id);
+    } catch (err) {
+      alert(err instanceof SyntaxError ? 'That file is not valid JSON.' : (err.message || 'Import failed'));
+    }
+  };
+
   const handleBulkDelete = async (ids) => {
     await runBulkDelete(ids, (id) => api.chatbots.delete(id), {
       label: 'automation',
@@ -388,6 +418,7 @@ export default function ChatbotBuilderPage({ subParts = [], navigate }) {
         onDelete={handleDelete}
         onDuplicate={handleDuplicate}
         onBulkDelete={handleBulkDelete}
+        onImport={handleImport}
       />
       <NewAutomationModal
         open={showModal}

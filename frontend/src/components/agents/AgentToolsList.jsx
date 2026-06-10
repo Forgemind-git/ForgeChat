@@ -1,19 +1,23 @@
 import { useState } from 'react';
-import { Plus, Trash2, FileSpreadsheet, AlertCircle, Power } from 'lucide-react';
+import { Plus, Trash2, FileSpreadsheet, AlertCircle, Power, Globe } from 'lucide-react';
 import { api } from '../../api.js';
 import { C, FONT, MONO } from '../../constants.js';
 import GoogleSheetsToolConfig from './GoogleSheetsToolConfig.jsx';
+import HttpToolConfig from './HttpToolConfig.jsx';
 
 /**
- * Tool roster for an agent. v1 only offers Google Sheets — the registry will
- * grow (Gmail, Calendar, HTTP, etc.) and this component picks up new types
- * by adding cases to renderRow / the "Add tool" menu.
+ * Tool roster for an agent. Each tool type has an entry in TOOL_TYPES (icon +
+ * menu copy), a config component (rendered when adding/editing), and a ToolRow
+ * summary. Add a new type by extending all three.
  */
-// Tool types offerable from the "Add tool" menu. Only Google Sheets today; the
-// registry will grow (Gmail, Calendar, HTTP, …) and each new entry shows up here.
 const TOOL_TYPES = [
-  { type: 'google_sheets', label: 'Google Sheets', desc: 'Read, append, or update rows in a sheet.' },
+  { type: 'google_sheets', label: 'Google Sheets', desc: 'Read, append, or update rows in a sheet.',
+    icon: FileSpreadsheet, iconColor: '#0F7A38', iconBg: '#E6F4EA' },
+  { type: 'http_request', label: 'HTTP request', desc: 'Call an external API / device / webhook.',
+    icon: Globe, iconColor: '#2563EB', iconBg: '#E6EEFC' },
 ];
+
+const toolMeta = (type) => TOOL_TYPES.find(t => t.type === type) || TOOL_TYPES[0];
 
 export default function AgentToolsList({ agentId, tools, onChange }) {
   const [adding, setAdding] = useState(false);   // false | tool-type string
@@ -97,47 +101,60 @@ export default function AgentToolsList({ agentId, tools, onChange }) {
                 background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 10,
                 boxShadow: C.shadowLg, padding: 6, minWidth: 240,
               }}>
-                {TOOL_TYPES.map(t => (
-                  <div key={t.type}
-                    onClick={() => { setMenuOpen(false); setAdding(t.type); }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 10px', borderRadius: 7, cursor: 'pointer' }}
-                    onMouseEnter={e => e.currentTarget.style.background = '#F5F5F0'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                    <div style={{ width: 30, height: 30, borderRadius: 7, background: '#E6F4EA', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                      <FileSpreadsheet size={15} color="#0F7A38" />
+                {TOOL_TYPES.map(t => {
+                  const Icon = t.icon;
+                  return (
+                    <div key={t.type}
+                      onClick={() => { setMenuOpen(false); setAdding(t.type); }}
+                      style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 10px', borderRadius: 7, cursor: 'pointer' }}
+                      onMouseEnter={e => e.currentTarget.style.background = '#F5F5F0'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      <div style={{ width: 30, height: 30, borderRadius: 7, background: t.iconBg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                        <Icon size={15} color={t.iconColor} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{t.label}</div>
+                        <div style={{ fontSize: 11, color: C.textMuted, marginTop: 1 }}>{t.desc}</div>
+                      </div>
                     </div>
-                    <div>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{t.label}</div>
-                      <div style={{ fontSize: 11, color: C.textMuted, marginTop: 1 }}>{t.desc}</div>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </>
           )}
         </div>
       )}
 
-      {(adding === 'google_sheets' || editing) && (
-        <div style={{ marginTop: 16 }}>
-          <GoogleSheetsToolConfig
-            agentId={agentId}
-            existingTool={editing}
-            onCancel={() => { setAdding(false); setEditing(null); }}
-            onSaved={async () => {
-              setAdding(false);
-              setEditing(null);
-              await onChange();
-            }}
-          />
-        </div>
-      )}
+      {(adding || editing) && (() => {
+        const activeType = editing ? editing.toolType : adding;
+        const ConfigComp = activeType === 'http_request' ? HttpToolConfig : GoogleSheetsToolConfig;
+        const close = () => { setAdding(false); setEditing(null); };
+        return (
+          <div style={{ marginTop: 16 }}>
+            <ConfigComp
+              agentId={agentId}
+              existingTool={editing}
+              onCancel={close}
+              onSaved={async () => { close(); await onChange(); }}
+            />
+          </div>
+        );
+      })()}
     </div>
   );
 }
 
 function ToolRow({ tool, busy, onToggle, onEdit, onRemove }) {
   const cfg = tool.config || {};
+  const meta = toolMeta(tool.toolType);
+  const Icon = meta.icon;
+  const isHttp = tool.toolType === 'http_request';
+  const title = isHttp
+    ? (cfg.label || 'HTTP request')
+    : `${cfg.spreadsheet_name || cfg.spreadsheet_id} · ${cfg.sheet_name}`;
+  const subtitle = isHttp
+    ? `${cfg.method || 'GET'} · ${cfg.url || ''}`
+    : `${(cfg.ops || []).join(' · ') || 'no ops enabled'} · acct #${cfg.google_account_id}`;
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 14,
@@ -145,17 +162,17 @@ function ToolRow({ tool, busy, onToggle, onEdit, onRemove }) {
       border: `1px solid ${C.border}`, opacity: tool.isEnabled ? 1 : 0.55,
     }}>
       <div style={{
-        width: 32, height: 32, borderRadius: 8, background: '#E6F4EA',
+        width: 32, height: 32, borderRadius: 8, background: meta.iconBg,
         display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
       }}>
-        <FileSpreadsheet size={16} color="#0F7A38" />
+        <Icon size={16} color={meta.iconColor} />
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: 13, fontWeight: 700, color: C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {cfg.spreadsheet_name || cfg.spreadsheet_id} · {cfg.sheet_name}
+          {title}
         </div>
-        <div style={{ fontSize: 11, color: C.textMuted, marginTop: 3, fontFamily: MONO }}>
-          {(cfg.ops || []).join(' · ') || 'no ops enabled'} · acct #{cfg.google_account_id}
+        <div style={{ fontSize: 11, color: C.textMuted, marginTop: 3, fontFamily: MONO, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {subtitle}
         </div>
       </div>
       <button onClick={onToggle} disabled={busy} title={tool.isEnabled ? 'Disable' : 'Enable'}

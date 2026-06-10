@@ -8,6 +8,7 @@ const OPS = [
   { key: 'read',   label: 'Read',   desc: 'Look up existing rows' },
   { key: 'append', label: 'Append', desc: 'Add a new row' },
   { key: 'update', label: 'Update', desc: 'Overwrite a specific range' },
+  { key: 'upsert', label: 'Upsert (recommended for logging)', desc: 'Find a row by a key column (e.g. phone) and update it, or add it if new — no duplicate rows, no column tracking' },
 ];
 
 // Scopes that let us list the account's PRE-EXISTING spreadsheets. Mirrors the

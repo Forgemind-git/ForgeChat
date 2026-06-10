@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback, useLayoutEffect, useMe
 import { api } from "../api.js";
 import AutomationExecutions from "./AutomationExecutions.jsx";
 import SearchableSelect from "./SearchableSelect.jsx";
-import { maskPhone } from "../constants.js";
+import { maskPhone, downloadJson, slugifyName } from "../constants.js";
 
 // Automation Builder — single-file React JSX (DM Sans + DM Mono, inline styles).
 
@@ -3001,7 +3001,13 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
 };
 
 
-const BuilderToolbar = ({ automationName, status, onBack, onSave, isDirty, saving, onToggleStatus, toggleBusy, onPreview, showPreview, activeTab, onTabChange, onUndo, onRedo, canUndo, canRedo, onZoomIn, onZoomOut, onFit, onAutoLayout }) => {
+const DownloadIcon = (s = 13) => (
+  <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+  </svg>
+);
+
+const BuilderToolbar = ({ automationName, status, onBack, onSave, isDirty, saving, onToggleStatus, toggleBusy, onPreview, showPreview, activeTab, onTabChange, onUndo, onRedo, canUndo, canRedo, onZoomIn, onZoomOut, onFit, onAutoLayout, onExport }) => {
   const isActive = status === 'active';
   const tabs = [
     { key: 'editor', label: 'Editor' },
@@ -3057,6 +3063,9 @@ const BuilderToolbar = ({ automationName, status, onBack, onSave, isDirty, savin
       </div>
       <div style={{ height:22, width:1, background:C.cardBorder }}/>
       <Btn kind="ghost" icon={IC.eye(13)} onClick={onPreview} data-testid="preview-toggle">{showPreview ? "Hide preview" : "Preview"}</Btn>
+      {onExport && (
+        <Btn kind="ghost" icon={DownloadIcon(13)} onClick={onExport} title="Download this automation as a JSON file you can import elsewhere">Export</Btn>
+      )}
       {onToggleStatus && (
         <Btn
           kind={isActive ? "ghost" : "primary"}
@@ -4144,6 +4153,20 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
     }
   };
 
+  // Export the automation as a portable JSON file. The backend export reads the
+  // saved row, so flush any unsaved canvas changes first — the file then matches
+  // exactly what's on screen.
+  const handleExportAutomation = async () => {
+    if (!automation?.id) return;
+    try {
+      if (isDirty) await handleSave();
+      const data = await api.chatbots.exportOne(automation.id);
+      downloadJson(`automation-${slugifyName(automation?.name)}`, data);
+    } catch (err) {
+      alert('Failed to export: ' + (err?.message || 'unknown error'));
+    }
+  };
+
   // "Create new template" from a node's template picker: persist the current
   // flow first (saved as a draft so nothing is lost), then deep-link to the
   // Template Builder's new-template editor (#/template-builder/new).
@@ -4212,6 +4235,7 @@ const AutomationBuilderView = ({ automation, onBack, onSave, onToggleStatus, act
           setTransform({ x: 40 - minX * scale + (rect.width - contentW * scale) / 2, y: 30 - minY * scale + (rect.height - contentH * scale) / 2, scale: Math.max(0.3, scale * 0.9) });
         }}
         onAutoLayout={autoLayout}
+        onExport={automation?.id ? handleExportAutomation : null}
       />
 
       {activeTab === 'executions' ? (

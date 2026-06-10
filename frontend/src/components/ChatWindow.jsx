@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Search, Loader2, MoreVertical, Phone, Pencil, X, Send, Lock, Paperclip, Image as ImageIcon, FileText, Video, Music, Library, RefreshCw, CheckCircle2, AlertTriangle, Mic, Square, Trash2, User, Download, Forward, Reply, Tag, UserPlus, Check } from 'lucide-react';
+import { Search, Loader2, MoreVertical, Phone, Pencil, X, Send, Lock, Paperclip, Image as ImageIcon, FileText, Video, Music, Library, RefreshCw, CheckCircle2, AlertTriangle, Mic, Square, Trash2, User, Download, Forward, Reply, Tag, UserPlus, Check, Bot } from 'lucide-react';
 import { usePolling } from '../hooks/usePolling.js';
 import { useServerEvents } from '../hooks/useServerEvents.js';
 import { api } from '../api.js';
@@ -102,6 +102,8 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
   // Chat-header quick-actions: tag + assign
   const [assignedUserId, setAssignedUserId] = useState(null);
   const [assignableUsers, setAssignableUsers] = useState(null); // null = non-admin/unknown -> Assign hidden
+  const [agentConv, setAgentConv] = useState(null);
+  const [agentBusy, setAgentBusy] = useState(false);
   const [tagPopoverOpen, setTagPopoverOpen] = useState(false);
   const [assignPopoverOpen, setAssignPopoverOpen] = useState(false);
   const [headerSaving, setHeaderSaving] = useState(false);
@@ -547,7 +549,27 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
       setAllTags(tgs);
       setAssignableUsers(usrs);
     });
+    // Is an AI agent active on this number, and is it paused for a human?
+    api.agentConversation.status(waNumber, contactNumber)
+      .then(setAgentConv)
+      .catch(() => setAgentConv(null));
   }, [waNumber, contactNumber]);
+
+  // Take over / return to bot.
+  const toggleAgentBot = async () => {
+    if (!agentConv?.hasAgent || agentBusy) return;
+    setAgentBusy(true);
+    try {
+      const r = agentConv.paused
+        ? await api.agentConversation.resume(waNumber, contactNumber)
+        : await api.agentConversation.pause(waNumber, contactNumber);
+      setAgentConv(c => ({ ...c, paused: !!r.paused }));
+    } catch (e) {
+      alert('Could not switch the bot: ' + (e.message || 'try again'));
+    } finally {
+      setAgentBusy(false);
+    }
+  };
 
   // Auto-scroll to bottom on first load
   useEffect(() => {
@@ -956,6 +978,22 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
                   </div>
                 )}
               </div>
+            )}
+
+            {/* AI agent take-over toggle — only when an agent is active on this number */}
+            {agentConv?.hasAgent && (
+              <button
+                onClick={toggleAgentBot}
+                disabled={agentBusy}
+                title={agentConv.paused
+                  ? 'Bot paused — you have taken over. Click to return this chat to the AI agent.'
+                  : `AI agent "${agentConv.agentName || 'bot'}" is handling this chat. Click to take over (pause the bot).`}
+                style={{ ...headerIconBtn, position: 'relative', color: '#fff', opacity: agentBusy ? 0.5 : 1, background: agentConv.paused ? 'transparent' : 'rgba(255,255,255,0.20)' }}>
+                {agentBusy
+                  ? <Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} />
+                  : <Bot size={18} />}
+                <span style={{ position: 'absolute', top: 5, right: 5, width: 8, height: 8, borderRadius: '50%', background: agentConv.paused ? '#f59e0b' : '#22c55e', border: '1.5px solid #fff' }} />
+              </button>
             )}
 
             {/* Search toggle */}

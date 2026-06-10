@@ -57,4 +57,10 @@ function maskSecret(s) {
   return `${str.slice(0, 4)}••••••••${str.slice(-4)}`;
 }
 
-module.exports = { encrypt, decrypt, maskSecret };
+// SHA-256 hex of an API key. MCP bearer keys are HASHED (not encrypted) — we
+// only ever store the hash and compare; the plaintext is shown once at creation.
+function hashApiKey(plain) {
+  return crypto.createHash('sha256').update(String(plain)).digest('hex');
+}
+
+module.exports = { encrypt, decrypt, maskSecret, hashApiKey };
