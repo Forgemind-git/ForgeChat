@@ -1923,7 +1923,7 @@ async function callIa360Agent({ record, stageName }) {
   let agentMemory = null;
   try {
     const memContact = await loadIa360ContactContext(record);
-    agentMemory = await lookupIa360MemoryContext({ record, contact: memContact, limit: 12 });
+    agentMemory = await lookupIa360MemoryContext({ record, contact: memContact, limit: 8 });
   } catch (memErr) {
     console.error('[ia360-agent] memory lookup failed:', memErr.message);
   }
@@ -3427,6 +3427,133 @@ async function sendIa360DirectText({ record, toNumber, body, label, targetContac
   }
 }
 
+// ─── Bandeja de ideas del owner ─────────────────────────────────────────────
+// Una idea (comando del owner "idea: <texto>", detección en conversación vía
+// Brain v2, o un agente) se persiste en coexistence.ia360_ideas y genera una
+// tarjeta de ruteo al owner con 4 destinos. Reusa el patrón tarjeta-aprobación
+// (sendOwnerInteractive + handler owner_*). Las tarjetas van SOLO al owner.
+const IA360_IDEAS_STATUS_BY_ACTION = {
+  owner_idea_prod: 'routed_production',
+  owner_idea_docs: 'routed_docs',
+  owner_idea_crm: 'routed_crm',
+  owner_idea_reject: 'rejected',
+};
+
+async function insertIa360Idea({ fuente, contactNumber, texto, contexto }) {
+  const { rows } = await pool.query(
+    `INSERT INTO coexistence.ia360_ideas (fuente, contact_number, texto, contexto_json)
+     VALUES ($1,$2,$3,$4::jsonb) RETURNING id`,
+    [fuente, contactNumber || null, texto, JSON.stringify(contexto || {})]
+  );
+  return rows[0].id;
+}
+
+async function sendIa360IdeaCard({ record, ideaId, texto, fuente, contactNumber = null }) {
+  const origen = fuente === 'owner' ? 'tuya' : `de la conversación con ${contactNumber || 'un contacto'}`;
+  const preview = texto.length > 480 ? `${texto.slice(0, 477)}...` : texto;
+  return sendOwnerInteractive({
+    record,
+    label: `owner_idea_card_${ideaId}`,
+    messageBody: `IA360: idea #${ideaId} capturada`,
+    ownerBudget: true,
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: `Idea #${ideaId} capturada` },
+      body: { text: `Alek, capturé esta idea (${origen}):\n\n"${preview}"\n\n¿A dónde la ruteo?` },
+      footer: { text: 'Bandeja de ideas · IA360' },
+      action: {
+        button: 'Rutear',
+        sections: [{
+          title: 'Destinos',
+          rows: [
+            { id: `owner_idea_prod:${ideaId}`, title: 'Producción', description: 'Backlog de producción (routed_production)' },
+            { id: `owner_idea_docs:${ideaId}`, title: 'Documentar', description: 'Encolar al vault local AlekContenido (ia360_docs_sync)' },
+            { id: `owner_idea_crm:${ideaId}`, title: 'CRM', description: 'Crear nota en EspoCRM ligada al contacto' },
+            { id: `owner_idea_reject:${ideaId}`, title: 'Rechazar', description: 'Descartar; puedes responder con el motivo' },
+          ],
+        }],
+      },
+    },
+  });
+}
+
+async function handleIa360OwnerIdeaCommand({ record, texto }) {
+  const ideaId = await insertIa360Idea({
+    fuente: 'owner',
+    contactNumber: IA360_OWNER_NUMBER,
+    texto,
+    contexto: { source: 'owner_command', message_id: record.message_id, captured_at: new Date().toISOString() },
+  });
+  const sent = await sendIa360IdeaCard({ record, ideaId, texto, fuente: 'owner' });
+  if (!sent) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'idea_card_fail', body: `Idea #${ideaId} guardada, pero no pude mandar la tarjeta; queda pending en la bandeja.`, ownerBudget: true });
+  }
+}
+
+async function handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId }) {
+  const status = IA360_IDEAS_STATUS_BY_ACTION[ownerAction];
+  const idNum = String(ideaId || '').replace(/\D/g, '');
+  if (!status || !idNum) return;
+  const { rows } = await pool.query(
+    `UPDATE coexistence.ia360_ideas
+        SET status=$1, routed_at=now(), approved_by=$2
+      WHERE id=$3 AND status='pending'
+      RETURNING id, fuente, contact_number, texto, contexto_json`,
+    [status, IA360_OWNER_NUMBER, idNum]
+  );
+  if (!rows.length) {
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'idea_route_dup', body: `La idea #${idNum} ya estaba ruteada (o no existe). No hice cambios.`, ownerBudget: true });
+    return;
+  }
+  const idea = rows[0];
+  let ack;
+  if (status === 'routed_production') {
+    ack = `Idea #${idea.id} marcada para PRODUCCIÓN (routed_production). Queda en la bandeja para la siguiente ventana de implementación.`;
+  } else if (status === 'routed_docs') {
+    const titulo = idea.texto.length > 80 ? `${idea.texto.slice(0, 77)}...` : idea.texto;
+    const contenido = `# Idea #${idea.id}\n\n- Fuente: ${idea.fuente}\n- Contacto: ${idea.contact_number || '-'}\n- Capturada: ${new Date().toISOString()}\n\n${idea.texto}\n\nContexto: ${JSON.stringify(idea.contexto_json || {})}`;
+    await pool.query(
+      `INSERT INTO coexistence.ia360_docs_sync (idea_id, titulo, contenido, destino) VALUES ($1,$2,$3,'AlekContenido')`,
+      [idea.id, titulo, contenido]
+    );
+    ack = `Idea #${idea.id} encolada para DOCUMENTAR (ia360_docs_sync, destino AlekContenido). La ventana local drena la cola al vault.`;
+  } else if (status === 'routed_crm') {
+    const identifier = idea.fuente === 'owner' ? IA360_OWNER_NUMBER : (idea.contact_number || IA360_OWNER_NUMBER);
+    let espoOk = false;
+    try {
+      const { rows: cRows } = await pool.query(
+        `SELECT custom_fields->>'espo_id' AS espo_id, COALESCE(name, profile_name) AS name
+           FROM coexistence.contacts WHERE contact_number=$1 ORDER BY updated_at DESC LIMIT 1`,
+        [identifier]
+      );
+      const res = await fetch(N8N_IA360_UPSERT_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          channel: 'whatsapp',
+          identifier,
+          espo_id: cRows[0]?.espo_id || null,
+          name: cRows[0]?.name || null,
+          intent: 'idea_captura',
+          action: 'idea_routed_crm',
+          extracted: { idea_id: idea.id, fuente: idea.fuente },
+          last_message: `[IDEA #${idea.id}] ${idea.texto}`,
+          transcript_stored: false,
+        }),
+      });
+      espoOk = res.ok;
+    } catch (e) {
+      console.error('[ia360-ideas] espo route error:', e.message);
+    }
+    ack = espoOk
+      ? `Idea #${idea.id} reflejada en EspoCRM como nota del contacto ${identifier} (routed_crm).`
+      : `Idea #${idea.id} quedó routed_crm, pero el upsert a EspoCRM falló; revisa el workflow n8n.`;
+  } else {
+    ack = `Idea #${idea.id} RECHAZADA. Si quieres, responde con el motivo y lo dejamos registrado.`;
+  }
+  await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: `idea_route_${status}`, body: ack, ownerBudget: true });
+}
+
 // POST al workflow n8n de cancelar (borra Calendar + Zoom). Requiere User-Agent
 // tipo Chrome por Cloudflare (los otros helpers n8n no lo necesitan; este SI).
 async function cancelIa360Booking({ calendarEventId, zoomMeetingId }) {
@@ -4410,6 +4537,11 @@ async function handleIa360LiteInteractive(record) {
       // call/keep cargan el numero del contacto (digit-strip OK). owner_cancel_yes
       // carga el EVENT_ID (alfanumerico) → NO digit-stripear ese arg.
       const targetContact = (ownerArg || '').replace(/\D/g, '');
+      // BANDEJA DE IDEAS: ruteo de la tarjeta (Producción/Documentar/CRM/Rechazar).
+      if (ownerAction && ownerAction.startsWith('owner_idea_')) {
+        await handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId: ownerArg });
+        return;
+      }
       if (ownerAction === 'owner_pipe') {
         await handleIa360OwnerPipelineChoice({ record, targetContact, pipeline: ownerPipe });
         return;
@@ -5883,6 +6015,18 @@ router.post('/webhook/whatsapp', async (req, res) => {
     if (incomingRecords.length > 0) {
       for (const record of incomingRecords) {
         try {
+          // ── BANDEJA DE IDEAS: comando del owner "idea: <texto>" ─────
+          // Va ANTES del canary Brain v2 (el owner está en la allowlist y el
+          // canary haría continue). Captura, persiste y manda tarjeta de ruteo.
+          if (record.message_type === 'text'
+              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
+            const ideaMatch = String(record.message_body || '').trim().match(/^idea\s*:\s*([\s\S]+)$/i);
+            if (ideaMatch && ideaMatch[1].trim()) {
+              await handleIa360OwnerIdeaCommand({ record, texto: ideaMatch[1].trim() })
+                .catch(e => console.error('[ia360-ideas] owner command error:', e.message));
+              continue; // no procesar como mensaje normal
+            }
+          }
           // ── CANARY Brain v2 (reversible, allowlist) ──────────────────
           // Antes de TODO el pipeline del monolito: si el remitente esta en la
           // allowlist y el flag esta on, el texto se enruta al Brain v2 y NO toca
@@ -6120,6 +6264,37 @@ router.post('/internal/ia360-revenue/opener', async (req, res) => {
   } catch (err) {
     console.error('[revenue-os] opener endpoint error:', err.message);
     return res.status(500).json({ ok: false, error: 'opener_failed' });
+  }
+});
+
+// BANDEJA DE IDEAS — captura desde el Brain v2 (intent idea_captura) u otros
+// agentes. Inserta la idea y manda la tarjeta de ruteo al owner (único egress:
+// sendOwnerInteractive -> messageSender). Auth = X-IA360-Directive-Secret.
+router.post('/internal/ia360-ideas/capture', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const b = req.body || {};
+    const texto = String(b.texto || b.text || '').trim();
+    if (!texto) return res.status(422).json({ ok: false, error: 'texto_required' });
+    const fuente = ['conversacion', 'agente'].includes(b.fuente) ? b.fuente : 'conversacion';
+    const contactNumber = normalizePhone(b.contact_number || '');
+    const waNumber = normalizePhone(b.wa_number || process.env.IA360_WA_NUMBER || '5213321594582');
+    const contexto = (b.contexto && typeof b.contexto === 'object') ? b.contexto : {};
+    const ideaId = await insertIa360Idea({ fuente, contactNumber, texto, contexto });
+    const synthetic = {
+      wa_number: waNumber,
+      contact_number: contactNumber || IA360_OWNER_NUMBER,
+      message_id: `idea-capture-${ideaId}`,
+      message_type: 'text',
+      direction: 'incoming',
+    };
+    const cardSent = await sendIa360IdeaCard({ record: synthetic, ideaId, texto, fuente, contactNumber });
+    return res.status(200).json({ ok: true, schema: 'ia360_idea_capture.v1', idea_id: ideaId, card_sent: Boolean(cardSent) });
+  } catch (err) {
+    console.error('[ia360-ideas] capture endpoint error:', err.message);
+    return res.status(500).json({ ok: false, error: 'idea_capture_failed' });
   }
 });
 
