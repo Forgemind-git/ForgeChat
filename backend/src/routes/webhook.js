@@ -842,6 +842,24 @@ function inferIa360QaPersonaHint(name) {
   return null;
 }
 
+// G-C: el nombre del introductor viene de push name / vCard (texto controlado por
+// el remitente). Se sanitiza antes de persistir: sin caracteres de control ni
+// saltos de línea, sin llaves de placeholder, espacios colapsados y tope de 60
+// caracteres. Devuelve null si no queda nada usable.
+function sanitizeIa360IntroName(raw) {
+  const clean = String(raw || '')
+    .replace(/[\u0000-\u001F\u007F\u2028\u2029\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, ' ')
+    .replace(/[{}]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Corte por code points (no por unidades UTF-16): un emoji en la frontera de
+  // los 60 caracteres no deja un surrogate suelto que rompa el jsonb al persistir.
+  const capped = Array.from(clean).slice(0, 60).join('').trim();
+  if (!capped) return null;
+  if (!/[\p{L}]/u.test(capped)) return null; // sin letras (solo dígitos/símbolos) no sirve como nombre
+  return capped;
+}
+
 async function upsertIa360SharedContact({ record, shared }) {
   if (!record?.wa_number || !shared?.contactNumber) return null;
   const qaPersonaExpectedChoice = inferIa360QaPersonaHint(shared.name);
@@ -849,16 +867,27 @@ async function upsertIa360SharedContact({ record, shared }) {
   // persona es quien hizo la introducción. Se guarda el NOMBRE para que el
   // opener referido_contexto pueda decir "nos presentó X". Si lo manda el owner,
   // el dato queda pendiente (el placeholder {{quien_intro}} bloquea el copy).
+  // G-C: sanitizado (push name inyectable), sin auto-introducción (vCard propio)
+  // y sin pisar un quien_intro ya capturado.
   let quienIntro = null;
-  if (record.contact_number && normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
+  const sharerIsSelf = normalizePhone(record.contact_number || '') === normalizePhone(shared.contactNumber || '');
+  if (record.contact_number && !sharerIsSelf && normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
     try {
       const { rows: introRows } = await pool.query(
         `SELECT name, profile_name FROM coexistence.contacts WHERE wa_number=$1 AND contact_number=$2 LIMIT 1`,
         [record.wa_number, normalizePhone(record.contact_number)]
       );
-      quienIntro = String(introRows[0]?.name || introRows[0]?.profile_name || record.contact_name || '').trim() || null;
+      quienIntro = sanitizeIa360IntroName(introRows[0]?.name || introRows[0]?.profile_name || record.contact_name || '');
+      if (quienIntro) {
+        const { rows: existingRows } = await pool.query(
+          `SELECT custom_fields->>'quien_intro' AS quien_intro FROM coexistence.contacts WHERE wa_number=$1 AND contact_number=$2 LIMIT 1`,
+          [record.wa_number, normalizePhone(shared.contactNumber)]
+        );
+        if (String(existingRows[0]?.quien_intro || '').trim()) quienIntro = null; // ya hay introductor registrado: no pisar
+      }
     } catch (e) {
       console.error('[ia360-vcard] quien_intro lookup:', e.message);
+      quienIntro = null;
     }
   }
   const customFields = {
@@ -2091,6 +2120,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'feedback sobre claridad, límites y arquitectura del flujo',
         nextAction: 'Alek revisa si la explicación técnica tiene sentido antes de pedir feedback real.',
         cta: 'pedir permiso para una pregunta corta de validación',
+        step2: {
+          si_pregunta: 'Va la pregunta: si este mensaje te hubiera llegado sin conocer a Alek, ¿se entiende qué es IA360 y qué puedo y no puedo hacer como IA, o hay algo que te haría desconfiar? Dímelo con toda franqueza; para eso es esta prueba.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek está construyendo IA360, un sistema que conecta WhatsApp, CRM y memoria de clientes, y me pidió validarlo con gente de su confianza antes de usarlo con clientes reales. No te quiero vender nada: solo necesito tu ojo técnico. ¿Me dejas hacerte una pregunta corta?`,
         openerOptions: {
           kind: 'buttons',
@@ -2109,6 +2141,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'comentario técnico accionable sobre una parte del sistema',
         nextAction: 'Alek edita la pregunta técnica y decide si la manda como prueba controlada.',
         cta: 'pedir una crítica concreta del flujo',
+        step2: {
+          si_pregunta: 'Gracias. ¿Cómo se siente recibir un mensaje así de una IA: natural, raro o invasivo? Lo que me digas se lo paso a Alek tal cual, sin suavizarlo.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek está probando IA360 (su sistema de WhatsApp + CRM con memoria) con contactos de confianza y quiere críticas directas, no cumplidos. ¿Me dejas hacerte una pregunta breve sobre cómo se siente recibir mensajes de una IA como esta?`,
         openerOptions: {
           kind: 'buttons',
@@ -2127,6 +2162,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'validación de si el contexto guardado ayuda o estorba',
         nextAction: 'Alek confirma qué contexto usar en la prueba antes de escribir.',
         cta: 'probar memoria con una pregunta controlada',
+        step2: {
+          si_a_ver: 'Va. Pregúntame algo que Alek y tú hayan platicado o trabajado antes, y te digo qué tengo registrado. Tú pones la prueba.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Estoy aprendiendo a recordar el contexto de cada persona sin volverme invasiva, y Alek me pidió probarlo contigo porque te tiene confianza. ¿Me dejas hacerte una pregunta corta para poner a prueba mi memoria?`,
         openerOptions: {
           kind: 'buttons',
@@ -2154,6 +2192,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'origen de la introducción, dolor probable o permiso para avanzar',
         nextAction: 'Alek completa el contexto del referidor antes de mandar cualquier mensaje.',
         cta: 'pedir contexto breve de la introducción',
+        step2: {
+          pregunta: '¿Qué te contó la persona que nos presentó sobre lo que hace Alek, y qué te llamó la atención para aceptar la introducción? Con eso evitamos mandarte algo fuera de lugar.',
+        },
         draft: ({ name, quienIntro }) => `Hola ${name}, soy la IA de Alek. Te escribo porque nos presentó ${quienIntro || '{{quien_intro}}'} y, antes de mandarte cualquier propuesta, Alek quiere entender tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`,
         openerOptions: {
           kind: 'buttons',
@@ -2172,6 +2213,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'interés inicial sin romper la confianza del canal',
         nextAction: 'Alek ajusta el one-liner según quién hizo la introducción.',
         cta: 'pedir permiso para explicar IA360 en una línea',
+        step2: {
+          si_cuentame: 'Va la versión completa en corto: IA360 conecta WhatsApp, CRM, agenda y memoria de clientes para que el seguimiento no dependa de la memoria de nadie. ¿En tu operación dónde se cae más el seguimiento hoy: mensajes, CRM o agenda?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Nos presentaron hace poco y Alek prefiere darte la versión corta antes que una llamada a ciegas: IA360 evita que el seguimiento se caiga entre WhatsApp, el CRM, la agenda y la gente. ¿Quieres explorar si aplica a tu caso?`,
         openerOptions: {
           kind: 'buttons',
@@ -2190,8 +2234,14 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'permiso explícito para explorar una llamada o siguiente paso',
         nextAction: 'Alek confirma que la introducción justifica proponer agenda.',
         cta: 'pedir permiso para sugerir una llamada',
+        step2: {
+          pregunta: 'Claro, pregunta con confianza: qué hace IA360, cómo trabaja Alek o qué implicaría la llamada. Te respondo aquí mismo.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Vienes de una introducción y Alek no quiere mandarte una agenda sin contexto. Si ordenar WhatsApp, CRM y seguimiento te suena útil, puedo proponerte una llamada corta con él. ¿Cómo lo ves?`,
         metaTemplateName: 'ia360_referido_apertura',
+        // El template de Meta trae botones de texto ("Sí, cuéntame"); su afirmativo
+        // mapea a la rama de horarios (el copy pide permiso para proponer llamada).
+        templateAliasOption: 'horarios',
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -2218,6 +2268,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'tipo de colaboración posible y segmento de clientes compatible',
         nextAction: 'Alek define si la conversación es canal, proveedor, implementación o co-venta.',
         cta: 'mapear fit de colaboración',
+        step2: {
+          si_pregunta: 'Gracias. ¿Qué tipo de clientes atiendes hoy y dónde los ves sufrir más: WhatsApp desordenado, CRM sin seguimiento o procesos repetidos a mano? Con eso mapeamos el fit.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió escribirte porque te ve como posible aliado, no como cliente: quiere explorar si IA360 les sirve a los clientes que tú ya atiendes cuando tienen fricción en WhatsApp, CRM o procesos repetidos. ¿Te hago una pregunta corta para mapear si hay fit?`,
         metaTemplateName: 'ia360_aliado_mapa_colaboracion',
         openerOptions: {
@@ -2237,6 +2290,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'criterios de cliente ideal o señales para descartar',
         nextAction: 'Alek valida criterios de fit antes de pedir intros.',
         cta: 'pedir señales de cliente compatible',
+        step2: {
+          si_pregunta: 'Va: cuando un cliente tuyo ya necesita ordenar WhatsApp, CRM o seguimiento, ¿qué señales lo delatan primero? Con eso definimos juntos a quién sí presentarle IA360.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek no quiere pedirte intros a ciegas: primero quiere definir contigo qué tipo de empresa sí tiene sentido para IA360. ¿Me dejas preguntarte qué señales ves cuando un cliente ya necesita ordenar su WhatsApp, CRM o seguimiento?`,
         openerOptions: {
           kind: 'buttons',
@@ -2255,6 +2311,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'interés en caso seguro para presentar o revender',
         nextAction: 'Alek elige el caso NDA-safe correcto antes de compartirlo.',
         cta: 'ofrecer caso seguro y resumido',
+        step2: {
+          si_comparte: 'Va el caso NDA-safe en corto: una empresa de servicios perdía seguimiento entre WhatsApp y su CRM; con IA360 cada conversación queda registrada, el pipeline se mueve solo y el dueño revisa su semana en un tablero. ¿Le haría sentido a alguno de tus clientes?',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek preparó un caso NDA-safe de IA360 (el problema, la operación antes y el resultado esperado) para que puedas explicárselo a tus clientes sin exponer datos de nadie. ¿Te lo comparto?`,
         openerOptions: {
           kind: 'buttons',
@@ -2282,6 +2341,10 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'avance confirmado, evidencia o siguiente punto pendiente',
         nextAction: 'Alek revisa el avance real del proyecto antes de enviar readout.',
         cta: 'pedir validación del avance',
+        step2: {
+          si_cuento: 'Te leo. Cuéntame el avance, la fricción o el pendiente con el detalle que quieras; se lo dejo a Alek con contexto hoy mismo.',
+          todo_bien: 'Qué bueno. Le paso a Alek que todo va en orden. Cualquier cosa que surja, me escribes por aquí y se lo pongo enfrente.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Como ya estamos trabajando juntos, Alek me pidió darle seguimiento a tu proyecto sin esperar a la siguiente reunión. ¿Hay algún avance, fricción o pendiente que quieras que le ponga enfrente hoy?`,
         openerOptions: {
           kind: 'buttons',
@@ -2300,6 +2363,10 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'bloqueo operativo, duda o necesidad de soporte',
         nextAction: 'Alek confirma si hay soporte pendiente antes de abrir expansión.',
         cta: 'detectar fricción concreta',
+        step2: {
+          hay_tema: 'Cuéntame el tema con el detalle que quieras; se lo paso a Alek hoy mismo con prioridad para que no se quede atorado.',
+          todo_orden: 'Perfecto, me da gusto. Le confirmo a Alek que no hay pendientes de su lado. Aquí sigo si surge algo.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de hablar de siguientes pasos en tu proyecto, Alek quiere asegurarse de que nada esté atorado de su lado. ¿Hay alguna fricción concreta que quieras que vea primero?`,
         openerOptions: {
           kind: 'buttons',
@@ -2392,6 +2459,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'interés en evidencia ejecutiva sin datos sensibles',
         nextAction: 'Alek elige el caso más parecido antes de compartirlo.',
         cta: 'ofrecer prueba segura',
+        step2: {
+          si_manda: 'Va el caso en corto: una operación que dependía de WhatsApp y Excel perdía seguimiento y visibilidad; con IA360 los mensajes alimentan el CRM, el pipeline se mueve solo y la dirección revisa su semana en un tablero. Si quieres, Alek te aterriza el paralelo con tu operación en una llamada corta.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si prefieres ver evidencia antes de hablar de soluciones, Alek puede compartirte un caso NDA-safe de IA360: el problema, el enfoque y el resultado esperado, sin exponer datos de ningún cliente. ¿Te lo mando?`,
         openerOptions: {
           kind: 'buttons',
@@ -2510,6 +2580,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'mención de cartera, cobranza, datos dispersos o visibilidad lenta',
         nextAction: 'Alek confirma si hay un flujo de datos que se pueda ordenar sin invadir sistemas.',
         cta: 'ubicar datos financieros poco visibles',
+        step2: {
+          respondo: 'Te leo. Cuéntame qué información te cuesta más tener confiable y a tiempo (cartera, cobranza, reportes), y se la paso a Alek aterrizada.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando la cartera o los datos viven dispersos, la decisión financiera llega tarde. ¿Qué información te cuesta más tener confiable y a tiempo?`,
         openerOptions: {
           kind: 'buttons',
@@ -2557,6 +2630,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'preguntas sobre permisos, datos, sistemas o alcance técnico',
         nextAction: 'Alek prepara mapa técnico mínimo antes de pedir acceso o integración.',
         cta: 'pedir revisión de mapa de integración',
+        step2: {
+          mapa: 'Va el mapa corto: WhatsApp Cloud API → ForgeChat (bandeja y reglas) → n8n (orquestación) → CRM y memoria por contacto. Todo con permisos mínimos, trazabilidad de cada mensaje y aprobación humana antes de cualquier envío sensible. Si quieres el detalle técnico completo, Alek te lo manda directo.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió contactarte porque eres quien cuida la parte técnica, y una revisión seria de IA360 empieza por permisos, datos, trazabilidad y rollback. ¿Cómo prefieres revisarlo?`,
         openerOptions: {
           kind: 'buttons',
@@ -2597,6 +2673,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         expectedSignal: 'condiciones para una prueba limitada y auditable',
         nextAction: 'Alek confirma límites de piloto antes de tocar sistemas.',
         cta: 'definir prueba técnica controlada',
+        step2: {
+          respondo: 'Te leo. Dime qué condición tendría que cumplirse para que la prueba te parezca segura (permisos, alcance, datos, reversibilidad) y la registro tal cual para Alek.',
+        },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si hacemos una prueba técnica de IA360, Alek la quiere limitada, trazable y reversible. ¿Qué condición tendría que cumplirse para que te parezca segura?`,
         openerOptions: {
           kind: 'buttons',
@@ -2698,6 +2777,299 @@ function buildIa360OpenerInteractive({ sequence, bodyText }) {
       buttons: opts.options.slice(0, 3).map(o => ({ type: 'reply', reply: { id: o.id, title: o.title } })),
     },
   };
+}
+
+// ── G-C: ruteo real de respuestas seq_* (openers v2) ─────────────────────────
+// Un botón/fila `seq_<secuencia>:<opcion>` del catálogo persona-first SIEMPRE
+// recibe un siguiente paso real: paso 2 definido en el catálogo (`step2`),
+// manejo semántico compartido (alek_directo / ahora_no / horarios) o acuse
+// específico con eco de la elección + aviso al owner con la nextAction de la
+// secuencia. Devuelve true si lo manejó; false SOLO para ids seq_* que no están
+// en el catálogo (esos sí caen al fallback global, porque son inválidos).
+async function handleIa360SequenceReply({ record, replyId, contact = null }) {
+  const m = /^seq_([a-z0-9_]+):([a-z0-9_]+)$/.exec(String(replyId || '').trim().toLowerCase());
+  if (!m) return false;
+  const sequenceId = m[1];
+  const optionKey = m[2];
+  const found = findIa360SequenceFlow(sequenceId);
+  if (!found) return false;
+  const { sequence } = found;
+  const option = (sequence.openerOptions?.options || [])
+    .find(o => String(o.id).toLowerCase() === `seq_${sequenceId}:${optionKey}`);
+  if (!option) return false;
+  try {
+    const ctx = contact || await loadIa360ContactContext(record).catch(() => null);
+    const cf = ctx?.custom_fields || {};
+    const contactName = ctx?.name || record.contact_name || record.contact_number;
+    const safeName = sanitizeIa360IntroName(contactName) || record.contact_number;
+    const nowIso = new Date().toISOString();
+
+    // Guard de estado (paridad con el router 100M): si la conversación ya avanzó
+    // a agenda/reunión/handoff humano, un botón seq_* de un opener viejo NO mueve
+    // el deal hacia atrás; responde continuidad y el owner se entera del tap.
+    const guard = await ia360HundredMAdvancedGuard(record);
+    if (guard.advanced) {
+      await enqueueIa360Text({ record, label: `ia360_seq_continuity_${sequenceId}`, body: guard.body });
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: `owner_seq_stale_${sequenceId}`,
+        body: `Alek, ${safeName} (${record.contact_number}) tocó "${option.title}" de un opener viejo ("${sequence.label}"), pero su proceso ya va más adelante. No moví nada; le respondí con continuidad.`,
+        targetContact: record.contact_number,
+        ownerBudget: true,
+      }).catch(e => console.error('[ia360-seq] stale notify:', e.message));
+      return true;
+    }
+
+    // Dedupe de doble tap del contacto: misma secuencia+opción ya registrada →
+    // continuidad corta, sin re-registro ni avisos duplicados al owner.
+    const prev = cf.ia360_seq_last_response || null;
+    if (prev && prev.sequence === sequenceId && prev.option === optionKey) {
+      await enqueueIa360Text({
+        record,
+        label: `ia360_seq_dup_${sequenceId}`,
+        body: `Ya tengo registrada tu respuesta "${option.title}" y Alek ya tiene el contexto. Quedo al pendiente; cualquier cosa me escribes por aquí.`,
+      });
+      return true;
+    }
+
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['ia360-seq-respuesta', `seq-${sequenceId}`],
+      customFields: {
+        ia360_seq_last_response: { sequence: sequenceId, option: optionKey, title: option.title, at: nowIso },
+        ia360_ultima_respuesta: option.title,
+        ultimo_cta_enviado: `ia360_seq_reply_${sequenceId}_${optionKey}`,
+      },
+    }).catch(e => console.error('[ia360-seq] merge state:', e.message));
+
+    const notifyOwner = (detalle) => sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: `owner_seq_reply_${sequenceId}`,
+      body: `Alek, ${safeName} (${record.contact_number}) respondió "${option.title}" al opener "${sequence.label}". ${detalle}`,
+      targetContact: record.contact_number,
+      ownerBudget: true,
+    }).catch(e => console.error('[ia360-seq] notify owner:', e.message));
+
+    // 1) Salida directa con Alek.
+    if (optionKey === 'alek_directo') {
+      await enqueueIa360Text({
+        record,
+        label: `ia360_seq_alek_directo_${sequenceId}`,
+        body: 'Perfecto, le aviso a Alek ahora mismo para que te escriba directo. Gracias por responder.',
+      });
+      await syncIa360Deal({
+        record,
+        targetStageName: 'Requiere Alek',
+        titleSuffix: sequence.label,
+        notes: `Respuesta al opener ${sequence.id}: pidió hablar directo con Alek.`,
+      }).catch(e => console.error('[ia360-seq] deal alek_directo:', e.message));
+      await notifyOwner('Pidió que le escribas TÚ directo. Deal en "Requiere Alek".');
+      return true;
+    }
+
+    // 2) Cierre suave → nutrición.
+    if (optionKey === 'ahora_no') {
+      await enqueueIa360Text({
+        record,
+        label: `ia360_seq_ahora_no_${sequenceId}`,
+        body: 'De acuerdo, no te insisto. Si más adelante quieres retomarlo, me escribes por aquí y seguimos donde lo dejamos.',
+      });
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        tags: ['nutricion-suave'],
+        customFields: {},
+      }).catch(e => console.error('[ia360-seq] tag nutricion:', e.message));
+      await syncIa360Deal({
+        record,
+        targetStageName: 'Nutrición',
+        titleSuffix: sequence.label,
+        notes: `Respuesta al opener ${sequence.id}: ahora no. Pasa a nutrición suave.`,
+      }).catch(e => console.error('[ia360-seq] deal ahora_no:', e.message));
+      await notifyOwner('Respondió que ahora no; queda en nutrición suave.');
+      return true;
+    }
+
+    // 3) Agenda con permiso (referido_permiso_agenda:horarios).
+    if (optionKey === 'horarios') {
+      await enqueueIa360Interactive({
+        record,
+        label: `ia360_seq_horarios_${sequenceId}`,
+        messageBody: 'IA360: preferencia para agendar',
+        interactive: {
+          type: 'button',
+          body: { text: 'Perfecto. ¿Qué ventana te acomoda mejor para la llamada con Alek?' },
+          action: {
+            buttons: [
+              { type: 'reply', reply: { id: 'sched_today', title: 'Hoy' } },
+              { type: 'reply', reply: { id: 'sched_tomorrow', title: 'Mañana' } },
+              { type: 'reply', reply: { id: 'sched_week', title: 'Esta semana' } },
+            ],
+          },
+        },
+      });
+      await syncIa360Deal({
+        record,
+        targetStageName: 'Agenda en proceso',
+        titleSuffix: sequence.label,
+        notes: `Respuesta al opener ${sequence.id}: pidió horarios. Deal a "Agenda en proceso".`,
+      }).catch(e => console.error('[ia360-seq] deal horarios:', e.message));
+      await notifyOwner('Pidió horarios para una llamada contigo. Deal en "Agenda en proceso".');
+      return true;
+    }
+
+    // 4) Paso 2 definido en el catálogo.
+    const step2 = sequence.step2 && sequence.step2[optionKey];
+    if (step2) {
+      await enqueueIa360Text({
+        record,
+        label: `ia360_seq_step2_${sequenceId}_${optionKey}`,
+        body: step2,
+      });
+      await syncIa360Deal({
+        record,
+        targetStageName: 'Intención detectada',
+        titleSuffix: sequence.label,
+        notes: `Respuesta al opener ${sequence.id}: "${option.title}". Paso 2 de la secuencia enviado.`,
+      }).catch(e => console.error('[ia360-seq] deal step2:', e.message));
+      await notifyOwner(`Le envié el paso 2 de la secuencia. Next action sugerida: ${sequence.nextAction}`);
+      return true;
+    }
+
+    // 5) Sin paso 2 en el catálogo (temas de lista): acuse específico con eco de
+    // la elección + aviso al owner con la respuesta y la next action sugerida.
+    await enqueueIa360Text({
+      record,
+      label: `ia360_seq_ack_${sequenceId}_${optionKey}`,
+      body: `Gracias, registré tu respuesta: "${option.title}". Le paso este contexto a Alek para que el siguiente paso vaya directo a eso, sin rodeos. Te escribe él con una propuesta concreta.`,
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: 'Intención detectada',
+      titleSuffix: sequence.label,
+      notes: `Respuesta al opener ${sequence.id}: "${option.title}". Acuse enviado; siguiente paso con Alek.`,
+    }).catch(e => console.error('[ia360-seq] deal ack:', e.message));
+    await notifyOwner(`Next action sugerida: ${sequence.nextAction}`);
+    return true;
+  } catch (err) {
+    console.error('[ia360-seq] reply error:', err.message);
+    // Nunca mudo: acuse mínimo aunque el registro haya fallado.
+    await enqueueIa360Text({
+      record,
+      label: 'ia360_seq_ack_error',
+      body: 'Recibí tu respuesta y ya se la pasé a Alek. Te escribe él en corto.',
+    }).catch(() => {});
+    return true;
+  }
+}
+
+// ── G-C: CTAs únicos — alias de botones de template (quick replies de texto) ──
+// Los templates fríos (p. ej. ia360_referido_apertura = template 41,
+// ia360_aliado_mapa_colaboracion = template 43) llegan con button.payload =
+// TEXTO del botón, no un id estructurado, por lo que "Sí, cuéntame" era ambiguo
+// entre Revenue OS y Referidos. Revenue OS se resuelve ANTES en el dispatch
+// (handleRevenueOsButton, gateado por ia360_revenue_state); si no era suyo, este
+// alias traduce el texto al id seq_* ÚNICO de la secuencia persona-first cuyo
+// opener realmente se le envió al contacto (pf.sequence_candidate.id + pf.send).
+const IA360_SEQ_ALIAS_NEGATIVE = new Set(['ahora no', 'por ahora no', 'no por ahora']);
+const IA360_SEQ_ALIAS_HANDOFF = new Set(['que me escriba alek', 'hablar con alek']);
+// Solo frases genuinamente afirmativas. Los títulos exactos del catálogo
+// ("Proponme horarios", "Te respondo aquí", etc.) se resuelven por match de
+// título, no por semántica: ponerlos aquí fabricaría elecciones equivocadas.
+const IA360_SEQ_ALIAS_AFFIRMATIVE = new Set([
+  'sí, cuéntame', 'si, cuéntame', 'sí, cuentame', 'si, cuentame',
+  'sí, cuéntame más', 'si, cuentame mas',
+  'sí, pregúntame', 'si, preguntame',
+  'sí, mándalo', 'si, mandalo',
+  'sí, compártelo', 'si, compartelo',
+  'sí, a ver', 'si, a ver',
+  'sí, te cuento', 'si, te cuento',
+  'sí, hay un tema', 'si, hay un tema',
+  'me interesa', 'sí, me interesa', 'si, me interesa',
+]);
+
+function resolveIa360TemplateButtonAlias({ replyId, contact }) {
+  const key = String(replyId || '').trim().toLowerCase();
+  if (!key || key.startsWith('seq_')) return null;
+  const isNeg = IA360_SEQ_ALIAS_NEGATIVE.has(key);
+  const isHand = IA360_SEQ_ALIAS_HANDOFF.has(key);
+  const isAff = IA360_SEQ_ALIAS_AFFIRMATIVE.has(key);
+  if (!isNeg && !isHand && !isAff) return null;
+  const pf = contact?.custom_fields?.ia360_persona_first;
+  const seqId = pf?.sequence_candidate?.id;
+  if (!seqId || !pf?.send?.sent_at) return null; // solo si su opener realmente salió
+  const found = findIa360SequenceFlow(seqId);
+  if (!found) return null;
+  const opts = found.sequence.openerOptions?.options || [];
+  // 1) Match exacto por título visible del botón.
+  const byTitle = opts.find(o => String(o.title).trim().toLowerCase() === key);
+  if (byTitle) return String(byTitle.id).toLowerCase();
+  // 2) Por semántica: negativo → ahora_no; handoff → alek_directo; afirmativo →
+  // la primera opción que no sea ninguna de las dos (el camino afirmativo).
+  const bySuffix = (suffix) => opts.find(o => String(o.id).toLowerCase().endsWith(`:${suffix}`));
+  if (isNeg) { const o = bySuffix('ahora_no'); return o ? String(o.id).toLowerCase() : null; }
+  if (isHand) { const o = bySuffix('alek_directo'); return o ? String(o.id).toLowerCase() : null; }
+  // Afirmativo SOLO cuando es inequívoco: la secuencia declara su opción de
+  // template (templateAliasOption) o existe exactamente UNA opción no terminal.
+  // Con varias opciones posibles (listas de temas) NO se fabrica una elección:
+  // se devuelve null y el fallback global acusa recibo y avisa al owner.
+  if (found.sequence.templateAliasOption) {
+    const o = bySuffix(found.sequence.templateAliasOption);
+    if (o) return String(o.id).toLowerCase();
+  }
+  const nonTerminal = opts.filter(o => {
+    const id = String(o.id).toLowerCase();
+    return !id.endsWith(':ahora_no') && !id.endsWith(':alek_directo');
+  });
+  return nonTerminal.length === 1 ? String(nonTerminal[0].id).toLowerCase() : null;
+}
+
+// ── G-C: anti-loop del router 100M ───────────────────────────────────────────
+// Nodos que en las pruebas reales generaron ciclos (doc 2026-06-10, chat_history
+// 1068-1079 y 1135-1142): exploración, mecanismos, mapa y ejemplo. Una visita
+// repetida ya no reenvía el bloque completo: responde una versión condensada con
+// salidas terminales (agendar / llamada / más adelante).
+const IA360_100M_LOOP_PRONE = new Set([
+  'explorando',
+  'mecanismo-whatsapp-crm',
+  'mecanismo-erp-bi',
+  'mecanismo-agentic-followup',
+  'mapa-30-60-90-solicitado',
+  'ejemplo-solicitado',
+]);
+// Etapas donde la conversación ya avanzó a agenda/handoff humano: un botón 100M
+// de un mensaje viejo NO debe reabrir la rama (guard de estado/versión).
+const IA360_100M_ADVANCED_STAGES = new Set(['Agenda en proceso', 'Reunión agendada', 'Requiere Alek']);
+
+async function ia360HundredMAdvancedGuard(record) {
+  const out = { advanced: false, body: '', visited: {}, visitedOk: false };
+  try {
+    const contact = await loadIa360ContactContext(record).catch(() => null);
+    const cf = contact?.custom_fields || {};
+    if (contact) {
+      out.visited = (cf.ia360_100m_visited && typeof cf.ia360_100m_visited === 'object') ? cf.ia360_100m_visited : {};
+      out.visitedOk = true; // lectura confiable: se puede escribir sin pisar el mapa
+    }
+    // Solo reuniones FUTURAS cuentan como "en curso": el cache crudo ia360_bookings
+    // conserva citas pasadas y atraparía al contacto para siempre.
+    const bookings = await loadIa360BookingsForList(record.contact_number).catch(() => []);
+    const hasBooking = Array.isArray(bookings) && bookings.length > 0;
+    let stageName = '';
+    const deal = await getActiveNonTerminalIa360Deal(record).catch(() => null);
+    if (deal) stageName = deal.stage_name || '';
+    if (hasBooking || IA360_100M_ADVANCED_STAGES.has(stageName)) {
+      out.advanced = true;
+      out.body = (hasBooking || stageName === 'Reunión agendada')
+        ? 'Vi tu respuesta, pero tu proceso ya va más adelante: tienes una reunión en curso con Alek. Sigo con eso para no regresarte al inicio. Si quieres mover la reunión o retomar otro tema, dímelo por aquí.'
+        : 'Vi tu respuesta a un mensaje anterior, pero tu proceso ya va más adelante: estamos en la parte de agenda con Alek. Sigo con eso para no darte vueltas; si quieres retomar otro tema, dímelo por aquí y lo vemos.';
+    }
+  } catch (err) {
+    console.error('[ia360-100m] advanced guard:', err.message);
+  }
+  return out;
 }
 
 function buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction = 'sequence_selected' }) {
@@ -3157,21 +3529,44 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     return deny('copy_blocked', `El borrador de ${name} está bloqueado (placeholder sin resolver). No envié nada.`);
   }
 
+  // G-C: dedupe de doble tap. Si esta misma secuencia ya fue aprobada y su envío
+  // ya salió SIN fallar, un segundo tap de la tarjeta NO debe generar otro egress.
+  // Un envío fallido NO bloquea: el owner puede reintentar con la misma tarjeta.
+  if (pf.approval?.status === 'approved' && pf.send?.sent_at && String(pf.send.send_status || '').toLowerCase() !== 'failed' && !pf.send.error) {
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_approve_send_dup',
+      body: `Ese opener ("${sequence.label}") ya se había enviado a ${name} (${pf.send.sent_at}). Detecté un doble tap y no envié nada nuevo.`,
+      targetContact,
+      ownerBudget: true,
+    });
+    return;
+  }
+
   // GUARDIA cliente_expansion (D7): la secuencia presupone un proyecto andando.
   // Solo dispara si el contacto tiene un deal vivo (status='open') en P2 (IA360
   // WhatsApp Revenue Pipeline) o P7 (Champions). Sin deal vivo → bloquear con aviso.
+  // G-C: con try/catch — si la consulta falla, el owner se entera (nunca mudo) y
+  // NO se envía nada (fail-closed).
   if (sequence.requiresLiveDeal) {
-    const { rows: liveRows } = await pool.query(
-      `SELECT 1
-         FROM coexistence.deals d
-         JOIN coexistence.pipelines p ON p.id = d.pipeline_id
-        WHERE p.name IN ('IA360 WhatsApp Revenue Pipeline', 'Champions — Adopción y expansión')
-          AND d.contact_wa_number = $1
-          AND d.contact_number = $2
-          AND d.status = 'open'
-        LIMIT 1`,
-      [record.wa_number, targetContact]
-    );
+    let liveRows;
+    try {
+      ({ rows: liveRows } = await pool.query(
+        `SELECT 1
+           FROM coexistence.deals d
+           JOIN coexistence.pipelines p ON p.id = d.pipeline_id
+          WHERE p.name IN ('IA360 WhatsApp Revenue Pipeline', 'Champions — Adopción y expansión')
+            AND d.contact_wa_number = $1
+            AND d.contact_number = $2
+            AND d.status = 'open'
+          LIMIT 1`,
+        [record.wa_number, targetContact]
+      ));
+    } catch (liveErr) {
+      console.error('[ia360-approve] live deal check failed:', liveErr.message);
+      return deny('live_deal_check_failed', `No pude verificar si ${name} tiene un proyecto activo (error de base de datos). Por seguridad no envié nada; reintenta en un momento.`);
+    }
     if (!liveRows.length) {
       return deny('no_live_deal', `${name} no tiene un proyecto activo (deal vivo en P2/P7). La secuencia ${sequence.id} solo aplica a clientes con proyecto en curso; elige otra secuencia. No envié nada.`);
     }
@@ -3255,6 +3650,10 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
       sent_at: nowIso,
       send_status: sendResult.status,
       outbound_message_id: sendResult.message_id || null,
+      // G-C: un opener nuevo abre un ciclo nuevo — la respuesta del ciclo anterior
+      // no debe activar el dedupe del router seq_* (el contacto debe poder volver
+      // a elegir la misma opción y recibir su paso 2).
+      ia360_seq_last_response: null,
     },
   }).catch(e => console.error('[ia360-approve] persist approval:', e.message));
 
@@ -5174,6 +5573,25 @@ async function handleIa360LiteInteractive(record) {
   // false y el flujo sigue normal. Va ANTES del embudo 100m / agenda.
   if (await handleRevenueOsButton({ record, replyId })) return;
 
+  // ── G-C: ruteo de respuestas a openers v2 (ids seq_* y alias de template) ──
+  // Va DESPUÉS de Revenue OS (que resuelve su propio "Sí, cuéntame" gateado por
+  // estado) y ANTES del embudo 100M. Un id seq_* del catálogo NUNCA cae al
+  // fallback global.
+  if (replyId && replyId.startsWith('seq_')) {
+    if (await handleIa360SequenceReply({ record, replyId })) return;
+  } else if (replyId || answer) {
+    const aliasKey = String(replyId || answer || '').trim().toLowerCase();
+    if (IA360_SEQ_ALIAS_NEGATIVE.has(aliasKey) || IA360_SEQ_ALIAS_HANDOFF.has(aliasKey) || IA360_SEQ_ALIAS_AFFIRMATIVE.has(aliasKey)) {
+      try {
+        const aliasContact = await loadIa360ContactContext(record).catch(() => null);
+        const aliased = resolveIa360TemplateButtonAlias({ replyId: aliasKey, contact: aliasContact });
+        if (aliased && await handleIa360SequenceReply({ record, replyId: aliased, contact: aliasContact })) return;
+      } catch (aliasErr) {
+        console.error('[ia360-seq] alias error:', aliasErr.message);
+      }
+    }
+  }
+
   // W4 — boton "Enviar contexto" (stage-aware): sin slot abre diagnostico, con slot abre
   // pre_call. Va ANTES del embudo para no confundirse con un micro-paso. Si el Flow no se
   // pudo encolar (dedup/cuenta), cae al flujo normal (este id no matchea = no-op silencioso).
@@ -5316,12 +5734,13 @@ async function handleIa360LiteInteractive(record) {
         { id: '100m_schedule', title: 'Agendar' },
       ],
     },
+    // G-C anti-loop: "No prioritario" ya NO ofrece "Aplicarlo" (reabría la rama
+    // comercial); las salidas son nutrición ("Más adelante") o baja.
     'no prioritario': {
       stage: 'Nutrición', tag: 'no-prioritario', title: 'No prioritario',
       body: 'Perfecto. Lo dejo en nutrición suave. Si después detectas doble captura, reportes tarde o leads sin seguimiento, ahí sí vale la pena retomarlo.',
       buttons: [
         { id: '100m_more_later', title: 'Más adelante' },
-        { id: '100m_apply_later', title: 'Aplicarlo' },
         { id: '100m_optout', title: 'Baja' },
       ],
     },
@@ -5360,6 +5779,57 @@ async function handleIa360LiteInteractive(record) {
   };
   const flow100m = reply100m[key100mById[replyId]] || reply100m[replyId] || reply100m[answer];
   if (flow100m) {
+    // ── G-C: anti-loop del router 100M ──────────────────────────────────────
+    // 'baja' (optout) SIEMPRE pasa: la salida del contacto no se bloquea nunca.
+    if (flow100m.tag !== 'no-contactar') {
+      try {
+        const guard = await ia360HundredMAdvancedGuard(record);
+        // Guard de estado/versión: la conversación ya avanzó a agenda/reunión/
+        // handoff humano → un botón de un mensaje viejo NO reabre la rama.
+        if (guard.advanced) {
+          await enqueueIa360Text({ record, label: 'ia360_100m_continuity', body: guard.body });
+          return;
+        }
+        // Nodo loop-prone repetido → versión condensada con salidas terminales,
+        // no el bloque completo otra vez. Si la lectura del contacto falló, NO se
+        // escribe el mapa de visitas (se pisaría con un objeto vacío).
+        const visited = guard.visited || {};
+        if (guard.visitedOk && IA360_100M_LOOP_PRONE.has(flow100m.tag)) {
+          if (visited[flow100m.tag]) {
+            await mergeContactIa360State({
+              waNumber: record.wa_number,
+              contactNumber: record.contact_number,
+              customFields: { ia360_100m_visited: { ...visited, [flow100m.tag]: (Number(visited[flow100m.tag]) || 0) + 1 } },
+            }).catch(e => console.error('[ia360-100m] visited merge:', e.message));
+            await enqueueIa360Interactive({
+              record,
+              label: 'ia360_100m_condensed',
+              messageBody: `IA360 100M: ${flow100m.title} (resumen)`,
+              interactive: {
+                type: 'button',
+                body: { text: `Eso ya lo vimos: ${flow100m.title}. Para no darte vueltas con lo mismo, mejor dime cómo cerramos: ¿agendamos una llamada corta con Alek o lo dejamos para más adelante?` },
+                footer: { text: 'IA360 · sin vueltas' },
+                action: {
+                  buttons: [
+                    { type: 'reply', reply: { id: '100m_schedule', title: 'Agendar' } },
+                    { type: 'reply', reply: { id: 'apply_call', title: 'Llamada con Alek' } },
+                    { type: 'reply', reply: { id: '100m_more_later', title: 'Más adelante' } },
+                  ],
+                },
+              },
+            });
+            return;
+          }
+          await mergeContactIa360State({
+            waNumber: record.wa_number,
+            contactNumber: record.contact_number,
+            customFields: { ia360_100m_visited: { ...visited, [flow100m.tag]: 1 } },
+          }).catch(e => console.error('[ia360-100m] visited merge:', e.message));
+        }
+      } catch (guardErr) {
+        console.error('[ia360-100m] guard error:', guardErr.message);
+      }
+    }
     await mergeContactIa360State({
       waNumber: record.wa_number,
       contactNumber: record.contact_number,
@@ -6235,11 +6705,11 @@ async function handleIa360LiteInteractive(record) {
   }
 
   // ── FALLBACK GLOBAL DE INTERACTIVE (openers v2) ────────────────────────────
-  // Si llegamos aquí, NINGÚN handler reconoció el button/list reply (id viejo,
-  // id de opener v2 sin ruteo todavía, o quick reply de template sin estado,
-  // p. ej. "Sí, cuéntame" de ia360_referido_apertura). Antes el contacto quedaba
-  // MUDO; ahora siempre recibe acuse y el owner se entera. try/catch terminal:
-  // nunca tumba el webhook.
+  // Si llegamos aquí, NINGÚN handler reconoció el button/list reply (id viejo o
+  // malformado). Los ids seq_* del catálogo y los quick replies de template con
+  // estado persona-first ya se rutean arriba (handleIa360SequenceReply + alias);
+  // aquí solo cae lo verdaderamente desconocido. El contacto siempre recibe
+  // acuse y el owner se entera. try/catch terminal: nunca tumba el webhook.
   try {
     const fallbackId = replyId || answer || '(sin id)';
     console.warn('[ia360-fallback] unhandled interactive reply contact=%s id=%s body=%s', record.contact_number || '-', fallbackId, String(record.message_body || '').slice(0, 80));
