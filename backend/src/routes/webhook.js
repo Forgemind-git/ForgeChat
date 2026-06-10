@@ -3268,6 +3268,173 @@ async function persistIa360PersonaPayload({ record, targetContact, flow, sequenc
   });
 }
 
+// G-D: pipelines donde un deal vivo habilita la jugada de expansión (D7).
+const IA360_EXPANSION_PIPELINES = ['IA360 WhatsApp Revenue Pipeline', 'Champions — Adopción y expansión'];
+
+// G-D: señales reales del contacto para el ranker del selector de secuencias.
+// Cada consulta tiene su propio try/catch (fail-open): si la DB falla, esa señal
+// queda en null y el selector sale con el orden default — nunca mudo.
+// OJO: ia360_memory_* tiene doble keying en contact_wa_number (a veces la línea
+// del bot, a veces el número del contacto); la llave confiable es contact_number.
+async function gatherIa360ContactSignals({ waNumber, contactNumber }) {
+  const signals = { liveDeal: null, quienIntro: null, lastFact: null, lastEvent: null, lastIncomingAt: null };
+  try {
+    const { rows } = await pool.query(
+      `SELECT d.title, p.name AS pipeline_name, s.name AS stage_name
+         FROM coexistence.deals d
+         JOIN coexistence.pipelines p ON p.id = d.pipeline_id
+         JOIN coexistence.pipeline_stages s ON s.id = d.stage_id
+        WHERE d.contact_wa_number = $1 AND d.contact_number = $2 AND d.status = 'open'
+        ORDER BY d.updated_at DESC NULLS LAST, d.id DESC
+        LIMIT 1`,
+      [waNumber, contactNumber]
+    );
+    if (rows.length) signals.liveDeal = { title: rows[0].title, pipelineName: rows[0].pipeline_name, stageName: rows[0].stage_name };
+  } catch (e) { console.error('[ia360-rank] deal lookup:', e.message); }
+  try {
+    const { rows } = await pool.query(
+      `SELECT custom_fields->>'quien_intro' AS quien_intro, custom_fields->>'referido_por' AS referido_por
+         FROM coexistence.contacts
+        WHERE wa_number = $1 AND contact_number = $2
+        LIMIT 1`,
+      [waNumber, contactNumber]
+    );
+    const quienIntro = String(rows[0]?.quien_intro || '').trim();
+    if (quienIntro) {
+      signals.quienIntro = quienIntro;
+    } else {
+      // referido_por guarda el NÚMERO de quien compartió el vCard. Solo cuenta
+      // como introductor si NO es el owner, ni el bot, ni el propio contacto;
+      // y solo con un nombre presentable (no citamos números pelones).
+      const referidoPor = normalizePhone(String(rows[0]?.referido_por || '').trim());
+      if (referidoPor && referidoPor !== IA360_OWNER_NUMBER && referidoPor !== normalizePhone(waNumber) && referidoPor !== normalizePhone(contactNumber)) {
+        const { rows: introRows } = await pool.query(
+          `SELECT name, profile_name FROM coexistence.contacts WHERE wa_number = $1 AND contact_number = $2 LIMIT 1`,
+          [waNumber, referidoPor]
+        );
+        const introName = String(introRows[0]?.name || introRows[0]?.profile_name || '').trim();
+        if (introName) signals.quienIntro = introName;
+      }
+    }
+  } catch (e) { console.error('[ia360-rank] quien_intro lookup:', e.message); }
+  try {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(recurring_pain, preference, objection, role) AS texto, last_seen_at
+         FROM coexistence.ia360_memory_facts
+        WHERE contact_number = $1
+          AND COALESCE(recurring_pain, preference, objection, role) IS NOT NULL
+        ORDER BY last_seen_at DESC
+        LIMIT 1`,
+      [contactNumber]
+    );
+    if (rows.length) signals.lastFact = { text: rows[0].texto, lastSeenAt: rows[0].last_seen_at };
+  } catch (e) { console.error('[ia360-rank] facts lookup:', e.message); }
+  try {
+    const { rows } = await pool.query(
+      `SELECT summary, created_at
+         FROM coexistence.ia360_memory_events
+        WHERE contact_number = $1
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [contactNumber]
+    );
+    if (rows.length) signals.lastEvent = { summary: rows[0].summary, createdAt: rows[0].created_at };
+  } catch (e) { console.error('[ia360-rank] events lookup:', e.message); }
+  try {
+    const { rows } = await pool.query(
+      `SELECT MAX(created_at) AS last_in
+         FROM coexistence.chat_history
+        WHERE wa_number = $1 AND contact_number = $2 AND direction = 'incoming'`,
+      [waNumber, contactNumber]
+    );
+    if (rows[0]?.last_in) signals.lastIncomingAt = rows[0].last_in;
+  } catch (e) { console.error('[ia360-rank] chat_history lookup:', e.message); }
+  return signals;
+}
+
+// G-D: ranker rule-based (SIN LLM). Solo REORDENA las secuencias de la persona
+// elegida; cada razón cita una señal que existe en la base. Sin señales que
+// matcheen secuencias de esta persona → orden de catálogo y cero razones
+// inventadas (honestidad del ranker).
+function rankIa360Sequences({ flow, signals }) {
+  const scores = new Map();
+  const reasons = new Map();
+  const bump = (id, pts, reason) => {
+    scores.set(id, (scores.get(id) || 0) + pts);
+    if (reason && !reasons.has(id)) reasons.set(id, reason);
+  };
+  const s = signals || {};
+  if (s.liveDeal) {
+    const dealReason = `Deal vivo «${s.liveDeal.title}» en ${s.liveDeal.pipelineName}`;
+    if (IA360_EXPANSION_PIPELINES.includes(s.liveDeal.pipelineName)) {
+      bump('cliente_expansion', 35, dealReason);
+      bump('cliente_readout', 20, dealReason);
+      bump('cliente_soporte', 10, dealReason);
+    } else {
+      bump('cliente_readout', 30, dealReason);
+      bump('cliente_soporte', 20, dealReason);
+    }
+  }
+  if (s.quienIntro) {
+    const introReason = `Te lo presentó ${s.quienIntro}`;
+    bump('referido_contexto', 30, introReason);
+    bump('referido_permiso_agenda', 15, introReason);
+    bump('referido_oneliner', 10, introReason);
+  }
+  const memorySignal = s.lastEvent || s.lastFact;
+  if (memorySignal) {
+    // 40 y no más: "Sugerida: Memoria registrada: " + frag debe caber en los
+    // 72 chars de la description de Meta sin perder el final de la razón.
+    const frag = compactForWhatsApp(s.lastEvent ? s.lastEvent.summary : s.lastFact.text, 40);
+    const memReason = `Memoria registrada: ${frag}`;
+    bump('beta_memoria', 15, memReason);
+    bump('cliente_readout', 10, memReason);
+  }
+  const ordered = (flow.sequences || [])
+    .map((seq, idx) => ({ seq, idx, score: scores.get(seq.id) || 0 }))
+    .sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
+  const ranked = ordered.length > 0 && ordered[0].score > 0;
+  return {
+    ordered: ordered.map(o => o.seq),
+    suggestedId: ranked ? ordered[0].seq.id : null,
+    reasonFor: (id) => reasons.get(id) || null,
+    ranked,
+  };
+}
+
+// G-D: resumen de 2 líneas del contacto para el cuerpo de la tarjeta. Solo
+// afirma lo que existe; sin señales devuelve una sola línea honesta.
+function buildIa360ContactSummaryLines(signals) {
+  const s = signals || {};
+  const fmtDate = (d) => {
+    try { return new Date(d).toISOString().slice(0, 10); } catch { return ''; }
+  };
+  if (!s.liveDeal && !s.quienIntro && !s.lastFact && !s.lastEvent) {
+    return ['Aún no tengo señales registradas de este contacto (sin deal, sin memoria, sin introductor).'];
+  }
+  // Tope de 180: título/pipeline/etapa vienen de la base sin límite y el body
+  // del interactive de Meta admite 1024 como máximo — si se excede, la tarjeta
+  // se vuelve muda. Acotado aquí, el body completo queda siempre < 1024.
+  const line1 = s.liveDeal
+    ? compactForWhatsApp(`Deal vivo: «${s.liveDeal.title}» — ${s.liveDeal.pipelineName}${s.liveDeal.stageName ? ` / ${s.liveDeal.stageName}` : ''}.`, 180)
+    : 'Sin deal vivo registrado.';
+  let line2;
+  if (s.lastEvent) {
+    const fecha = fmtDate(s.lastEvent.createdAt);
+    line2 = `Último evento${fecha ? ` (${fecha})` : ''}: ${compactForWhatsApp(s.lastEvent.summary, 120)}`;
+  } else if (s.lastFact) {
+    const fecha = fmtDate(s.lastFact.lastSeenAt);
+    line2 = `Memoria${fecha ? ` (${fecha})` : ''}: ${compactForWhatsApp(s.lastFact.text, 120)}`;
+  } else if (s.quienIntro) {
+    line2 = `Lo presentó: ${s.quienIntro}.`;
+  } else if (s.lastIncomingAt) {
+    line2 = `Última interacción: ${fmtDate(s.lastIncomingAt)}.`;
+  } else {
+    line2 = 'Sin memoria registrada todavía.';
+  }
+  return [line1, line2];
+}
+
 async function sendIa360SequenceSelector({ record, targetContact, contact, flowKey, flow }) {
   const name = contact?.name || targetContact;
   const payload = buildIa360PersonaPayload({
@@ -3295,28 +3462,63 @@ async function sendIa360SequenceSelector({ record, targetContact, contact, flowK
     payload,
     tags: [`persona-choice:${flowKey}`],
   });
+  // G-D: ranker rule-based sobre señales reales — la sugerida primero con el
+  // porqué en su descripción; sin señales → orden de catálogo sin razones.
+  const signals = await gatherIa360ContactSignals({ waNumber: record.wa_number, contactNumber: targetContact });
+  const ranking = rankIa360Sequences({ flow, signals });
+  const summaryLines = buildIa360ContactSummaryLines(signals);
+  const bodyText = [
+    `Alek, ${name} quedó como ${flow.personaContext}.`,
+    ...summaryLines,
+    'Elige una secuencia. Sigo en dry-run: no enviaré nada al contacto.',
+  ].join('\n');
+  const suggestedReason = ranking.suggestedId ? ranking.reasonFor(ranking.suggestedId) : null;
+  // G-D: el ranking queda auditable en custom_fields (orden, sugerida, razón,
+  // resumen) — best-effort, no bloquea el envío de la tarjeta.
+  await mergeContactIa360State({
+    waNumber: record.wa_number,
+    contactNumber: targetContact,
+    customFields: {
+      ia360_selector_ranking: {
+        at: new Date().toISOString(),
+        persona: flowKey,
+        ranked: ranking.ranked,
+        suggested: ranking.suggestedId,
+        reason: suggestedReason,
+        order: ranking.ordered.map(seq => seq.id),
+        summary: summaryLines,
+      },
+    },
+  }).catch(e => console.error('[ia360-rank] persist ranking:', e.message));
   return sendOwnerInteractive({
     record,
     label: `owner_sequence_selector_${targetContact}_${flowKey}`,
-    messageBody: `IA360: secuencias ${name}`,
+    messageBody: ranking.ranked
+      ? `IA360: secuencias ${name} — sugerida: ${ranking.suggestedId} (${suggestedReason})`
+      : `IA360: secuencias ${name}`,
     targetContact,
     ownerBudget: true,
     interactive: {
       type: 'list',
       header: { type: 'text', text: 'Elegir secuencia' },
-      body: {
-        text: `Alek, ${name} quedó como ${flow.personaContext}. Elige una secuencia lógica. Sigo en dry-run: no enviaré nada al contacto.`,
+      body: { text: bodyText },
+      footer: {
+        text: ranking.ranked
+          ? 'Sugerida primero por señales; aprobación antes de envío'
+          : 'Persona antes de secuencia; aprobación antes de envío',
       },
-      footer: { text: 'Persona antes de secuencia; aprobación antes de envío' },
       action: {
         button: 'Elegir secuencia',
         sections: [{
           title: compactForWhatsApp(flow.personaContext, 24),
-          rows: flow.sequences.map(seq => ({
-            id: `owner_seq:${targetContact}:${seq.id}`,
-            title: compactForWhatsApp(seq.uiTitle || seq.label, 24),
-            description: compactForWhatsApp(seq.goal, 72),
-          })),
+          rows: ranking.ordered.map(seq => {
+            const reason = ranking.suggestedId === seq.id ? ranking.reasonFor(seq.id) : null;
+            return {
+              id: `owner_seq:${targetContact}:${seq.id}`,
+              title: compactForWhatsApp(seq.uiTitle || seq.label, 24),
+              description: compactForWhatsApp(reason ? `Sugerida: ${reason}` : seq.goal, 72),
+            };
+          }),
         }],
       },
     },

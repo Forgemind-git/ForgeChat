@@ -13,7 +13,7 @@ MODE="${2:-negativo}"
 
 WA="5213321594582"
 OWNER="5213322638033"
-PID_NUM="123456789"
+PID_NUM="873315362541590"
 DB="forgecrm-db"
 BE="forgecrm-backend"
 ENVF="/home/alek/stack/forgechat-poc/backend/.env"
