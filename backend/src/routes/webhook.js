@@ -350,6 +350,37 @@ function isIa360ClienteActivoBetaContact(contact) {
     || tags.includes('cliente-activo-beta');
 }
 
+// G-LIVE: números QA del harness E2E (pruebas sintéticas autorizadas). Longitud
+// exacta de 13 dígitos (521 + 99900XXXXX): un '\d*' laxo dejaría pasar móviles
+// reales de la lada 999 (Mérida) como si fueran QA.
+const IA360_QA_NUMBER_RE = /^52199900\d{5}$/;
+
+// G-LIVE: pregunta que requiere DATOS VIVOS del portal del cliente (saldos, listas,
+// estatus). Lectura de estado => handoff explícito, nunca inventar. La guía de uso
+// ("¿cómo subo información al portal?") NO matchea: esa sí la responde el agente.
+function isIa360PortalLiveDataQuestion(body) {
+  const t = String(body || '').toLowerCase();
+  if (!/(portal|plataforma)/.test(t)) return false;
+  return /(cu[aá]nt[oa]s?\b|cu[aá]les\b|qu[eé] (hay|tiene|dice|muestra|aparece)|lista(do)?\s+de|estatus|estado de|sald[oa]s?|pendientes? de pago|cargad[oa]s?|registrad[oa]s?)/.test(t);
+}
+
+// G-LIVE: perfil de comunicación para el agente IA. Viaja como `role` en el payload;
+// el nodo Normalize del workflow n8n lo expone al modelo como contact.role (sin tocar
+// n8n publicado). do_not_pitch => tono ejecutivo: corto, negocio, control/riesgo.
+function buildIa360ClienteActivoBetaRoleHint(contact) {
+  const cf = contact?.custom_fields || {};
+  const beta = cf.ia360_cliente_activo_beta || {};
+  const role = beta.contact_role || cf.project_role || cf.rol_comite || 'cliente activo beta';
+  const noPitchRaw = beta.do_not_pitch != null ? beta.do_not_pitch : cf.do_not_pitch;
+  const noPitch = noPitchRaw === true || noPitchRaw === 1
+    || /^(true|1|s[ií]|yes)$/i.test(String(noPitchRaw || ''))
+    || /cfo|champion|finanzas/i.test(String(role));
+  const parts = [String(role), 'cliente activo en beta supervisada'];
+  if (noPitch) parts.push('do_not_pitch: PROHIBIDO vender, pitchear u ofrecer nuevos servicios');
+  parts.push('estilo ejecutivo: respuesta corta, implicación de negocio, control y riesgo, sin detalle técnico salvo que lo pida');
+  return parts.join(' | ');
+}
+
 function getIa360ContactProfile(contact) {
   const cf = contact?.custom_fields || {};
   const beta = cf.ia360_cliente_activo_beta || {};
@@ -727,7 +758,7 @@ function buildIa360OwnerMemoryReadout({ record, signals, persisted }) {
   return lines.join('\n');
 }
 
-async function handleIa360ClienteActivoBetaLearning({ record, deal, contact }) {
+async function handleIa360ClienteActivoBetaLearning({ record, deal, contact, captureOnly = false }) {
   const memoryBefore = await lookupIa360MemoryContext({ record, contact }).catch(err => {
     console.error('[ia360-memory] lookup before reply:', err.message);
     return { events: [], facts: [] };
@@ -747,6 +778,19 @@ async function handleIa360ClienteActivoBetaLearning({ record, deal, contact }) {
       ia360_cliente_activo_beta_last_reply_kind: 'memory_learning',
     },
   }).catch(e => console.error('[ia360-memory] contact marker:', e.message));
+  if (captureOnly) {
+    // G-LIVE: la captura de memoria NUNCA es respuesta al cliente. El caller (rama
+    // cliente activo/beta de handleIa360FreeText) responde con el agente IA; aquí
+    // solo se aprende en segundo plano.
+    console.log('[ia360-memory] contact=%s mode=%s events=%d facts=%d stage=%s egress=capture_only',
+      maskIa360Number(record.contact_number),
+      deal?.memory_mode || 'cliente_activo_beta',
+      persisted.filter(x => x.eventId).length,
+      persisted.filter(x => x.factId).length,
+      deal?.stage_name || '-'
+    );
+    return false;
+  }
   const reply = buildIa360ClienteActivoBetaReply({ signals, memoryContext: memoryAfter });
   const ownerReadout = buildIa360OwnerMemoryReadout({ record, signals, persisted });
   if (!IA360_MEMORY_EGRESS_ON) {
@@ -2322,7 +2366,7 @@ async function shadowIa360ContactIntelligence({ record, stageName, history }) {
   }
 }
 
-async function callIa360Agent({ record, stageName }) {
+async function callIa360Agent({ record, stageName, roleHint = null }) {
   // Recent conversation for context (last 8 messages).
   const { rows: hist } = await pool.query(
     `SELECT direction AS dir, message_body AS body
@@ -2367,6 +2411,9 @@ async function callIa360Agent({ record, stageName }) {
           source: 'forgechat-ia360-webhook',
         }),
         memory: agentMemory,
+        // G-LIVE: el Normalize del workflow mapea `role` a contact.role dentro del
+        // agent_input — perfil de comunicación visible para el modelo sin tocar n8n.
+        ...(roleHint ? { role: roleHint } : {}),
       }),
       signal: ia360AgentController.signal,
     });
@@ -4580,6 +4627,14 @@ async function handleIa360SharedContacts(record) {
         body: 'Recibí una tarjeta de contacto, pero no pude extraer un número de WhatsApp. Revísala manualmente.',
         ownerBudget: true,
       });
+      // G-LIVE: el remitente tampoco debe quedar mudo cuando la tarjeta no se pudo leer.
+      if (!isIa360OwnerNumber(record.contact_number)) {
+        await enqueueIa360Text({
+          record,
+          label: 'ia360_vcard_ack',
+          body: 'Recibí la tarjeta, pero no pude leer bien el número. Se la paso a Alek para revisarla y te confirmo por aquí.',
+        }).catch(e => console.error('[ia360-vcard] parse-fail ack error:', e.message));
+      }
       return true;
     }
 
@@ -4612,6 +4667,15 @@ async function handleIa360SharedContacts(record) {
         },
       }).catch(e => console.error('[ia360-vcard] crm reflect:', e.message));
       await notifyOwnerVcardCaptured({ record, shared });
+    }
+    // G-LIVE (auditoría 06-11): un CONTACTO (no owner) que comparte una tarjeta
+    // merece acuse — antes solo se notificaba al owner y el remitente quedaba mudo.
+    if (!isIa360OwnerNumber(record.contact_number)) {
+      await enqueueIa360Text({
+        record,
+        label: 'ia360_vcard_ack',
+        body: 'Recibí la tarjeta, gracias. La registro y le digo a Alek; cualquier siguiente paso te lo confirmo por aquí.',
+      }).catch(e => console.error('[ia360-vcard] contact ack error:', e.message));
     }
     return true;
   } catch (err) {
@@ -5523,6 +5587,125 @@ async function handleIa360BotFailure({ record, reason, alreadyResponded = false 
   return failureId;
 }
 
+// ── G-LIVE: invariante estructural no-silencio (watchdog por inbound) ────────────
+// La clase del incidente Andrés (38 min mudo): una rama "marca como manejado" sin
+// egress real. La verdad no es ningún flag en memoria: es la fila outgoing en
+// chat_history (insertPendingRow la escribe al encolar, así que es visible de
+// inmediato). 75 s después del inbound de un cliente activo/beta (o con deal
+// ganado), si no existe NINGÚN outgoing hacia ese contacto desde el inbound =>
+// holding + alerta al owner + failure registrado. Cubre toda rama presente o
+// futura (texto, botones, audio, vCard) sin parchar rama por rama. El dedupe de
+// resolveIa360Outbound (ia360_handler_for = message_id) lo hace idempotente.
+const IA360_NO_SILENCE_WATCHDOG_MS = 75000;
+
+async function ia360HasOutgoingForInbound(record) {
+  // Escape de comodines LIKE: los wamid del harness pueden traer '_' o '%'.
+  const wamidLike = String(record.message_id || '~none~').replace(/[\\%_]/g, '\\$&');
+  const { rows } = await pool.query(
+    `SELECT 1
+       FROM coexistence.chat_history o
+      WHERE o.direction = 'outgoing'
+        AND o.contact_number = $1
+        AND COALESCE(o.status, '') NOT IN ('failed', 'error')
+        AND (o.template_meta->>'ia360_handler_for' LIKE $2 || '%'
+             OR o.timestamp >= (SELECT i.timestamp FROM coexistence.chat_history i
+                                 WHERE i.message_id = $3 LIMIT 1))
+      LIMIT 1`,
+    [record.contact_number, wamidLike, record.message_id || '~none~']
+  );
+  return rows.length > 0;
+}
+
+async function ia360IsWatchedActiveContact(record) {
+  const contact = await loadIa360ContactContext(record).catch(() => null);
+  if (isIa360ClienteActivoBetaContact(contact)) return true;
+  // Cliente con deal GANADO sin marca beta en contacts: también es cliente real
+  // activo que jamás debe quedar en silencio (hallazgo alta de la auditoría 06-11).
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM coexistence.deals d
+         JOIN coexistence.pipeline_stages s ON s.id = d.stage_id
+        WHERE d.contact_wa_number = $1 AND d.contact_number = $2
+          AND (s.stage_type = 'won' OR s.name = 'Ganado')
+        LIMIT 1`,
+      [record.wa_number, record.contact_number]
+    );
+    return rows.length > 0;
+  } catch (e) {
+    console.error('[ia360-no-silence] won-deal check error:', e.message);
+    return false;
+  }
+}
+
+async function ia360NoSilenceWatchdogCheck(record) {
+  if (!(await ia360IsWatchedActiveContact(record))) return;
+  if (await ia360HasOutgoingForInbound(record)) return;
+  console.error('[ia360-no-silence] INVARIANTE DISPARADO contact=%s message=%s type=%s',
+    maskIa360Number(record.contact_number), record.message_id, record.message_type);
+  await handleIa360BotFailure({
+    record,
+    reason: `invariante no-silencio: sin fila outgoing en chat_history ${Math.round(IA360_NO_SILENCE_WATCHDOG_MS / 1000)}s después del inbound de cliente activo/beta`,
+    alreadyResponded: false,
+  });
+}
+
+function scheduleIa360NoSilenceWatchdog(record) {
+  try {
+    if (!record || record.direction !== 'incoming') return;
+    if (record.message_type === 'status' || record.message_type === 'reaction' || record.message_type === 'sticker') return;
+    if (!record.message_id) return; // sin wamid no hay forma confiable de verificar el egress
+    const n = normalizePhone(record.contact_number);
+    if (!n || n === IA360_OWNER_NUMBER) return;
+    // Texto pasivo ("gracias", "ok") no exige respuesta (diseño deliberado Gap#1).
+    if (record.message_type === 'text' && isIa360PassiveMessage(record.message_body)) return;
+    // Subset del record: no retener raw_payload (batches n8n) en memoria 75 s.
+    const slim = {
+      wa_number: record.wa_number,
+      contact_number: record.contact_number,
+      contact_name: record.contact_name || null,
+      message_id: record.message_id,
+      message_type: record.message_type,
+      message_body: record.message_body || null,
+      direction: record.direction,
+    };
+    const t = setTimeout(() => {
+      ia360NoSilenceWatchdogCheck(slim).catch(e =>
+        console.error('[ia360-no-silence] watchdog error:', e.message));
+    }, IA360_NO_SILENCE_WATCHDOG_MS);
+    if (typeof t.unref === 'function') t.unref();
+  } catch (e) {
+    console.error('[ia360-no-silence] schedule error:', e.message);
+  }
+}
+
+// G-LIVE: un deploy/restart dentro de la ventana del watchdog perdería los timers en
+// memoria — y el deploy es justo el momento de mayor riesgo de egress roto. Al boot,
+// re-escanear los inbounds recientes (15 min) de no-owner y re-correr el check.
+const ia360BootRescanTimer = setTimeout(async () => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT message_id, wa_number, contact_number, message_type, message_body
+         FROM coexistence.chat_history
+        WHERE direction = 'incoming'
+          AND message_type NOT IN ('status', 'reaction', 'sticker')
+          AND timestamp > NOW() - INTERVAL '15 minutes'`
+    );
+    let checked = 0;
+    for (const r of rows) {
+      if (!r.message_id) continue;
+      if (normalizePhone(r.contact_number) === IA360_OWNER_NUMBER) continue;
+      if (r.message_type === 'text' && isIa360PassiveMessage(r.message_body)) continue;
+      checked += 1;
+      await ia360NoSilenceWatchdogCheck({ ...r, direction: 'incoming' })
+        .catch(e => console.error('[ia360-no-silence] boot rescan check:', e.message));
+    }
+    if (checked) console.log('[ia360-no-silence] boot rescan: %d inbound(s) recientes revisados', checked);
+  } catch (e) {
+    console.error('[ia360-no-silence] boot rescan error:', e.message);
+  }
+}, 90000);
+if (typeof ia360BootRescanTimer.unref === 'function') ia360BootRescanTimer.unref();
+
 async function handleIa360FreeText(record) {
   // PRODUCTION-HARDENING (fallback universal — cero silencio): estos dos flags viven a
   // nivel de FUNCION (no del try) para que el catch terminal pueda verlos.
@@ -5541,17 +5724,70 @@ async function handleIa360FreeText(record) {
     dealFound = true;
     const contactContext = deal.contact_context || await loadIa360ContactContext(record).catch(() => null);
     if (deal.memory_mode === 'cliente_activo_beta_supervisado' || isIa360ClienteActivoBetaContact(contactContext)) {
-      const handled = await handleIa360ClienteActivoBetaLearning({ record, deal, contact: contactContext });
-      if (handled) {
-        responded = true;
+      // G-LIVE (P0 producción): cliente activo/beta SIEMPRE recibe respuesta real.
+      // 1) Captura de memoria: aprendizaje en segundo plano REAL (fire-and-forget,
+      //    no suma latencia al camino caliente) y NUNCA cuenta como respuesta (la
+      //    clase del bug de Andrés: dry-run devolvía true y el padre creía que ya
+      //    había respondido).
+      handleIa360ClienteActivoBetaLearning({ record, deal, contact: contactContext, captureOnly: true })
+        .catch(e => console.error('[ia360-memory] capture error:', e.message));
+
+      // 2) Datos vivos del portal del cliente: WhatsApp no tiene acceso => handoff
+      //    explícito y honesto. NUNCA inventar listas ni cifras.
+      if (isIa360PortalLiveDataQuestion(record.message_body)) {
+        const sentHandoff = await enqueueIa360Text({
+          record,
+          label: 'ia360_cliente_activo_portal_handoff',
+          body: 'Ese dato vive en el portal y prefiero confirmarte la cifra exacta antes que darte una aproximación. Lo reviso con Alek y te confirmo por aquí en breve.',
+        });
+        if (sentHandoff) responded = true;
+        await handleIa360BotFailure({
+          record,
+          reason: 'handoff: pregunta de datos vivos del portal del cliente (sin acceso desde WhatsApp)',
+          alreadyResponded: sentHandoff === true,
+        }).catch(e => console.error('[ia360-failure] portal handoff alert error:', e.message));
         return;
       }
-      // Cliente activo/beta con pregunta sustantiva pero sin señales suficientes para
-      // contestar desde memoria: nunca inventar ni dejar en silencio. Enviar holding
-      // claro al contacto y alertar a Alek para investigar el proyecto/fuente canónica.
+
+      // 3) Respuesta REAL del agente IA (memoria incluida vía memory-lookup del
+      //    workflow). UNA sola respuesta; prohibidas cadenas de "corrijo".
+      //    [qa-force-agent-down] simula agente caído SOLO para números QA (E2E).
+      const qaForceDown = IA360_QA_NUMBER_RE.test(String(record.contact_number || ''))
+        && /\[qa-force-agent-down\]/i.test(String(record.message_body || ''));
+      const agentBeta = qaForceDown
+        ? null
+        : await callIa360Agent({
+            record,
+            stageName: deal.stage_name,
+            roleHint: buildIa360ClienteActivoBetaRoleHint(contactContext),
+          });
+      const betaReply = agentBeta && typeof agentBeta.reply === 'string' ? agentBeta.reply.trim() : '';
+      if (betaReply) {
+        const sentBeta = await enqueueIa360Text({ record, label: 'ia360_cliente_activo_beta_agent_reply', body: betaReply });
+        if (sentBeta) {
+          // Gestión de citas detectada por el agente: la acción de calendario del
+          // embudo no aplica al pseudo-deal beta, así que el loop lo cierra Alek.
+          const betaAction = String(agentBeta.action || agentBeta.intent || '');
+          if (['list_bookings', 'cancel', 'reschedule', 'offer_slots', 'book'].includes(betaAction)) {
+            sendIa360DirectText({
+              record,
+              toNumber: IA360_OWNER_NUMBER,
+              label: 'owner_beta_meeting_intent',
+              body: `IA360: el cliente activo/beta ${record.contact_name || record.contact_number} pidió gestión de cita (${betaAction}): "${String(record.message_body || '').slice(0, 140)}". Ya le respondí, pero la acción de calendario requiere tu confirmación.`,
+              targetContact: record.contact_number,
+              ownerBudget: true,
+            }).catch(e => console.error('[ia360-agent] beta meeting alert error:', e.message));
+          }
+          responded = true;
+          return;
+        }
+      }
+
+      // 4) Holding SOLO si el agente falló o no devolvió respuesta utilizable:
+      //    holding al contacto + alerta al owner + failure registrado.
       await handleIa360BotFailure({
         record,
-        reason: 'cliente activo/beta sin contexto suficiente en memoria para responder sin alucinar',
+        reason: 'cliente activo/beta: agente IA sin respuesta utilizable (caído, timeout o reply vacío)',
         alreadyResponded: false,
       }).catch(e => console.error('[ia360-failure] cliente-activo fallback error:', e.message));
       responded = true;
@@ -7109,6 +7345,19 @@ async function handleIa360LiteInteractive(record) {
       });
     } catch (e) {
       console.error('[ia360-calendar] slot confirm prompt error:', e.message);
+      // G-LIVE (auditoría 06-11): el prospecto ELIGIÓ hora; si el prompt de
+      // confirmación falla, no puede quedar mudo en el paso más caliente del
+      // booking — y Alek debe enterarse para cerrar la cita manualmente.
+      await enqueueIa360Text({
+        record,
+        label: 'ia360_lite_slot_confirm_fallback',
+        body: 'Vi que elegiste un horario. Déjame confirmarlo con Calendar y te escribo en un momento para cerrarlo.',
+      }).catch(() => {});
+      await handleIa360BotFailure({
+        record,
+        reason: 'booking: falló el prompt de confirmación de horario (' + String(e.message || '').slice(0, 80) + ')',
+        alreadyResponded: true,
+      }).catch(err2 => console.error('[ia360-failure] slot confirm alert error:', err2.message));
     }
     return;
   }
@@ -7565,7 +7814,17 @@ function ia360BrainV2CanaryEligible(record) {
   if (!IA360_BRAIN_V2_CANARY_ON) return false;
   if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return false;
   if (!String(record.message_body || '').trim()) return false;
-  return IA360_BRAIN_V2_ALLOWLIST.has(normalizePhone(record.contact_number));
+  if (!IA360_BRAIN_V2_ALLOWLIST.has(normalizePhone(record.contact_number))) return false;
+  // G-LIVE (auditoría 06-11): el canary es un arnés del OWNER — todo su egress va
+  // hard-coded al owner. Un contacto real allowlisted por error quedaría 100% mudo
+  // (el route hace continue y el monolito nunca ve el mensaje). El invariante
+  // owner-only vive en código, no solo en el .env: un no-owner cae al monolito.
+  if (normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
+    console.error('[brain-v2-canary] allowlist contiene un no-owner %s — cayendo al monolito',
+      maskIa360Number(record.contact_number));
+    return false;
+  }
+  return true;
 }
 
 async function callBrainV2({ contactWaNumber, message, forceActor }) {
@@ -7631,6 +7890,24 @@ async function handleBrainV2Canary(record) {
   console.log('[brain-v2-canary] sin reply (branch=%s)', branch);
 }
 
+// G-LIVE QA-GUARD (incidente José Ramón): detecta payloads SINTÉTICOS del harness
+// QA/E2E por su wamid (wamid.e2e.*, wamid.qa-harness.*, e2e.*, *harness*). Los wamid
+// reales de Meta son 'wamid.' + base64 (sin más puntos), así que nunca matchean.
+function isIa360SyntheticWamid(messageId) {
+  // Solo el patrón con puntos: el cuerpo base64 de un wamid real no contiene puntos,
+  // así que el falso positivo (descartar un mensaje real) es estructuralmente imposible.
+  return /(^|\.)(e2e|qa[-_a-z0-9]*|harness)\./i.test(String(messageId || ''));
+}
+
+// Un payload sintético SOLO puede procesarse para números QA (52199900*) o el owner.
+// Cualquier otro destino (contactos reales) se descarta completo: sin insert en
+// chat_history, sin handlers, sin egress derivado.
+function isIa360BlockedSyntheticInbound(record) {
+  if (!record || !isIa360SyntheticWamid(record.message_id)) return false;
+  const n = String(record.contact_number || '');
+  return !(IA360_QA_NUMBER_RE.test(n) || n === IA360_OWNER_NUMBER);
+}
+
 router.post('/webhook/whatsapp', async (req, res) => {
   try {
     // Authenticity: this endpoint is necessarily unauthenticated (public), so
@@ -7656,6 +7933,22 @@ router.post('/webhook/whatsapp', async (req, res) => {
     for (const p of payloads) {
       const records = parseMetaPayload(p);
       allRecords.push(...records);
+    }
+
+    // G-LIVE QA-GUARD: descartar payloads sintéticos dirigidos a números reales
+    // ANTES de insertar o despachar nada (cierra el incidente José Ramón).
+    let blockedSynthetic = 0;
+    for (let i = allRecords.length - 1; i >= 0; i--) {
+      if (isIa360BlockedSyntheticInbound(allRecords[i])) {
+        const r = allRecords[i];
+        console.warn('[qa-guard] payload sintético bloqueado: wamid=%s contact=%s type=%s',
+          r.message_id, maskIa360Number(r.contact_number), r.message_type);
+        allRecords.splice(i, 1);
+        blockedSynthetic += 1;
+      }
+    }
+    if (blockedSynthetic > 0 && allRecords.length === 0) {
+      return res.status(200).json({ ok: true, stored: 0, blocked_synthetic: blockedSynthetic });
     }
 
     if (allRecords.length === 0) {
@@ -7757,6 +8050,9 @@ router.post('/webhook/whatsapp', async (req, res) => {
     if (incomingRecords.length > 0) {
       for (const record of incomingRecords) {
         try {
+          // G-LIVE: invariante no-silencio. Se programa ANTES de cualquier handler
+          // para que cubra continues, throws y ramas fire-and-forget por igual.
+          scheduleIa360NoSilenceWatchdog(record);
           // ── BANDEJA DE IDEAS: comando del owner "idea: <texto>" ─────
           // Va ANTES del canary Brain v2 (el owner está en la allowlist y el
           // canary haría continue). Captura, persiste y manda tarjeta de ruteo.
@@ -7879,6 +8175,22 @@ router.post('/webhook/whatsapp', async (req, res) => {
           await evaluateTriggers(record);
         } catch (triggerErr) {
           console.error('[webhook] Trigger evaluation error:', triggerErr.message);
+          // G-LIVE (auditoría 06-11): un throw en el dispatch no debe dejar mudo al
+          // contacto. Verificamos la VERDAD en chat_history (no flags) antes del
+          // fallback; ante error del check, no doble-texteamos.
+          if (record.direction === 'incoming'
+              && ['text', 'interactive', 'button'].includes(record.message_type)
+              && normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER
+              && !(record.message_type === 'text' && isIa360PassiveMessage(record.message_body))) {
+            const hasOut = await ia360HasOutgoingForInbound(record).catch(() => true);
+            if (!hasOut) {
+              await handleIa360BotFailure({
+                record,
+                reason: 'error en dispatch: ' + String(triggerErr.message || 'desconocido').slice(0, 120),
+                alreadyResponded: false,
+              }).catch(e => console.error('[ia360-failure] dispatch fallback error:', e.message));
+            }
+          }
         }
       }
     }
@@ -7904,7 +8216,11 @@ router.post('/webhook/whatsapp', async (req, res) => {
     }
 
     console.log(`[webhook] Stored ${allRecords.length} record(s)`);
-    res.status(200).json({ ok: true, stored: allRecords.length });
+    res.status(200).json({
+      ok: true,
+      stored: allRecords.length,
+      ...(blockedSynthetic > 0 ? { blocked_synthetic: blockedSynthetic } : {}),
+    });
   } catch (err) {
     console.error('[webhook] Error:', err.message);
     // Always return 200 to n8n so it doesn't retry infinitely. Use a static
