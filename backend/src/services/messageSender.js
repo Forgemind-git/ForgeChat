@@ -44,15 +44,32 @@ async function resolveAccount({ accountId, fromPhoneNumber }) {
 /**
  * Insert an optimistic chat_history row that the UI shows as "sending…".
  * Returns the local message_id used so caller can correlate later updates.
+ *
+ * G-BRAIN dedupe atómico: el índice único parcial
+ * chat_history_ia360_handler_dedupe (contact_number, template_meta->>'ia360_handler_for')
+ * convierte el dedupe IA360 en una garantía de base de datos. Si otra ruta ya
+ * insertó una respuesta para el mismo handler, este INSERT no inserta nada
+ * (ON CONFLICT DO NOTHING) y se devuelve null — el caller NO debe encolar.
+ * Las filas sin ia360_handler_for (broadcasts, automation, chat manual) quedan
+ * fuera del índice parcial y conservan el comportamiento de siempre.
+ *
+ * `db` acepta un client de pg para participar en una transacción del caller
+ * (candado anti-doble-ruta del webhook IA360); default: el pool global.
+ * `status` permite filas sandbox ('qa_sandboxed': fila visible y correlacionable
+ * para los harness E2E, pero JAMÁS encolada hacia Meta); default: 'sending'.
  */
-async function insertPendingRow({ account, toNumber, messageType, messageBody, mediaUrl = null, mediaMime = null, templateMeta = null, contextMessageId = null, rawPayloadExtra = null }) {
+async function insertPendingRow({ account, toNumber, messageType, messageBody, mediaUrl = null, mediaMime = null, templateMeta = null, contextMessageId = null, rawPayloadExtra = null, db = pool, status = 'sending' }) {
   const messageId = localMessageId();
-  await pool.query(
+  const res = await db.query(
     `INSERT INTO coexistence.chat_history
        (message_id, phone_number_id, wa_number, contact_number, to_number,
         direction, message_type, message_body, raw_payload,
         media_url, media_mime_type, status, timestamp, template_meta, context_message_id)
-     VALUES ($1,$2,$3,$4,$5,'outgoing',$6,$7,$8,$9,$10,'sending',NOW(),$11,$12)`,
+     VALUES ($1,$2,$3,$4,$5,'outgoing',$6,$7,$8,$9,$10,$13,NOW(),$11,$12)
+     ON CONFLICT (contact_number, (template_meta->>'ia360_handler_for'))
+       WHERE direction = 'outgoing' AND (template_meta->>'ia360_handler_for') IS NOT NULL
+     DO NOTHING
+     RETURNING message_id`,
     [
       messageId,
       account.phoneNumberId,
@@ -66,8 +83,14 @@ async function insertPendingRow({ account, toNumber, messageType, messageBody, m
       mediaMime,
       templateMeta ? JSON.stringify(templateMeta) : null,
       contextMessageId || null,
+      status,
     ]
   );
+  if (res.rowCount === 0) {
+    console.log('[messageSender] dedupe ON CONFLICT: fila no insertada (handler ya respondido) to=%s handler=%s',
+      String(toNumber).replace(/\D/g, ''), templateMeta?.ia360_handler_for || '-');
+    return null;
+  }
   return messageId;
 }
 

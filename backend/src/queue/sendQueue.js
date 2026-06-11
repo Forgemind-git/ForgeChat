@@ -77,6 +77,21 @@ async function processJob(job) {
     }
   }
 
+  // G-BRAIN sandbox QA: los números 52199900XXXXX son ficticios (harness E2E).
+  // Enviarlos por el WABA real es riesgo de calidad ante Meta (decenas de envíos
+  // a números inexistentes). Tras pasar la validación de template (fidelidad del
+  // test), se corta AQUÍ — el único choke point de egress — sin llamar a Meta: la
+  // fila optimista se marca 'sent' con un wamid sintético, así los harness que
+  // esperan status='sent' siguen en verde con cero egress real.
+  // OJO (hallazgo de review): el patrón DEBE ser el rango QA exacto. 999 es la
+  // lada de Mérida — un patrón ancho tipo ^521999 dejaría mudo a un cliente real.
+  if (/^52199900\d{5}$/.test(String(to || ''))) {
+    const sandboxWamid = `wamid.qa-sandbox.${Date.now()}.${job.id || '0'}`;
+    if (localMessageId) await markSent(localMessageId, sandboxWamid);
+    console.log('[sendQueue] QA sandbox: egress a Meta OMITIDO kind=%s to=%s wamid=%s', kind, to, sandboxWamid);
+    return { wamid: sandboxWamid, qaSandbox: true };
+  }
+
   let result;
   try {
     if (kind === 'text') {

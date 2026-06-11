@@ -100,8 +100,12 @@ chk_nonempty "SIM2 holding al contacto" "$H2"
 F2=$(psql_q "SELECT id||' | '||status||' | '||reason FROM coexistence.ia360_bot_failures WHERE contact_number='$QA' AND reason LIKE 'cliente activo/beta: agente IA%' ORDER BY id DESC LIMIT 1")
 chk_nonempty "SIM2 failure registrado" "$F2"
 echo "  failure: $F2"
-A2=$(psql_q "SELECT LEFT(message_body,100) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_bot_failure' AND message_body LIKE '%$QA%' ORDER BY id DESC LIMIT 1")
-chk_nonempty "SIM2 alerta al owner" "$A2"
+# G-BRAIN sandbox QA: la alerta de un contacto 521999* ya NO egresa al WhatsApp
+# real del owner — queda como evidencia verificable en ia360_qa_evidence.
+A2=$(psql_q "SELECT LEFT(message_body,100) FROM coexistence.ia360_qa_evidence WHERE kind='owner_bot_failure_suppressed' AND contact_number='$QA' ORDER BY id DESC LIMIT 1")
+chk_nonempty "SIM2 alerta al owner suprimida con evidencia (sandbox QA)" "$A2"
+A2REAL=$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='owner_bot_failure' AND message_body LIKE '%$QA%' AND created_at > NOW() - INTERVAL '10 minutes'")
+chk "SIM2 cero tarjetas QA al owner real" "$A2REAL" "0"
 
 echo "=== SIM 3 — guard del inyector: sintético a número real → bloqueado ==="
 W3="wamid.e2e.glive.guard.$(ts).$RANDOM"

@@ -33,6 +33,7 @@ chk_not_has(){ if echo "$2" | grep -qF "$3"; then bad "$1" "$2" "NO contiene:$3"
 chk_any(){ # $1=nombre $2=valor $3=patron grep -E (alternativas)
   if echo "$2" | grep -qE "$3"; then ok "$1"; else bad "$1" "$2" "matchea:$3"; fi
 }
+chk_nonempty(){ if [ -n "$2" ]; then ok "$1"; else bad "$1" "(vacío)" "no-vacío"; fi; }
 
 psql_q(){ docker exec "$DB" psql -U postgres -d postgres -tAc "$1"; }
 
@@ -47,11 +48,13 @@ post_webhook(){
 ts(){ date +%s; }
 WAMID_BASE="wamid.e2e.gcold.$(ts)"
 
+# G-BRAIN: filtro temporal (15 min) — sin él, un label de una corrida anterior
+# produce falsos PASS (p.ej. un owner_approve_send_blocked viejo).
 owner_msg_id_by_label(){ # $1=label → message_id de la última saliente al owner con ese label
-  psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='$1' ORDER BY id DESC LIMIT 1"
+  psql_q "SELECT message_id FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='$1' AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY id DESC LIMIT 1"
 }
 owner_body_by_label(){
-  psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='$1' ORDER BY id DESC LIMIT 1"
+  psql_q "SELECT message_body FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$OWNER' AND template_meta->>'label'='$1' AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY id DESC LIMIT 1"
 }
 
 # G-COLD: espera con polling a que aparezca la saliente al owner con ese label.
@@ -170,6 +173,18 @@ echo ""
 echo "=== SIM D — aliado (5219990077704): template EN REVISIÓN bloquea de punta a punta ==="
 NUMD="5219990077704"
 
+# G-BRAIN fixture: ia360_aliado_criterios_fit ya está APPROVED en Meta. Para
+# conservar la cobertura del caso "template en revisión", el SIM D lo simula
+# mutando el cache local de status y lo RESTAURA SIEMPRE al salir (trap EXIT).
+# OJO: el check constraint solo admite DRAFT/SUBMITTED/APPROVED/REJECTED/PAUSED/
+# DISABLED — se usa SUBMITTED, que ia360ColdAvailability trata como "en revisión".
+restore_criterios_fit(){
+  psql_q "UPDATE coexistence.message_templates SET status='APPROVED' WHERE name='ia360_aliado_criterios_fit'" >/dev/null
+}
+trap restore_criterios_fit EXIT
+psql_q "UPDATE coexistence.message_templates SET status='SUBMITTED' WHERE name='ia360_aliado_criterios_fit'" >/dev/null
+chk "fixture: criterios_fit simulado en revisión" "$(psql_q "SELECT status FROM coexistence.message_templates WHERE name='ia360_aliado_criterios_fit'")" "SUBMITTED"
+
 echo "--- STEP 0 — limpieza estado QA $NUMD ---"
 clean_qa_number "$NUMD"
 ok "estado limpio ($NUMD)"
@@ -213,6 +228,10 @@ chk_has "cinturón avisa template no aprobado" "$BLOCKED" "aún no está aprobad
 TCOUNT=$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$NUMD' AND message_type='template'")
 chk "cero templates salientes al QA" "$TCOUNT" "0"
 
+# G-BRAIN: restaurar el status real (APPROVED) ya, sin esperar al EXIT.
+restore_criterios_fit
+chk "fixture: criterios_fit restaurado a APPROVED" "$(psql_q "SELECT status FROM coexistence.message_templates WHERE name='ia360_aliado_criterios_fit'")" "APPROVED"
+
 # ============================================================================
 sleep 61  # G-COLD: ventana nueva del presupuesto owner (6 msg/60s)
 echo ""
@@ -247,7 +266,15 @@ JR_SEL=$(wait_owner_msg "owner_sequence_selector_${JR}_persona_aliado" 90)
 echo "--- STEP 3 — la tarjeta simulada (ranking persistido completo) ---"
 psql_q "SELECT jsonb_pretty(custom_fields->'ia360_selector_ranking') FROM coexistence.contacts WHERE wa_number='$WA' AND contact_number='$JR'"
 JR_DESC=$(psql_q "SELECT r->>'description' FROM coexistence.contacts c, jsonb_array_elements(c.custom_fields->'ia360_selector_ranking'->'rows') r WHERE c.wa_number='$WA' AND c.contact_number='$JR' AND r->>'title'='Criterios de fit' LIMIT 1")
-chk_any "row Criterios de fit con marca de disponibilidad" "$JR_DESC" "template|✓"
+# G-BRAIN: la marca de disponibilidad SOLO existe en modo frío (fuera de ventana
+# de 24 h). Si JR tiene conversación viva (escribió hace <24 h), el selector va
+# en modo caliente y el row sin marca es el comportamiento CORRECTO.
+JR_OUTW=$(psql_q "SELECT custom_fields->'ia360_selector_ranking'->'cold'->>'outside_window' FROM coexistence.contacts WHERE wa_number='$WA' AND contact_number='$JR'")
+if [ "$JR_OUTW" = "true" ]; then
+  chk_any "row Criterios de fit con marca de disponibilidad (modo frío)" "$JR_DESC" "template|✓"
+else
+  chk_nonempty "row Criterios de fit presente (modo caliente, sin marca: ventana abierta)" "$JR_DESC"
+fi
 
 echo "--- STEP 4 — CERO egress a JR durante la simulación ---"
 JR_EGRESS=$(psql_q "SELECT count(*) FROM coexistence.chat_history WHERE direction='outgoing' AND contact_number='$JR' AND created_at > now() - interval '10 minutes'")
