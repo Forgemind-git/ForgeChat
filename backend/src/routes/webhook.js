@@ -1366,6 +1366,359 @@ async function handleRevenueOsFreeText(record) {
   }
 }
 
+// ============================================================================
+// G-WIN — Quick-win "Mapa de cartera" (Pipeline 7 "Champions — Adopción y
+// expansión", persona cliente activo / CFO). Patrón Revenue OS P5: máquina de
+// estados en contacts.custom_fields.ia360_cartera_state ('' → esperando_tabla
+// → mapa_entregado), handlers gateados que CORTAN el embudo, egress único vía
+// enqueueIa360Text / sendIa360DirectText → sendQueue.
+//   PASO 1 (texto cartera/saldos que no cuadran) → Hallazgo / Impacto / Dato
+//          faltante (pide la tabla EN TEXTO; el bot no lee imágenes) /
+//          Siguiente acción. SIN pitch y SIN agenda.
+//   PASO 2 (tabla pegada en texto) → mapa estructurado al contacto + nota
+//          completa en su deal P7 + cola ia360_docs_sync + readout al owner +
+//          deal a "Quick win entregado" (solo hacia adelante).
+// GUARDRAIL: nunca agenda automática, no nutrición, no insistencia; si el
+// mensaje no es de cartera, el flujo NO se activa y el agente genérico sigue.
+// ============================================================================
+const CHAMPIONS_PIPELINE_NAME = 'Champions — Adopción y expansión';
+const CARTERA_STAGE_VALIDACION = 'Validación en curso';
+const CARTERA_STAGE_QUICKWIN = 'Quick win entregado';
+const CARTERA_FORMATO_TABLA = 'Cliente | Saldo en portal | Saldo correcto | Fecha de corte | Responsable';
+
+const IA360_CARTERA_COPY = {
+  paso1: [
+    'Gracias por el aviso. Lo dejo ordenado:',
+    '',
+    '*Hallazgo:* los saldos que muestra el portal no cuadran con los saldos reales de cartera; hoy la corrección depende de revisiones manuales y la diferencia no se ve en un solo lugar.',
+    '',
+    '*Impacto:* mientras el portal muestre saldos incorrectos, cobranza trabaja con cifras que el cliente puede rebatir y el seguimiento pierde confiabilidad.',
+    '',
+    '*Dato faltante:* mándame la tabla aquí mismo, en texto, una línea por cuenta con este formato:',
+    CARTERA_FORMATO_TABLA,
+    'Importante: no puedo leer imágenes ni archivos adjuntos; si la tienes en foto o en Excel, pégamela como texto.',
+    '',
+    '*Siguiente acción:* en cuanto la reciba, la convierto en tu mapa de cartera (cuenta → saldo portal → saldo correcto → fecha de corte → responsable → siguiente acción) y lo dejo registrado para Alek.',
+  ].join('\n'),
+  pideTexto: [
+    'Recibí tu archivo, pero no puedo leer imágenes ni documentos adjuntos.',
+    '¿Me pegas la tabla aquí mismo en texto? Una línea por cuenta:',
+    CARTERA_FORMATO_TABLA,
+  ].join('\n'),
+  recordatorioFormato: [
+    'Va, sigo pendiente de la tabla para armar el mapa. Pégala aquí en texto, una línea por cuenta:',
+    CARTERA_FORMATO_TABLA,
+  ].join('\n'),
+};
+
+// Persona cliente activo / CFO: reúsa el helper beta (Andrés) y el perfil
+// persona-first (QA y contactos nuevos). El owner JAMÁS entra a este flujo.
+function ia360IsClienteActivoCartera(contact) {
+  if (!contact) return false;
+  if (isIa360ClienteActivoBetaContact(contact)) return true;
+  const cf = contact.custom_fields || {};
+  const rel = cf?.ia360_persona_first?.classification?.relationship_context || '';
+  const personaCtx = String(cf.persona_context || '').toLowerCase();
+  const tags = Array.isArray(contact.tags) ? contact.tags.map(t => String(t || '').toLowerCase()) : [];
+  return rel === 'cliente_activo'
+    || personaCtx === 'cliente activo'
+    || tags.includes('persona:cliente_activo');
+}
+
+// Disparador del PASO 1: cartera/cobranza explícita, o "saldos" acompañado de
+// señal de descuadre. Mantenerlo angosto: un tema no-cartera NO debe activar
+// el flujo (gate del goal).
+const IA360_CARTERA_TRIGGER_RE = /\b(cartera|cobranza|cuentas?\s+por\s+cobrar)\b/i;
+const IA360_CARTERA_SALDOS_RE = /\bsaldos?\b/i;
+const IA360_CARTERA_DESCUADRE_RE = /no\s+cuadra|descuadr|incorrect|equivocad|diferenc|portal|\bmal\b/i;
+
+function ia360EsMensajeCartera(body) {
+  const t = String(body || '');
+  return IA360_CARTERA_TRIGGER_RE.test(t)
+    || (IA360_CARTERA_SALDOS_RE.test(t) && IA360_CARTERA_DESCUADRE_RE.test(t));
+}
+
+// Parser de la tabla pegada en texto. Separadores: | ; tab. Coma solo si la
+// línea no trae montos con coma de millares ("1,250,000"). Salta encabezados.
+function parseCarteraTabla(text) {
+  const rows = [];
+  const lines = String(text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    let parts = null;
+    if (/[|;\t]/.test(line)) parts = line.split(/[|;\t]/);
+    else if (line.includes(',') && !/\d,\d{3}/.test(line)) parts = line.split(',');
+    if (!parts) continue;
+    parts = parts.map(p => p.trim()).filter(p => p !== '');
+    if (parts.length < 4) continue;
+    const low = line.toLowerCase();
+    if (/cliente|cuenta/.test(low) && /saldo/.test(low)) continue; // encabezado
+    rows.push({
+      cuenta: parts[0],
+      saldo_portal: parts[1],
+      saldo_correcto: parts[2],
+      fecha_corte: parts[3],
+      responsable: parts[4] || 'por confirmar',
+    });
+  }
+  return rows;
+}
+
+function carteraMonto(s) {
+  const limpio = String(s || '').replace(/[^0-9.\-]/g, '');
+  if (!limpio || limpio === '-' || limpio === '.') return null;
+  const n = Number(limpio);
+  return Number.isFinite(n) ? n : null;
+}
+
+function carteraFormatoMonto(n) {
+  if (n === null || !Number.isFinite(n)) return null;
+  const negativo = n < 0;
+  const [ent, dec] = Math.abs(n).toFixed(2).split('.');
+  return `${negativo ? '-' : ''}$${ent.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${dec}`;
+}
+
+// Mapa estructurado: cuenta → saldo portal → saldo correcto → diferencia →
+// fecha de corte → responsable → siguiente acción.
+function buildCarteraMapa(rows) {
+  const bloques = [];
+  let diferenciaTotal = 0;
+  let cuentasConDescuadre = 0;
+  rows.forEach((r, i) => {
+    const portal = carteraMonto(r.saldo_portal);
+    const correcto = carteraMonto(r.saldo_correcto);
+    const dif = portal !== null && correcto !== null ? correcto - portal : null;
+    if (dif !== null) {
+      diferenciaTotal += dif;
+      if (dif !== 0) cuentasConDescuadre += 1;
+    }
+    bloques.push([
+      `${i + 1}) Cuenta: ${r.cuenta}`,
+      `   - Saldo en portal: ${carteraFormatoMonto(portal) || r.saldo_portal}`,
+      `   - Saldo correcto: ${carteraFormatoMonto(correcto) || r.saldo_correcto}`,
+      `   - Diferencia: ${dif !== null ? carteraFormatoMonto(dif) : 'por calcular'}`,
+      `   - Fecha de corte: ${r.fecha_corte}`,
+      `   - Responsable: ${r.responsable}`,
+      `   - Siguiente acción: corregir el saldo en el portal y confirmarlo con ${r.responsable} antes del próximo corte.`,
+    ].join('\n'));
+  });
+  const texto = [
+    '*Mapa de cartera — saldos por corregir*',
+    '',
+    bloques.join('\n\n'),
+    '',
+    `Cuentas con descuadre: ${cuentasConDescuadre} de ${rows.length} · Diferencia acumulada: ${carteraFormatoMonto(diferenciaTotal) || 'por calcular'}`,
+    '',
+    'Ya quedó registrado para Alek con el detalle completo. Cuando el portal refleje los saldos correctos, este mapa sirve para confirmarlo cuenta por cuenta.',
+  ].join('\n');
+  return { texto, diferenciaTotal, cuentasConDescuadre };
+}
+
+// Movimiento de deal dedicado a Pipeline 7 (clon del patrón syncRevenueOsDeal:
+// create-or-move, solo hacia adelante por posición; NO toca otros pipelines).
+async function syncCarteraChampionsDeal({ record, targetStageName, notes = '' }) {
+  if (!record || !record.wa_number || !record.contact_number || !targetStageName) return null;
+  const { rows: pipeRows } = await pool.query(
+    `SELECT id FROM coexistence.pipelines WHERE name = $1 LIMIT 1`,
+    [CHAMPIONS_PIPELINE_NAME]
+  );
+  const pipelineId = pipeRows[0]?.id;
+  if (!pipelineId) return null;
+
+  const { rows: stageRows } = await pool.query(
+    `SELECT id, name, position, stage_type
+       FROM coexistence.pipeline_stages
+      WHERE pipeline_id = $1 AND name = $2
+      LIMIT 1`,
+    [pipelineId, targetStageName]
+  );
+  const targetStage = stageRows[0];
+  if (!targetStage) return null;
+
+  const { rows: userRows } = await pool.query(
+    `SELECT id FROM coexistence.forgecrm_users WHERE role='admin' ORDER BY id LIMIT 1`
+  );
+  const createdBy = userRows[0]?.id || null;
+
+  const { rows: contactRows } = await pool.query(
+    `SELECT COALESCE(name, profile_name, $3) AS name
+       FROM coexistence.contacts
+      WHERE wa_number=$1 AND contact_number=$2
+      LIMIT 1`,
+    [record.wa_number, record.contact_number, record.contact_number]
+  );
+  const contactName = contactRows[0]?.name || record.contact_number;
+  const nextNote = `[${new Date().toISOString()}] ${notes || `Stage → ${targetStageName}`}`;
+
+  const { rows: existingRows } = await pool.query(
+    `SELECT d.*, s.position AS current_stage_position, s.name AS current_stage_name
+       FROM coexistence.deals d
+       JOIN coexistence.pipeline_stages s ON s.id=d.stage_id
+      WHERE d.pipeline_id=$1 AND d.contact_wa_number=$2 AND d.contact_number=$3
+      ORDER BY d.updated_at DESC NULLS LAST, d.id DESC
+      LIMIT 1`,
+    [pipelineId, record.wa_number, record.contact_number]
+  );
+
+  if (existingRows.length === 0) {
+    const title = `IA360 · ${contactName} · Quick win cartera`;
+    const { rows: posRows } = await pool.query(
+      `SELECT COALESCE(MAX(position),-1)+1 AS pos FROM coexistence.deals WHERE stage_id=$1`,
+      [targetStage.id]
+    );
+    const status = targetStage.stage_type === 'won' ? 'won' : targetStage.stage_type === 'lost' ? 'lost' : 'open';
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.deals
+         (pipeline_id, stage_id, title, value, currency, status, assigned_user_id,
+          contact_wa_number, contact_number, contact_name, notes, position, created_by,
+          won_at, lost_at)
+       VALUES ($1,$2,$3,0,'MXN',$4,$5,$6,$7,$8,$9,$10,$11,
+               ${status === 'won' ? 'NOW()' : 'NULL'}, ${status === 'lost' ? 'NOW()' : 'NULL'})
+       RETURNING id`,
+      [pipelineId, targetStage.id, title, status, createdBy, record.wa_number, record.contact_number, contactName, nextNote, posRows[0].pos, createdBy]
+    );
+    return { id: rows[0].id, created: true, stage: targetStage.name, title };
+  }
+
+  const existing = existingRows[0];
+  const shouldMove = Number(targetStage.position) >= Number(existing.current_stage_position);
+  const finalStageId = shouldMove ? targetStage.id : existing.stage_id;
+  const finalStatus = targetStage.stage_type === 'won' ? 'won' : targetStage.stage_type === 'lost' ? 'lost' : 'open';
+  const finalNotes = `${existing.notes || ''}${existing.notes ? '\n' : ''}${nextNote}`;
+  await pool.query(
+    `UPDATE coexistence.deals
+        SET stage_id = $1,
+            status = $2,
+            notes = $3,
+            updated_at = NOW(),
+            won_at = CASE WHEN $2='won' THEN COALESCE(won_at, NOW()) ELSE NULL END,
+            lost_at = CASE WHEN $2='lost' THEN COALESCE(lost_at, NOW()) ELSE NULL END
+      WHERE id = $4`,
+    [finalStageId, shouldMove ? finalStatus : existing.status, finalNotes, existing.id]
+  );
+  return { id: existing.id, moved: shouldMove, stage: shouldMove ? targetStage.name : existing.current_stage_name, title: existing.title };
+}
+
+// Media (imagen/documento) durante esperando_tabla → pedir la versión en texto.
+// El bot no descarga ni interpreta el archivo; solo guía al contacto.
+async function handleCarteraMediaInbound(record) {
+  try {
+    if (!record || record.direction !== 'incoming') return false;
+    if (record.message_type !== 'image' && record.message_type !== 'document') return false;
+    if (normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) return false;
+    const contact = await loadIa360ContactContext(record).catch(() => null);
+    if (!contact || !ia360IsClienteActivoCartera(contact)) return false;
+    if ((contact.custom_fields?.ia360_cartera_state || '') !== 'esperando_tabla') return false;
+    await enqueueIa360Text({ record, label: 'ia360_cartera_pide_texto', body: IA360_CARTERA_COPY.pideTexto });
+    return true;
+  } catch (err) {
+    console.error('[cartera] media handler error (no route):', err.message);
+    return false;
+  }
+}
+
+// Readout al owner tras entregar el mapa (PASO 2). ownerBudget=false: un quick
+// win entregado siempre se reporta.
+function buildCarteraOwnerReadout({ record, contactName, deal, mapa, rows }) {
+  return [
+    `IA360 · Quick win cartera — ${contactName || 'contacto'} (${maskIa360Number(record.contact_number)})`,
+    '',
+    `El contacto entregó su tabla de cartera (${rows.length} ${rows.length === 1 ? 'cuenta' : 'cuentas'}) y le devolví el mapa estructurado.`,
+    `- Cuentas con descuadre: ${mapa.cuentasConDescuadre} · Diferencia acumulada: ${carteraFormatoMonto(mapa.diferenciaTotal) || 'por calcular'}`,
+    deal ? `- Deal: «${deal.title || 'sin título'}» → ${deal.stage} (P7 Champions).` : '- Deal: no se encontró deal en P7 (revisar).',
+    '- Mapa encolado a ia360_docs_sync (destino AlekContenido).',
+    '',
+    'No envié pitch ni agenda; el flujo quedó en modo quick win.',
+  ].join('\n');
+}
+
+// PASO 1 + PASO 2 — texto libre. Va DESPUÉS de Revenue OS y ANTES del agente
+// genérico en el dispatch; devuelve true para CORTAR el embudo (guardrail: el
+// agente no debe responder encima ni empujar agenda).
+async function handleCarteraFreeText(record) {
+  try {
+    if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return false;
+    const body = String(record.message_body || '').trim();
+    if (!body) return false;
+    if (normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) return false;
+    const contact = await loadIa360ContactContext(record).catch(() => null);
+    if (!contact || !ia360IsClienteActivoCartera(contact)) return false;
+    const state = contact.custom_fields?.ia360_cartera_state || '';
+
+    // PASO 2 — esperando la tabla.
+    if (state === 'esperando_tabla') {
+      const rows = parseCarteraTabla(body);
+      if (rows.length > 0) {
+        const mapa = buildCarteraMapa(rows);
+        const deal = await syncCarteraChampionsDeal({
+          record,
+          targetStageName: CARTERA_STAGE_QUICKWIN,
+          notes: `PASO 2 mapa de cartera: tabla recibida (${rows.length} cuentas). Quick win entregado.\nTabla original:\n${body}\n\n${mapa.texto}`,
+        }).catch(e => { console.error('[cartera] deal quick win:', e.message); return null; });
+        await mergeContactIa360State({
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          tags: ['cartera-quickwin-entregado'],
+          customFields: {
+            ia360_cartera_state: 'mapa_entregado',
+            ia360_cartera_mapa_at: new Date().toISOString(),
+            ia360_cartera_cuentas: rows.length,
+            ia360_cartera_tabla_raw: body,
+          },
+        }).catch(e => console.error('[cartera] estado mapa_entregado:', e.message));
+        await enqueueIa360Text({ record, label: 'ia360_cartera_mapa', body: mapa.texto });
+        await pool.query(
+          `INSERT INTO coexistence.ia360_docs_sync (idea_id, titulo, contenido, destino)
+           VALUES (NULL, $1, $2, 'AlekContenido')`,
+          [
+            `Mapa de cartera — ${contact.name || record.contact_number} (${new Date().toISOString().slice(0, 10)})`,
+            `${mapa.texto}\n\n---\nTabla original pegada por el contacto:\n${body}`,
+          ]
+        ).catch(e => console.error('[cartera] docs_sync:', e.message));
+        await sendIa360DirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_cartera_readout',
+          body: buildCarteraOwnerReadout({ record, contactName: contact.name, deal, mapa, rows }),
+          targetContact: record.contact_number,
+        }).catch(e => console.error('[cartera] owner readout:', e.message));
+        return true;
+      }
+      // Sin tabla todavía: si insiste en el tema, recordamos el formato; si
+      // habla de otra cosa, el agente genérico responde (respuesta siempre útil).
+      if (ia360EsMensajeCartera(body)) {
+        await enqueueIa360Text({ record, label: 'ia360_cartera_formato', body: IA360_CARTERA_COPY.recordatorioFormato });
+        return true;
+      }
+      return false;
+    }
+
+    // PASO 1 — disparo del flujo (solo tema cartera; gate del goal).
+    if (state !== 'mapa_entregado' && ia360EsMensajeCartera(body)) {
+      await mergeContactIa360State({
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        tags: ['cartera-quickwin'],
+        customFields: {
+          ia360_cartera_state: 'esperando_tabla',
+          ia360_cartera_dolor: body,
+          ia360_cartera_paso1_at: new Date().toISOString(),
+        },
+      });
+      await syncCarteraChampionsDeal({
+        record,
+        targetStageName: CARTERA_STAGE_VALIDACION,
+        notes: `PASO 1 mapa de cartera: el contacto reportó saldos que no cuadran. Mensaje: ${body}`,
+      }).catch(e => console.error('[cartera] deal paso 1:', e.message));
+      await enqueueIa360Text({ record, label: 'ia360_cartera_paso1', body: IA360_CARTERA_COPY.paso1 });
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error('[cartera] free-text handler error (no route):', err.message);
+    return false;
+  }
+}
+
 async function resolveIa360Outbound(record, dedupSuffix = '') {
   // dedupSuffix permite mandar UN segundo mensaje al mismo contacto para el mismo inbound
   // sin que el dedup (por ia360_handler_for) lo descarte. Default '' = comportamiento idéntico.
@@ -7249,6 +7602,13 @@ router.post('/webhook/whatsapp', async (req, res) => {
             continue; // B-29: vCard capturada y owner-gated; no cae al embudo normal
           }
 
+          // G-WIN cartera: el bot no lee imágenes. Si el contacto está a media
+          // captura de tabla (esperando_tabla) y manda foto/archivo, pedimos la
+          // versión en texto y no seguimos el embudo para este record.
+          if (await handleCarteraMediaInbound(record)) {
+            continue;
+          }
+
           const { rows: pausedRows } = await pool.query(
             `SELECT id FROM coexistence.automation_executions
               WHERE wa_number=$1 AND contact_number=$2
@@ -7273,8 +7633,14 @@ router.post('/webhook/whatsapp', async (req, res) => {
           // el agente no responda el mismo texto ni empuje agenda (guardrail). El owner
           // tiene deal vivo en P2, así que sin este gate el agente respondería en paralelo.
           const revHandled = await handleRevenueOsFreeText(record).catch(e => { console.error('[revenue-os] dispatch:', e.message); return false; });
+          // G-WIN "Mapa de cartera" (P7 Champions) — mismo contrato que Revenue OS:
+          // gateado por persona+tema+estado; si actúa, CORTA el embudo para que el
+          // agente genérico no responda encima (guardrail: sin pitch, sin agenda).
+          const carteraHandled = revHandled
+            ? false
+            : await handleCarteraFreeText(record).catch(e => { console.error('[cartera] dispatch:', e.message); return false; });
           // Free text (no button) inside an active funnel → AI agent (fire-and-forget; never blocks the Meta ack).
-          if (!revHandled) handleIa360FreeText(record).catch(e => console.error('[ia360-agent] fire-and-forget:', e.message));
+          if (!revHandled && !carteraHandled) handleIa360FreeText(record).catch(e => console.error('[ia360-agent] fire-and-forget:', e.message));
           await evaluateTriggers(record);
         } catch (triggerErr) {
           console.error('[webhook] Trigger evaluation error:', triggerErr.message);
@@ -7431,6 +7797,65 @@ router.post('/internal/ia360-revenue/opener', async (req, res) => {
   } catch (err) {
     console.error('[revenue-os] opener endpoint error:', err.message);
     return res.status(500).json({ ok: false, error: 'opener_failed' });
+  }
+});
+
+// G-WIN cartera — vista previa del flujo completo al WhatsApp del OWNER (nunca
+// a un contacto): los mensajes de los 3 pasos con datos de ejemplo, en UN solo
+// texto, para aprobación de copy. Egress único: sendIa360DirectText →
+// messageSender. Auth = X-IA360-Directive-Secret (patrón de los endpoints
+// internos). Idempotencia: el caller decide cuándo (una sola vez por sesión).
+router.post('/internal/ia360-cartera/preview', async (req, res) => {
+  if (!isIa360InternalAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  try {
+    const ejemploRows = [
+      { cuenta: 'Transportes del Bajío', saldo_portal: '$1,250,000.00', saldo_correcto: '$980,000.00', fecha_corte: '31/05/2026', responsable: 'Laura' },
+      { cuenta: 'Logística Occidente', saldo_portal: '$430,500.00', saldo_correcto: '$512,300.00', fecha_corte: '31/05/2026', responsable: 'Marco' },
+    ];
+    const mapaEjemplo = buildCarteraMapa(ejemploRows);
+    const preview = [
+      'IA360 · PREVIEW flujo "Mapa de cartera" (P7 Champions) — para tu aprobación. Nada de esto se envió a Andrés.',
+      '',
+      '── PASO 1 · El contacto reporta saldos que no cuadran. El bot responde: ──',
+      '',
+      IA360_CARTERA_COPY.paso1,
+      '',
+      '── Si manda foto o archivo en lugar de texto: ──',
+      '',
+      IA360_CARTERA_COPY.pideTexto,
+      '',
+      '── PASO 2 · El contacto pega la tabla. El bot responde (datos de ejemplo): ──',
+      '',
+      mapaEjemplo.texto,
+      '',
+      '── PASO 3 · Tú recibes este readout y el deal avanza a "Quick win entregado": ──',
+      '',
+      'IA360 · Quick win cartera — (contacto) (521***XX)',
+      '',
+      'El contacto entregó su tabla de cartera (2 cuentas) y le devolví el mapa estructurado.',
+      `- Cuentas con descuadre: ${mapaEjemplo.cuentasConDescuadre} · Diferencia acumulada: ${carteraFormatoMonto(mapaEjemplo.diferenciaTotal)}`,
+      '- Deal: «IA360 · (contacto) · Quick win cartera» → Quick win entregado (P7 Champions).',
+      '- Mapa encolado a ia360_docs_sync (destino AlekContenido).',
+    ].join('\n');
+    const record = {
+      wa_number: normalizePhone(req.body?.wa_number || process.env.IA360_WA_NUMBER || '5213321594582'),
+      contact_number: IA360_OWNER_NUMBER,
+      message_id: `cartera_preview:${Date.now()}`,
+      message_type: 'cartera_preview',
+      message_body: '',
+    };
+    const sent = await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'ia360_cartera_preview_owner',
+      body: preview,
+    });
+    return res.status(sent ? 200 : 502).json({ ok: !!sent, schema: 'ia360_cartera_preview.v1', chars: preview.length });
+  } catch (err) {
+    console.error('[cartera] preview endpoint error:', err.message);
+    return res.status(500).json({ ok: false, error: 'preview_failed' });
   }
 });
 
