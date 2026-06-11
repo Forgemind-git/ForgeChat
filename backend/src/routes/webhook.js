@@ -759,14 +759,18 @@ async function handleIa360ClienteActivoBetaLearning({ record, deal, contact }) {
         ia360_memory_last_owner_readout_preview: ownerReadout,
       },
     }).catch(e => console.error('[ia360-memory] dry-run marker:', e.message));
-    console.log('[ia360-memory] contact=%s mode=%s events=%d facts=%d stage=%s egress=dry_run',
+    console.log('[ia360-memory] contact=%s mode=%s events=%d facts=%d stage=%s egress=dry_run -> fallback_required',
       maskIa360Number(record.contact_number),
       deal?.memory_mode || 'cliente_activo_beta',
       persisted.filter(x => x.eventId).length,
       persisted.filter(x => x.factId).length,
       deal?.stage_name || '-'
     );
-    return true;
+    // Important: dry-run memory learning is NOT a customer response. Returning true
+    // made the parent handler believe the message was handled, which produced the
+    // active-client silence bug. Return false so handleIa360FreeText sends the
+    // universal holding fallback + owner alert instead of leaving WhatsApp quiet.
+    return false;
   }
   await enqueueIa360Text({ record, label: 'ia360_cliente_activo_beta_memory_reply', body: reply });
   sendIa360DirectText({
@@ -5470,7 +5474,7 @@ function isIa360PassiveMessage(body) {
 // `reason` = 'no-manejado' (accionable sin resolver) o 'error: <msg>' (excepción).
 // `alreadyResponded` evita doble-texto si el flujo ya le dijo algo al contacto.
 async function handleIa360BotFailure({ record, reason, alreadyResponded = false }) {
-  const fallbackBody = 'Recibí tu mensaje. Déjame revisarlo con Alek y te contacto en breve.';
+  const fallbackBody = 'Recibí tu pregunta. Para responderte bien y no darte una respuesta incompleta, voy a revisar el contexto con Alek y te confirmo por aquí en breve.';
   let failureId = null;
   try {
     const { rows } = await pool.query(
@@ -5538,7 +5542,19 @@ async function handleIa360FreeText(record) {
     const contactContext = deal.contact_context || await loadIa360ContactContext(record).catch(() => null);
     if (deal.memory_mode === 'cliente_activo_beta_supervisado' || isIa360ClienteActivoBetaContact(contactContext)) {
       const handled = await handleIa360ClienteActivoBetaLearning({ record, deal, contact: contactContext });
-      if (handled) responded = true;
+      if (handled) {
+        responded = true;
+        return;
+      }
+      // Cliente activo/beta con pregunta sustantiva pero sin señales suficientes para
+      // contestar desde memoria: nunca inventar ni dejar en silencio. Enviar holding
+      // claro al contacto y alertar a Alek para investigar el proyecto/fuente canónica.
+      await handleIa360BotFailure({
+        record,
+        reason: 'cliente activo/beta sin contexto suficiente en memoria para responder sin alucinar',
+        alreadyResponded: false,
+      }).catch(e => console.error('[ia360-failure] cliente-activo fallback error:', e.message));
+      responded = true;
       return;
     }
     const agent = await callIa360Agent({ record, stageName: deal.stage_name });
