@@ -811,18 +811,39 @@ async function persistIa360MemorySignals({ record, contact, signals }) {
 
 async function lookupIa360MemoryContext({ record, contact, limit = 8 }) {
   await ensureIa360MemoryTables();
-  const profile = getIa360ContactProfile(contact);
+  // G-RAG (revisión 06-11): la llave de la jaula es SOLO el proyecto declarado
+  // (beta.project o custom_fields.project_name). account_name NO es proxy de
+  // proyecto: usarlo escondía memoria real de contactos con empresa capturada
+  // y sin proyecto activo.
+  const cfJaula = contact?.custom_fields || {};
+  const jaulaProjectKey = (cfJaula.ia360_cliente_activo_beta || {}).project || cfJaula.project_name || null;
   const params = [
     record?.wa_number || null,
     record?.contact_number || null,
-    profile.projectName || null,
+    jaulaProjectKey,
     limit,
   ];
+  // G-RAG JAULA por proyecto (decisión B1 de Alek 06-11): prohibida la fuga
+  // inter-proyecto. Con proyecto activo declarado, el agente recibe SOLO
+  // memoria de ESE proyecto + memoria general de persona (project_name
+  // vacío); lo que el mismo contacto tenga en OTRO proyecto queda FUERA.
+  // Sin proyecto activo no hay jaula que aplicar: se conserva el
+  // comportamiento G-BRAIN (toda la memoria del contacto). La comparación
+  // normaliza guiones/guiones bajos/espacios ('Camiones-Selectos' =
+  // 'Camiones Selectos'). El expediente del owner NO pasa por aquí: ese es
+  // cross-proyecto a propósito.
+  const jaulaWhere = `(
+        (contact_wa_number=$1 AND contact_number=$2
+         AND (COALESCE($3::text,'')=''
+              OR COALESCE(project_name,'')=''
+              OR regexp_replace(lower(project_name),'[-_ ]','','g') = regexp_replace(lower($3),'[-_ ]','','g')))
+        OR ($3::text IS NOT NULL AND $3<>'' AND
+            regexp_replace(lower(project_name),'[-_ ]','','g') = regexp_replace(lower($3),'[-_ ]','','g'))
+      )`;
   const events = await pool.query(
     `SELECT area, signal_type, summary, business_impact, missing_data, next_action, owner_review_status, created_at
        FROM coexistence.ia360_memory_events
-      WHERE ((contact_wa_number=$1 AND contact_number=$2)
-             OR ($3::text IS NOT NULL AND project_name=$3))
+      WHERE ${jaulaWhere}
       ORDER BY created_at DESC
       LIMIT $4`,
     params
@@ -830,12 +851,13 @@ async function lookupIa360MemoryContext({ record, contact, limit = 8 }) {
   const facts = await pool.query(
     `SELECT persona, role, preference, objection, recurring_pain, affected_process, missing_metric, confidence, status, last_seen_at
        FROM coexistence.ia360_memory_facts
-      WHERE ((contact_wa_number=$1 AND contact_number=$2)
-             OR ($3::text IS NOT NULL AND project_name=$3))
+      WHERE ${jaulaWhere}
       ORDER BY last_seen_at DESC
       LIMIT $4`,
     params
   );
+  console.log('[ia360-jaula] contacto=%s proyecto=%s facts=%d eventos=%d',
+    record?.contact_number || '-', jaulaProjectKey || '-', facts.rows.length, events.rows.length);
   return { events: events.rows, facts: facts.rows };
 }
 
@@ -5449,6 +5471,569 @@ async function handleIa360OwnerMemoryQuery({ record, query }) {
   await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_memory_dossier', body });
 }
 
+// ─── G-RAG: puente seguro AlekContenido ↔ RAG IA360 (2026-06-11) ────────────
+// El vault de Obsidian se indexa desde el HOST (scripts/vault-bridge.js: el
+// contenedor backend NO monta el vault); el backend solo lee ia360_vault_notes
+// y administra los vínculos contacto↔nota en ia360_vault_links. Reglas duras:
+// auto-match SOLO por teléfono (el nombre JAMÁS auto-matchea: homónimos), el
+// owner confirma por tarjeta los candidatos por nombre, y los facts destilados
+// caen en ia360_memory_facts con source='alekcontenido' (provenance reversible
+// vía fact_key y payload.note_path).
+
+let ia360VaultTablesReady = null;
+
+async function ensureIa360VaultTables() {
+  if (!ia360VaultTablesReady) {
+    ia360VaultTablesReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS coexistence.ia360_vault_notes (
+          note_id BIGSERIAL UNIQUE,
+          note_path TEXT PRIMARY KEY,
+          nombre TEXT,
+          nombre_normalizado TEXT,
+          telefono_wa TEXT,
+          project_name TEXT,
+          rol TEXT,
+          empresa TEXT,
+          frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
+          contenido TEXT,
+          file_mtime TIMESTAMPTZ,
+          indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          missing_since TIMESTAMPTZ
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS ia360_vault_notes_tel_idx
+          ON coexistence.ia360_vault_notes (telefono_wa) WHERE telefono_wa IS NOT NULL
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS ia360_vault_notes_nombre_idx
+          ON coexistence.ia360_vault_notes (nombre_normalizado)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS coexistence.ia360_vault_links (
+          id BIGSERIAL PRIMARY KEY,
+          forgechat_contact_id BIGINT NOT NULL,
+          contact_number TEXT NOT NULL,
+          note_path TEXT NOT NULL,
+          project_name TEXT,
+          estado TEXT NOT NULL CHECK (estado IN ('vinculado','rechazado')),
+          matched_by TEXT NOT NULL CHECK (matched_by IN ('telefono','owner_tap','owner_reject')),
+          confirmado_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (forgechat_contact_id, note_path)
+        )
+      `);
+      await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS ia360_vault_links_note_vinculado_uidx
+          ON coexistence.ia360_vault_links (note_path) WHERE estado = 'vinculado'
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS ia360_vault_links_contact_idx
+          ON coexistence.ia360_vault_links (contact_number, estado)
+      `);
+    })().catch(err => {
+      ia360VaultTablesReady = null;
+      throw err;
+    });
+  }
+  return ia360VaultTablesReady;
+}
+
+// Blocklist del puente: bot, owner y TODO número QA/sintético 521999*.
+function ia360VaultBlocklisted(num) {
+  const n = String(num || '');
+  return n === IA360_BOT_WA_NUMBER || n === IA360_OWNER_NUMBER || /^521999/.test(n);
+}
+
+// Levenshtein chico para el fuzzy de candidatos (Antúnez/Antunes ⇒ distancia 1
+// tras normalizar). Tokens cortos, sin librería.
+function ia360Levenshtein(a, b) {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// Carga la ficha de contacto por número; si el mismo número vive bajo varias
+// cuentas WA, gana la del bot (la conversación IA360 real).
+async function loadIa360VaultContactByNumber(contactNumber) {
+  const num = normalizePhone(contactNumber);
+  if (!num) return null;
+  const { rows } = await pool.query(
+    `SELECT id, wa_number, contact_number, name, profile_name, custom_fields
+       FROM coexistence.contacts
+      WHERE contact_number = $1
+      ORDER BY (wa_number = $2) DESC
+      LIMIT 1`,
+    [num, IA360_BOT_WA_NUMBER]
+  );
+  return rows[0] || null;
+}
+
+// Auto-match SOLO por teléfono. El COUNT(DISTINCT)=1 garantiza que un teléfono
+// jamás apunte a 2 contactos; el NOT EXISTS respeta vínculos de otros contactos
+// y rechazos sellados de este contacto. El nombre JAMÁS auto-matchea.
+async function ensureIa360VaultAutoLinks({ contact }) {
+  if (!contact || ia360VaultBlocklisted(contact.contact_number)) return [];
+  await ensureIa360VaultTables();
+  const { rows } = await pool.query(
+    `INSERT INTO coexistence.ia360_vault_links
+       (forgechat_contact_id, contact_number, note_path, project_name, estado, matched_by, confirmado_at)
+     SELECT $1, $2, n.note_path, n.project_name, 'vinculado', 'telefono', NOW()
+       FROM coexistence.ia360_vault_notes n
+      WHERE n.telefono_wa = $2 AND n.missing_since IS NULL
+        AND (SELECT COUNT(DISTINCT c2.id) FROM coexistence.contacts c2 WHERE c2.contact_number = $2) = 1
+        AND NOT EXISTS (SELECT 1 FROM coexistence.ia360_vault_links l
+                         WHERE l.note_path = n.note_path
+                           AND (l.estado = 'vinculado' OR l.forgechat_contact_id = $1))
+     ON CONFLICT (forgechat_contact_id, note_path) DO NOTHING
+     RETURNING note_path`,
+    [contact.id, contact.contact_number]
+  );
+  return rows.map(r => r.note_path);
+}
+
+// Limpieza de valores del vault: [[wikilinks]] → texto interno, sin markdown
+// de negritas, espacios colapsados, tope 300 chars.
+function ia360CleanVaultValue(v) {
+  return String(v == null ? '' : v)
+    .replace(/\[\[([^\]]+)\]\]/g, '$1')
+    .replace(/\*\*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+}
+
+// Destilación DETERMINISTA de una nota del vault (sin LLM): frontmatter a
+// slots de ia360_memory_facts + hasta 3 dolores de la tabla del cuerpo.
+function distillIa360VaultNote(note) {
+  const fm = note?.frontmatter || {};
+  const facts = [];
+  const push = (slot, valor, sufijo) => {
+    const v = ia360CleanVaultValue(valor);
+    if (v) facts.push({ slot, valor: v, sufijo });
+  };
+  const pick = (...keys) => {
+    for (const k of keys) {
+      if (fm[k] != null && String(fm[k]).trim() !== '') return fm[k];
+    }
+    return null;
+  };
+  push('role', pick('rol', 'cargo', 'rol_principal', 'rol_en_meta'), 'rol');
+  push('account_name', pick('empresa', 'organizacion', 'organización'), 'empresa');
+  push('persona', pick('tipo', 'tipo_referencia', 'nivel_decision'), 'tipo');
+  const canal = pick('canal_preferido');
+  if (canal) push('preference', `Canal preferido: ${ia360CleanVaultValue(canal)}`, 'canal');
+  // Filas de la tabla de dolores del cuerpo: "| 1 | **dolor** | ...".
+  const re = /^\|\s*\d+\s*\|\s*\*\*(.+?)\*\*/gm;
+  let m;
+  let i = 0;
+  while ((m = re.exec(String(note?.contenido || ''))) && i < 3) {
+    i += 1;
+    push('recurring_pain', m[1], `pain${i}`);
+  }
+  return facts;
+}
+
+const IA360_VAULT_SLOT_COLUMNS = {
+  role: 'role',
+  account_name: 'account_name',
+  persona: 'persona',
+  preference: 'preference',
+  recurring_pain: 'recurring_pain',
+};
+
+// Vuelca a ia360_memory_facts lo destilado de las notas VINCULADAS del
+// contacto. fact_key = 'alekcontenido:<note_path>#<sufijo>' (dedupe natural);
+// project_name = el de la NOTA (jaula correcta; notas de Areas/CRM traen NULL
+// = fact general de persona). Devuelve { notas, facts, proyectos }.
+async function enrichIa360ContactFromVault({ record, contact }) {
+  await ensureIa360VaultTables();
+  const { rows: notes } = await pool.query(
+    `SELECT n.note_path, n.project_name, n.frontmatter, n.contenido
+       FROM coexistence.ia360_vault_links l
+       JOIN coexistence.ia360_vault_notes n ON n.note_path = l.note_path
+      WHERE l.forgechat_contact_id = $1 AND l.estado = 'vinculado'
+        AND n.missing_since IS NULL
+      ORDER BY l.confirmado_at DESC NULLS LAST`,
+    [contact.id]
+  );
+  const result = { notas: [], facts: 0, proyectos: [] };
+  if (!notes.length) return result;
+  for (const note of notes) {
+    result.notas.push({ note_path: note.note_path, project_name: note.project_name || null });
+    if (note.project_name && !result.proyectos.includes(note.project_name)) result.proyectos.push(note.project_name);
+    for (const f of distillIa360VaultNote(note)) {
+      const col = IA360_VAULT_SLOT_COLUMNS[f.slot];
+      if (!col) continue;
+      const factKey = `alekcontenido:${note.note_path}#${f.sufijo}`;
+      const payload = { note_path: note.note_path, origen: 'vault', valor: f.valor };
+      await pool.query(
+        `INSERT INTO coexistence.ia360_memory_facts
+           (fact_key, source, contact_wa_number, contact_number, forgechat_contact_id,
+            project_name, ${col}, confidence, owner_review_status, status, payload)
+         VALUES ($1,'alekcontenido',$2,$3,$4,$5,$6,0.950,'owner_curated','confirmed',$7::jsonb)
+         ON CONFLICT (fact_key) DO UPDATE SET
+           ${col} = EXCLUDED.${col},
+           project_name = EXCLUDED.project_name,
+           payload = EXCLUDED.payload,
+           evidence_count = coexistence.ia360_memory_facts.evidence_count + 1,
+           last_seen_at = NOW(), updated_at = NOW()`,
+        [
+          factKey,
+          contact.wa_number,
+          contact.contact_number,
+          contact.id,
+          note.project_name || null,
+          f.valor,
+          JSON.stringify(payload),
+        ]
+      );
+      result.facts += 1;
+    }
+  }
+  await mergeContactIa360State({
+    waNumber: contact.wa_number,
+    contactNumber: contact.contact_number,
+    customFields: { rag_enriched_at: new Date().toISOString() },
+  });
+  console.log('[ia360-vault] enriquecido contacto=%s notas=%d facts=%d origen=%s',
+    contact.contact_number, result.notas.length, result.facts, record?.message_id || '-');
+  return result;
+}
+
+// Candidatos por NOMBRE: notas vivas no vinculadas a NADIE y sin fila sellada
+// para ESTE contacto. Cada token (≥3 chars) del nombre del contacto debe
+// aparecer en el nombre de la nota o estar a Levenshtein ≤ 1 de algún token.
+async function buildIa360VaultCandidates(contact) {
+  await ensureIa360VaultTables();
+  const display = contact?.name || contact?.profile_name || '';
+  const tokens = ia360NormalizeNameForMatch(display).split(' ').filter(t => t.length >= 3);
+  if (!tokens.length) return [];
+  const { rows } = await pool.query(
+    `SELECT n.note_id, n.note_path, n.nombre, n.nombre_normalizado, n.project_name, n.rol, n.empresa
+       FROM coexistence.ia360_vault_notes n
+      WHERE n.missing_since IS NULL
+        AND NOT EXISTS (SELECT 1 FROM coexistence.ia360_vault_links l
+                         WHERE l.note_path = n.note_path AND l.estado = 'vinculado')
+        AND NOT EXISTS (SELECT 1 FROM coexistence.ia360_vault_links l2
+                         WHERE l2.note_path = n.note_path AND l2.forgechat_contact_id = $1)`,
+    [contact.id]
+  );
+  const scored = [];
+  for (const n of rows) {
+    const noteName = String(n.nombre_normalizado || '');
+    if (!noteName) continue;
+    const noteTokens = noteName.split(' ').filter(Boolean);
+    let score = 0;
+    let all = true;
+    for (const t of tokens) {
+      if (noteName.includes(t) || noteTokens.some(nt => ia360Levenshtein(t, nt) <= 1)) score += 1;
+      else all = false;
+    }
+    if (all && score > 0) scored.push({ ...n, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 3);
+}
+
+// Tarjeta de candidatos al owner (mismo patrón list del approve-send). Sin tap
+// del owner = cero sync: el nombre solo PROPONE, nunca vincula.
+async function sendIa360VaultCandidateCard({ record, contact, candidates = null }) {
+  const list = candidates || await buildIa360VaultCandidates(contact);
+  const display = contact.name || contact.profile_name || contact.contact_number;
+  if (!list.length) {
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'ia360_vault_no_candidates',
+      body: `Sin notas candidatas en el vault para ${display}. Si existe la nota, captúrale telefono_wa y vuelve a pedir "sincroniza a ...".`,
+      targetContact: contact.contact_number,
+      ownerBudget: true,
+    });
+    return false;
+  }
+  await mergeContactIa360State({
+    waNumber: contact.wa_number,
+    contactNumber: contact.contact_number,
+    customFields: { ia360_vault_offered: list.map(c => c.note_id).join(',') },
+  });
+  const rows = list.map(c => ({
+    id: `owner_vlink:${contact.contact_number}:${c.note_id}`,
+    title: String(c.nombre || c.note_path).slice(0, 24),
+    description: `${c.project_name || 'CRM general'} · ${c.rol || c.empresa || 'nota'}`.slice(0, 72),
+  }));
+  rows.push({
+    id: `owner_vnone:${contact.contact_number}`,
+    title: 'Ninguno, crear nuevo',
+    description: 'No vincular; nota nueva en Areas/CRM/contactos/ cuando haya docs',
+  });
+  return sendOwnerInteractive({
+    record,
+    label: 'ia360_vault_candidates',
+    messageBody: `Candidatos vault para ${contact.contact_number}: ${list.map(c => `${c.nombre} (${c.project_name || 'CRM general'})`).join(', ')}`,
+    targetContact: contact.contact_number,
+    ownerBudget: true,
+    interactive: {
+      type: 'list',
+      body: { text: `Sin match por teléfono para ${display} (${contact.contact_number}). ¿Vinculo alguna nota del vault?` },
+      action: {
+        button: 'Elegir nota',
+        sections: [{
+          title: 'Notas del vault',
+          rows,
+        }],
+      },
+    },
+  });
+}
+
+// Tap owner_vlink: vínculo sellado por decisión EXPLÍCITA del owner. Un tap SÍ
+// puede revertir un rechazo previo (decisión nueva, no re-pregunta).
+async function handleIa360OwnerVaultLink({ record, targetContact, noteId }) {
+  try {
+    await ensureIa360VaultTables();
+    const contact = await loadIa360VaultContactByNumber(targetContact);
+    const { rows: noteRows } = await pool.query(
+      `SELECT note_id, note_path, project_name, nombre
+         FROM coexistence.ia360_vault_notes
+        WHERE note_id = $1
+        LIMIT 1`,
+      [noteId]
+    );
+    const note = noteRows[0];
+    if (!contact || !note) {
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'ia360_vault_link_conflict',
+        body: `No pude vincular: ${!contact ? `no hay ficha de contacto para ${targetContact}` : `la nota ${noteId} ya no existe en el índice del vault`}. Corre el indexador y vuelve a pedir "sincroniza a ...".`,
+        targetContact,
+        ownerBudget: true,
+      });
+      return;
+    }
+    try {
+      await pool.query(
+        `INSERT INTO coexistence.ia360_vault_links
+           (forgechat_contact_id, contact_number, note_path, project_name, estado, matched_by, confirmado_at)
+         VALUES ($1,$2,$3,$4,'vinculado','owner_tap',NOW())
+         ON CONFLICT (forgechat_contact_id, note_path) DO UPDATE SET
+           estado='vinculado', matched_by='owner_tap', confirmado_at=NOW(), updated_at=NOW()`,
+        [contact.id, contact.contact_number, note.note_path, note.project_name || null]
+      );
+    } catch (linkErr) {
+      // Solo la violación del índice parcial único (23505) significa "la nota
+      // ya pertenece a OTRO contacto"; lo demás es error interno y lo maneja
+      // el catch externo sin diagnósticos falsos.
+      if (linkErr.code !== '23505') throw linkErr;
+      console.warn('[ia360-vault] vínculo en conflicto note=%s contacto=%s: %s', note.note_path, targetContact, linkErr.message);
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'ia360_vault_link_conflict',
+        body: `No vinculé ${note.note_path}: esa nota ya está vinculada a OTRO contacto (una nota apunta a una sola persona). Si el vínculo actual está mal, dime y lo revisamos.`,
+        targetContact,
+        ownerBudget: true,
+      });
+      return;
+    }
+    const enriched = await enrichIa360ContactFromVault({ record, contact });
+    const display = contact.name || contact.profile_name || targetContact;
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'ia360_vault_linked',
+      body: `Vinculé ${note.note_path} a ${display} (${targetContact}). Facts: ${enriched.facts} (proyecto: ${note.project_name || 'general'}). Si quieres vincular otra nota: "sincroniza a ${display}".`,
+      targetContact,
+      ownerBudget: true,
+    });
+  } catch (err) {
+    console.error('[ia360-vault] owner_vlink error:', err.message);
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'ia360_vault_link_conflict',
+      body: `No pude completar el vínculo para ${targetContact} (error interno). Inténtalo de nuevo en un momento.`,
+      targetContact,
+      ownerBudget: true,
+    }).catch(() => {});
+  }
+}
+
+// Tap owner_vnone: sella como rechazados TODOS los candidatos ofrecidos en la
+// tarjeta (no se vuelve a preguntar). Jamás degrada un vínculo ya sellado.
+async function handleIa360OwnerVaultNone({ record, targetContact }) {
+  try {
+    await ensureIa360VaultTables();
+    const contact = await loadIa360VaultContactByNumber(targetContact);
+    if (!contact) {
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'ia360_vault_none_ack',
+        body: `No hay ficha de contacto para ${targetContact}; no había nada que sellar.`,
+        targetContact,
+        ownerBudget: true,
+      });
+      return;
+    }
+    const offered = String(contact.custom_fields?.ia360_vault_offered || '')
+      .split(',')
+      .map(s => s.replace(/\D/g, ''))
+      .filter(Boolean);
+    for (const nid of offered) {
+      const { rows } = await pool.query(
+        `SELECT note_path, project_name FROM coexistence.ia360_vault_notes WHERE note_id = $1 LIMIT 1`,
+        [nid]
+      );
+      const note = rows[0];
+      if (!note) continue;
+      await pool.query(
+        `INSERT INTO coexistence.ia360_vault_links
+           (forgechat_contact_id, contact_number, note_path, project_name, estado, matched_by, confirmado_at)
+         VALUES ($1,$2,$3,$4,'rechazado','owner_reject',NOW())
+         ON CONFLICT (forgechat_contact_id, note_path) DO UPDATE SET
+           estado='rechazado', matched_by='owner_reject', confirmado_at=NOW(), updated_at=NOW()
+           WHERE coexistence.ia360_vault_links.estado <> 'vinculado'`,
+        [contact.id, contact.contact_number, note.note_path, note.project_name || null]
+      );
+    }
+    await mergeContactIa360State({
+      waNumber: contact.wa_number,
+      contactNumber: contact.contact_number,
+      customFields: { ia360_vault_offered: '', ia360_vault_none: '1' },
+    });
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'ia360_vault_none_ack',
+      body: `Listo, no vinculé nada para ${targetContact}. Los candidatos quedan sellados como rechazados (no vuelvo a preguntar) y cuando haya documentos crearé nota nueva en Areas/CRM/contactos/.`,
+      targetContact,
+      ownerBudget: true,
+    });
+  } catch (err) {
+    console.error('[ia360-vault] owner_vnone error:', err.message);
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'ia360_vault_none_ack',
+      body: `No pude sellar los rechazos para ${targetContact} (error interno). Vuelve a tocar "Ninguno, crear nuevo" en un momento.`,
+      targetContact,
+      ownerBudget: true,
+    }).catch(() => {});
+  }
+}
+
+// Comando del owner: "sincroniza a <nombre|número>". Resuelve el contacto con
+// la misma tolerancia a typos del expediente, fuerza el auto-match por
+// teléfono y, si no hay vínculo, propone candidatos por nombre con tarjeta.
+// try/catch total: NUNCA queda mudo.
+async function handleIa360OwnerVaultSync({ record, query }) {
+  const ownerText = (label, body) => sendIa360DirectText({
+    record, toNumber: IA360_OWNER_NUMBER, label, body, ownerBudget: true,
+  });
+  try {
+    await ensureIa360VaultTables();
+    const target = await resolveIa360MemoryTarget(query);
+    if (target.kind === 'none') {
+      await ownerText('ia360_vault_sync_none', `No encontré a "${query}" ni como nombre ni como número.`);
+      return;
+    }
+    if (target.kind === 'ambiguous') {
+      const list = target.candidates.slice(0, 8)
+        .map(c => `- ${c.contact_name || 'sin nombre'} (${c.contact_number})`).join('\n');
+      await ownerText('ia360_vault_sync_ambiguous',
+        `Encontré varios contactos que coinciden con "${query}". ¿A cuál sincronizo?\n${list}\n\nMándame "sincroniza a <número>" para elegirlo.`);
+      return;
+    }
+    const num = normalizePhone(target.candidates[0].contact_number);
+    const contact = await loadIa360VaultContactByNumber(num);
+    if (!contact) {
+      await ownerText('ia360_vault_sync_none', `No hay ficha de ${num} en contacts de ForgeChat; sin ficha no puedo vincular notas del vault.`);
+      return;
+    }
+    if (ia360VaultBlocklisted(contact.contact_number)) {
+      await ownerText('ia360_vault_sync_blocked', 'Ese número está en la blocklist del puente (bot/owner/QA); no se sincroniza.');
+      return;
+    }
+    await ensureIa360VaultAutoLinks({ contact });
+    const enriched = await enrichIa360ContactFromVault({ record, contact });
+    if (enriched.notas.length) {
+      const display = contact.name || contact.profile_name || num;
+      const lines = [
+        `Sincronizado ${display} (${num}): ${enriched.notas.length} nota(s) vinculada(s), ${enriched.facts} facts.`,
+        ...enriched.notas.map(n => `- ${n.note_path} → proyecto ${n.project_name || 'general'}`),
+      ];
+      await sendIa360DirectText({
+        record,
+        toNumber: IA360_OWNER_NUMBER,
+        label: 'ia360_vault_synced',
+        body: lines.join('\n'),
+        targetContact: num,
+        ownerBudget: true,
+      });
+      // "Si quieres vincular otra nota: sincroniza a <nombre>" (ack del tap):
+      // si todavía quedan candidatos por nombre sin sellar, se ofrecen aquí
+      // mismo — sin esto el repeat-sync sería un callejón sin salida.
+      const remaining = await buildIa360VaultCandidates(contact);
+      if (remaining.length) await sendIa360VaultCandidateCard({ record, contact, candidates: remaining });
+      return;
+    }
+    await sendIa360VaultCandidateCard({ record, contact });
+  } catch (err) {
+    console.error('[ia360-vault] sync error:', err.message);
+    await ownerText('ia360_vault_sync_error', `No pude sincronizar "${query}" ahora mismo (error interno). Inténtalo de nuevo en un momento.`).catch(() => {});
+  }
+}
+
+// Hook al alta de contacto: el primer mensaje real de un número nuevo dispara
+// UNA sola vez (flag ia360_vault_checked) el auto-match por teléfono y, si no
+// hay vínculo pero sí candidatos por nombre, la tarjeta al owner. Sin tap del
+// owner = cero sync. Fire-and-forget: jamás bloquea el inbound.
+async function maybeIa360VaultIntake(record) {
+  await ensureIa360VaultTables();
+  const { rows } = await pool.query(
+    `SELECT id, wa_number, contact_number, name, profile_name, custom_fields
+       FROM coexistence.contacts
+      WHERE wa_number = $1 AND contact_number = $2
+      LIMIT 1`,
+    [record.wa_number, record.contact_number]
+  );
+  const contact = rows[0];
+  if (!contact) return;
+  if (String(contact.custom_fields?.ia360_vault_checked || '') === '1') return;
+  await mergeContactIa360State({
+    waNumber: contact.wa_number,
+    contactNumber: contact.contact_number,
+    customFields: { ia360_vault_checked: '1' },
+  });
+  await ensureIa360VaultAutoLinks({ contact });
+  const { rows: linked } = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM coexistence.ia360_vault_links
+      WHERE forgechat_contact_id = $1 AND estado = 'vinculado'`,
+    [contact.id]
+  );
+  if (linked[0].n > 0) {
+    await enrichIa360ContactFromVault({ record, contact });
+    return;
+  }
+  const candidates = await buildIa360VaultCandidates(contact);
+  if (candidates.length) await sendIa360VaultCandidateCard({ record, contact, candidates });
+}
+
 // ─── Bandeja de ideas del owner ─────────────────────────────────────────────
 // Una idea (comando del owner "idea: <texto>", detección en conversación vía
 // Brain v2, o un agente) se persiste en coexistence.ia360_ideas y genera una
@@ -6823,6 +7408,15 @@ async function handleIa360LiteInteractive(record) {
       // BANDEJA DE IDEAS: ruteo de la tarjeta (Producción/Documentar/CRM/Rechazar).
       if (ownerAction && ownerAction.startsWith('owner_idea_')) {
         await handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId: ownerArg });
+        return;
+      }
+      // G-RAG: tarjeta de candidatos del vault — vincular nota o sellar rechazo.
+      if (ownerAction === 'owner_vlink') {
+        await handleIa360OwnerVaultLink({ record, targetContact, noteId: String(ownerPipe || '').replace(/\D/g, '') });
+        return;
+      }
+      if (ownerAction === 'owner_vnone') {
+        await handleIa360OwnerVaultNone({ record, targetContact });
         return;
       }
       if (ownerAction === 'owner_pipe') {
@@ -8472,6 +9066,19 @@ router.post('/webhook/whatsapp', async (req, res) => {
               continue; // no procesar como mensaje normal
             }
           }
+          // ── G-RAG: comando del owner "sincroniza a <nombre|número>" ──
+          // Mismo patrón que el expediente: va ANTES del canary Brain v2 (el
+          // owner está en la allowlist y el canary haría continue). Vincula
+          // notas del vault al contacto y vuelca facts; nunca queda mudo.
+          if (record.message_type === 'text'
+              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
+            const syncMatch = String(record.message_body || '').trim().match(/^sincroniza(?:me)?\s+(?:a|al|con)\s+(.+)$/i);
+            if (syncMatch && syncMatch[1].trim()) {
+              await handleIa360OwnerVaultSync({ record, query: syncMatch[1].trim() })
+                .catch(e => console.error('[ia360-vault] owner command error:', e.message));
+              continue; // no procesar como mensaje normal
+            }
+          }
           // ── CANARY Brain v2 (reversible, allowlist) ──────────────────
           // Antes de TODO el pipeline del monolito: si el remitente esta en la
           // allowlist y el flag esta on, el texto se enruta al Brain v2 y NO toca
@@ -8521,6 +9128,15 @@ router.post('/webhook/whatsapp', async (req, res) => {
               console.error('[ia360-failure] comment-capture error:', capErr.message);
               // si la captura falla, dejamos que el mensaje siga el flujo normal
             }
+          }
+
+          // ── G-RAG: intake del vault al alta del contacto ─────────────────
+          // Fire-and-forget (sin continue): el auto-match con el vault corre
+          // UNA vez por contacto y no bloquea el flujo normal del mensaje.
+          if (record.direction === 'incoming'
+              && ['text', 'interactive', 'button'].includes(record.message_type)
+              && !ia360VaultBlocklisted(normalizePhone(record.contact_number))) {
+            maybeIa360VaultIntake(record).catch(e => console.error('[ia360-vault] intake error:', e.message));
           }
 
           if (await handleIa360SharedContacts(record)) {

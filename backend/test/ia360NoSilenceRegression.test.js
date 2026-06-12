@@ -35,7 +35,9 @@ test('cliente activo beta memory dry-run must fall through to no-silence fallbac
   assert.match(betaBlock, /captureOnly: true/, 'la rama beta debe capturar memoria sin responder');
   assert.match(betaBlock, /callIa360Agent/, 'la rama beta debe pedir respuesta real al agente');
   assert.match(betaBlock, /ia360_cliente_activo_beta_agent_reply/, 'la respuesta real debe encolar al contacto');
-  assert.match(betaBlock, /roleHint: buildIa360ClienteActivoBetaRoleHint/, 'el agente debe recibir el perfil ejecutivo');
+  // G-BRAIN compuso el roleHint ([perfil ejecutivo, hint conversacional]); la
+  // intención es la misma: el perfil ejecutivo SIEMPRE llega al agente.
+  assert.ok(betaBlock.includes('buildIa360ClienteActivoBetaRoleHint(contactContext)'), 'el agente debe recibir el perfil ejecutivo');
   assert.match(betaBlock, /handleIa360BotFailure/, 'sin agente debe haber holding + alerta + failure');
   assert.match(betaBlock, /agente IA sin respuesta utilizable/);
 });
