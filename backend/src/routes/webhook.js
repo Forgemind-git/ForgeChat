@@ -9,6 +9,7 @@ const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('
 const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
+const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
 
 const router = Router();
 
@@ -5314,6 +5315,55 @@ async function sendIa360DirectText({ record, toNumber, body, label, targetContac
   }
 }
 
+// ─── G5: Circuit breaker de PAGO / elegibilidad de Meta ─────────────────────
+// Engancha en el procesamiento de webhooks de STATUS. El 131042 NO llega como
+// excepción en el envío síncrono (Meta devuelve accepted+wamid); llega DESPUÉS
+// como status "failed" con errors[].code=131042. Por eso el breaker vive aquí,
+// no sólo en el envío. La LÓGICA (clasificación, flag por cuenta, anti-spam) está
+// en services/paymentCircuitBreaker.js; esta función sólo traduce la decisión en
+// una alerta al owner vía sendIa360DirectText (UNA vez por bloqueo/día/código).
+async function handleIa360PaymentCircuitBreaker(record) {
+  const decision = evaluatePaymentStatus(record);
+  if (decision.action === 'none') return;
+
+  if (decision.action === 'recover') {
+    console.log('[ia360-payment-cb] cuenta %s RECUPERADA (status=%s, facturable entregado) — flag limpiado',
+      decision.accountKey, record.status);
+    // Aviso de recuperación: también es un mensaje de sesión al owner (entrega
+    // aunque la cuenta estuviera bloqueada para templates).
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'owner_payment_recovered',
+      body: '✅ WhatsApp volvió a entregar templates: el bloqueo por pago/elegibilidad de Meta quedó resuelto. Reanudo envíos normales.',
+    }).catch(e => console.error('[ia360-payment-cb] aviso recuperación falló:', e.message));
+    return;
+  }
+
+  // action === 'block'
+  if (!decision.shouldAlert) {
+    console.log('[ia360-payment-cb] cuenta %s ya bloqueada code=%s — alerta suprimida (anti-spam)',
+      decision.accountKey, decision.code);
+    return;
+  }
+
+  const cuenta = record.wa_number || decision.accountKey;
+  const body =
+    `🚨 *WhatsApp bloqueó tus envíos* (cuenta ${cuenta}).\n\n` +
+    `Meta marcó un mensaje como *failed* por *${decision.title}* (código ${decision.code}).\n\n` +
+    `Esto bloquea los *templates* (mensajes iniciados por el negocio). Los mensajes de sesión (respuestas dentro de 24 h) siguen funcionando.\n\n` +
+    (decision.href ? `Resuélvelo aquí:\n${decision.href}` : 'Revisa el Billing Hub de Meta para liquidar el saldo pendiente.');
+
+  const sent = await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: `owner_payment_block_${decision.code}`,
+    body,
+  }).catch(e => { console.error('[ia360-payment-cb] alerta owner falló:', e.message); return false; });
+  console.log('[ia360-payment-cb] ALERTA owner cuenta=%s code=%s alerta#%d enviada=%s',
+    decision.accountKey, decision.code, decision.alertCount, sent);
+}
+
 // ─── Expediente del owner: "qué sabes de <nombre|número>" ──────────────────
 // Comando read-only del owner: arma un expediente con los facts y eventos de
 // coexistence.ia360_memory_* para un contacto, resuelto por número o por
@@ -9297,6 +9347,13 @@ router.post('/webhook/whatsapp', async (req, res) => {
           await evaluateTriggers(record);
         } catch (triggerErr) {
           console.error('[webhook] Status trigger evaluation error:', triggerErr.message);
+        }
+        // G5: circuit breaker de pago/elegibilidad (131042 y familia). Va fuera
+        // de la transacción de inserción para no enviar dentro del BEGIN/COMMIT.
+        try {
+          await handleIa360PaymentCircuitBreaker(record);
+        } catch (cbErr) {
+          console.error('[ia360-payment-cb] error:', cbErr.message);
         }
       }
     }

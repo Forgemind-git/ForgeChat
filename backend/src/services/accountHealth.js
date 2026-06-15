@@ -4,6 +4,7 @@
 // up silently.
 
 const pool = require('../db');
+const { isAccountBlockRetryCode } = require('./paymentCircuitBreaker');
 
 /**
  * Classify an error from Meta and persist it on the account row.
@@ -44,6 +45,11 @@ async function markAccountHealth(accountId, status, message = null) {
 function classifyMetaError(err) {
   if (!err) return 'unknown_error';
   if (err.status === 401 || err.metaError?.code === 190) return 'invalid_token';
+  // G5: bloqueo a nivel CUENTA por pago/elegibilidad/deshabilitación (131042 y
+  // familia + 368). Set compartido con el circuit breaker (paymentCircuitBreaker)
+  // para que breaker y skipRetry no se desincronicen. Reintentar aquí quema los 4
+  // intentos en vano porque Meta ya dijo bloqueo de cuenta.
+  if (isAccountBlockRetryCode(err.metaError?.code)) return 'payment_blocked';
   if (err.status === 429 || err.metaError?.code === 4 || err.metaError?.code === 80007) return 'rate_limited';
   return 'unknown_error';
 }
