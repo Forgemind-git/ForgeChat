@@ -8,6 +8,7 @@ const { enqueueMediaDownload } = require('../queue/mediaQueue');
 const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('../services/messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
+const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
 
 const router = Router();
 
@@ -2509,21 +2510,10 @@ async function bookIa360Slot({ record, start, end }) {
   }
 }
 
+// Delega en el módulo puro ./ia360OpenerReply (mismo parse, sin DB) para que los
+// tests ejerciten exactamente la extracción que corre en producción.
 function getInteractiveReplyId(record) {
-  try {
-    const payload = typeof record.raw_payload === 'string' ? JSON.parse(record.raw_payload) : record.raw_payload;
-    const msg = payload?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    const interactive = msg?.interactive;
-    if (interactive) {
-      if (interactive.button_reply?.id) return String(interactive.button_reply.id).trim().toLowerCase();
-      if (interactive.list_reply?.id) return String(interactive.list_reply.id).trim().toLowerCase();
-    }
-    if (msg?.button?.payload) return String(msg.button.payload).trim().toLowerCase();
-    if (msg?.button?.text) return String(msg.button.text).trim().toLowerCase();
-  } catch (_) {
-    // ignore malformed/non-JSON payloads; fallback to visible title
-  }
-  return '';
+  return extractInteractiveReplyId(record);
 }
 
 
@@ -8731,6 +8721,67 @@ async function handleIa360LiteInteractive(record) {
     return;
   }
 
+  // ── G6: ÚLTIMO RECURSO PARA BOTONES DE OPENER (quick-reply sin payload) ─────
+  // Los quick-reply de los templates fríos del opener llegan con id = el TÍTULO
+  // visible ("Sí, cuéntame" / "Ahora no") y SIN payload estable. handleRevenueOsButton
+  // y el resolver de alias seq_* los rutean SOLO cuando el contacto está en el
+  // estado correcto (apertura_sent / persona-first enviado). Si su proceso no
+  // calza ese estado, declinaban y el botón moría en [ia360-fallback]
+  // (log: "unhandled interactive reply id=si, cuentame"). Aquí, ya que todos los
+  // handlers gateados declinaron, clasificamos el id normalizado (minúsculas, sin
+  // acentos, sin puntuación, trim) y damos un siguiente paso COHERENTE en vez del
+  // fallback genérico. Reusamos el copy de Revenue OS (demo/onboarding).
+  // TODO(G6+): buildIa360OpenerInteractive (~L3474) debe emitir payload ESTABLE
+  // (p.ej. `opener:<seq>:si` / `opener:<seq>:no`) en vez de depender del título;
+  // cuando lo haga, este clasificador por texto queda solo como red de seguridad
+  // para los templates fríos viejos ya enviados.
+  const openerKind = classifyOpenerReply(replyId || answer);
+  if (openerKind) {
+    try {
+      const safeName = record.contact_name || record.contact_number;
+      if (openerKind === 'affirmative') {
+        // "Sí, cuéntame" → abre la conversación de demo/onboarding con la pregunta
+        // de calificación (PASO 2 de Revenue OS) y deja estado para que su texto
+        // libre siguiente llegue al agente. NO es el fallback genérico.
+        await mergeContactIa360State({
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          tags: ['revenue-os-interesado'],
+          customFields: { ia360_revenue_state: 'calificacion', ultimo_cta_enviado: 'ia360_opener_si_recovery' },
+        }).catch(e => console.error('[ia360-opener] state affirmative:', e.message));
+        await enqueueIa360Text({ record, label: 'ia360_opener_si_recovery', body: REVENUE_OS_COPY.paso2 });
+        await sendIa360DirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_opener_si_recovery',
+          body: `Alek, ${safeName} (${record.contact_number}) tocó "Sí, cuéntame" de un opener (id: ${replyId || answer || '-'}) sin estado activo. Le respondí con la pregunta de calificación para abrir la demo; quedó en "calificación".`,
+          targetContact: record.contact_number,
+          ownerBudget: true,
+        }).catch(e => console.error('[ia360-opener] owner notice si:', e.message));
+      } else {
+        // "Ahora no" → cierre cortés (mismo copy que Revenue OS) + nutrición suave.
+        await mergeContactIa360State({
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          tags: ['nutricion-suave'],
+          customFields: { ia360_revenue_state: 'nutricion', ultimo_cta_enviado: 'ia360_opener_ahora_no_recovery' },
+        }).catch(e => console.error('[ia360-opener] state negative:', e.message));
+        await enqueueIa360Text({ record, label: 'ia360_opener_ahora_no_recovery', body: REVENUE_OS_COPY.ahoraNo });
+        await sendIa360DirectText({
+          record,
+          toNumber: IA360_OWNER_NUMBER,
+          label: 'owner_opener_ahora_no_recovery',
+          body: `Alek, ${safeName} (${record.contact_number}) tocó "Ahora no" de un opener (id: ${replyId || answer || '-'}). Cerré cortés y lo dejé en nutrición suave.`,
+          targetContact: record.contact_number,
+          ownerBudget: true,
+        }).catch(e => console.error('[ia360-opener] owner notice no:', e.message));
+      }
+    } catch (openerErr) {
+      console.error('[ia360-opener] recovery handler error:', openerErr.message);
+    }
+    return;
+  }
+
   // ── FALLBACK GLOBAL DE INTERACTIVE (openers v2) ────────────────────────────
   // Si llegamos aquí, NINGÚN handler reconoció el button/list reply (id viejo o
   // malformado). Los ids seq_* del catálogo y los quick replies de template con
@@ -8852,10 +8903,28 @@ async function handleBrainV2Canary(record) {
       return;
     }
   }
+  const isOwnerDirect = normalizePhone(record.contact_number) === IA360_OWNER_NUMBER && !forceActor;
+  if (isOwnerDirect) {
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'brainv2_owner_operator_local',
+      body: [
+        'Te leo como owner. Brain v2 sigue en canary, pero ya no te voy a mandar el error genérico.',
+        '',
+        'Comandos útiles:',
+        '- `/sim <mensaje>` para probar cómo respondería a un contacto.',
+        '- `idea: <texto>` para mandar algo a la bandeja de ideas.',
+        '- `qué sabes de <nombre|número>` para consultar memoria.',
+        '- `sincroniza a <nombre|número>` para vincular notas del vault.'
+      ].join('\n')
+    });
+    return;
+  }
   console.log('[brain-v2-canary] routing contact=%s force_actor=%s msg=%j', record.contact_number, forceActor || '-', message.slice(0, 80));
   const out = await callBrainV2({ contactWaNumber: record.contact_number, message, forceActor });
   if (!out) {
-    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'brainv2_holding', body: 'Brain v2: no pude generar respuesta en este momento. Reintenta en un momento.' });
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'brainv2_holding', body: 'Brain v2 no devolvió respuesta para la simulación. La ruta owner directa sigue disponible; reviso el workflow antes de otro intento.' });
     return;
   }
   const branch = out.branch || out.route || 'fallback';
@@ -8874,8 +8943,12 @@ async function handleBrainV2Canary(record) {
     await handleIa360FreeText(handbackRecord).catch(e => console.error('[brain-v2-canary] handback error:', e.message));
     return;
   }
-  // owner_operator / system_excluded / fallback => SIN reply (por diseno).
-  console.log('[brain-v2-canary] sin reply (branch=%s)', branch);
+  await sendIa360DirectText({
+    record,
+    toNumber: IA360_OWNER_NUMBER,
+    label: 'brainv2_no_route',
+    body: `Brain v2 devolvió la rama "${branch}" sin respuesta final. No te dejo mudo; usa /sim <mensaje> para probar como contacto o dime qué flujo quieres revisar.`
+  });
 }
 
 // G-LIVE QA-GUARD (incidente José Ramón): detecta payloads SINTÉTICOS del harness
@@ -8954,9 +9027,20 @@ router.post('/webhook/whatsapp', async (req, res) => {
         // produced phantom "Status: delivered" bubbles. If no matching message
         // exists (e.g. an app-sent message we don't track), this is a no-op.
         if (r.message_type === 'status') {
+          const statusErrors = Array.isArray(r.errors) && r.errors.length > 0
+            ? r.errors.map((e) => e?.message || e?.title || e?.code || JSON.stringify(e)).filter(Boolean).join('; ')
+            : null;
           await client.query(
-            `UPDATE coexistence.chat_history SET status = $1 WHERE message_id = $2`,
-            [r.status, r.message_id]
+            `UPDATE coexistence.chat_history
+                SET status = $1,
+                    raw_payload = COALESCE($3::jsonb, raw_payload),
+                    error_message = CASE
+                      WHEN $1 IN ('failed', 'error') THEN COALESCE($4, error_message)
+                      WHEN $1 IN ('sent', 'delivered', 'read') THEN NULL
+                      ELSE error_message
+                    END
+              WHERE message_id = $2`,
+            [r.status, r.message_id, r.raw_payload || null, statusErrors]
           );
           continue;
         }
