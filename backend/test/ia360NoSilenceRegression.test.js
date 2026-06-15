@@ -105,3 +105,16 @@ test('datos vivos del portal: handoff explícito, nunca inventar listas', () => 
   const handoffBlock = src.slice(handoffIdx, handoffIdx + 900);
   assert.match(handoffBlock, /alreadyResponded: sentHandoff === true/);
 });
+
+test('owner directo en Brain v2 canary no responde holding generico', () => {
+  const handlerStart = src.indexOf('async function handleBrainV2Canary(record)');
+  assert.notEqual(handlerStart, -1, 'falta handleBrainV2Canary');
+  const handlerEnd = src.indexOf('// G-LIVE QA-GUARD', handlerStart);
+  const handler = src.slice(handlerStart, handlerEnd);
+  assert.match(handler, /isOwnerDirect/, 'la ruta owner directa debe estar explícita');
+  assert.match(handler, /brainv2_owner_operator_local/, 'owner directo debe recibir respuesta operativa local');
+  assert.ok(
+    handler.indexOf('brainv2_owner_operator_local') < handler.indexOf('callBrainV2'),
+    'owner directo no debe depender del workflow Brain v2 incompleto'
+  );
+});
