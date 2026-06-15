@@ -115,8 +115,12 @@ async function processJob(job) {
   } catch (err) {
     const cls = classifyMetaError(err);
     await markAccountHealth(account.id, cls, err.message);
-    // Don't retry auth failures — they'll fail every time until token is fixed
-    if (cls === 'invalid_token') {
+    // Don't retry auth failures — they'll fail every time until token is fixed.
+    // G5: tampoco reintentar bloqueos de cuenta por pago/elegibilidad (131042 y
+    // familia): Meta ya dijo bloqueo, reintentar quema los 4 intentos en vano.
+    // (El 131042 suele llegar como webhook de status, no como excepción síncrona;
+    // este skipRetry cubre el caso en que Meta SÍ rechace de forma síncrona.)
+    if (cls === 'invalid_token' || cls === 'payment_blocked') {
       err.skipRetry = true;
     }
     throw err;
