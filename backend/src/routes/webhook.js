@@ -13,6 +13,7 @@ const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
 const {
   IA360_DEFAULT_PIPELINE_NAME,
   IA360_PARTNERS_PIPELINE_NAME,
+  IA360_PARTNER_RELATIONSHIPS,
   ia360PipelineForRelationship,
   ia360ResolveStageName,
 } = require('./ia360DealRouting');
@@ -4429,6 +4430,24 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
     payload.approval.reason = 'Borrador bloqueado por placeholder sin resolver.';
   }
   await persistIa360PersonaPayload({ record, targetContact, flow, sequence, payload, tags: ['owner-sequence-selected'] });
+  // G10 (P2): "Fit identificado" (pos 0 del pipeline Partners). Este es el momento
+  // PRE-ENVÍO: el owner eligió secuencia para un partner y se generó su readout/
+  // draft, pero el opener AÚN no sale (eso ocurre en handleIa360OwnerApproveSend →
+  // "Introducción enviada", pos 1). Poblar pos 0 aquí deja el journey medible desde
+  // el inicio. No añade egress (syncIa360Deal es solo DB; el readout ya va al owner)
+  // y NO mueve el deal hacia atrás: "Fit identificado" no está en forceMoveStages y
+  // su position 0 nunca supera la de un deal ya avanzado (guard shouldMove de
+  // syncIa360Deal), así que un deal en "Introducción enviada"/posterior solo recibe
+  // una nota, no regresa de stage.
+  if (IA360_PARTNER_RELATIONSHIPS.has(String(flow?.relationshipContext || ''))) {
+    await syncIa360Deal({
+      record,
+      targetStageName: 'Fit identificado',
+      titleSuffix: 'Fit (secuencia elegida)',
+      notes: `Partner identificado como fit: owner eligió secuencia ${sequence.id} (pre-envío).`,
+      pipelineName: ia360PipelineForRelationship(flow?.relationshipContext),
+    }).catch(e => console.error('[ia360-fit] syncIa360Deal:', e.message));
+  }
   // G-COLD: aviso pre-aprobación. Si el contacto está fuera de la ventana de 24h,
   // el owner debe saber ANTES de aprobar si el opener saldrá como template de
   // Meta (mismo copy, con botones) o si no puede salir nada todavía.

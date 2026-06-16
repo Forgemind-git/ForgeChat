@@ -35,11 +35,17 @@ const IA360_PARTNER_RELATIONSHIPS = new Set(['aliado_socio', 'referido_bni']);
 //   - "Diagnóstico compartido" (3) no lo alcanza ningún callsite hoy (faltan las
 //     secuencias Blueprint/Propuesta del journey).
 const IA360_PARTNER_STAGE_MAP = {
+  'Fit identificado': 'Fit identificado',        // G10: pre-envío, partner identificado como fit (pos 0)
   'Diagnóstico enviado': 'Introducción enviada', // opener de intro aprobado/enviado
   'Intención detectada': 'Prospecto activo',     // respondió / paso 2 de la secuencia
   'Agenda en proceso': 'Seguimiento en marcha',  // pidió horarios para llamada con Alek
   'Requiere Alek': 'Seguimiento en marcha',      // handoff humano (el pipeline 6 no tiene stage propio)
   'Nutrición': 'Prospecto activo',               // "ahora no": sigue prospecto activo (suave)
+  // G10 (P2): el journey aliado alcanza "Diagnóstico compartido" (pos 3) por tres
+  // vías semánticas; las tres caen en el MISMO stage real del pipeline 6.
+  'Diagnóstico compartido': 'Diagnóstico compartido', // stage real directo
+  'Blueprint compartido': 'Diagnóstico compartido',   // secuencia Blueprint entregada
+  'Propuesta enviada': 'Diagnóstico compartido',      // secuencia Propuesta entregada
   'Ganado': 'Ganado',
   'Perdido / no fit': 'Perdido',
 };
@@ -62,6 +68,60 @@ function ia360ResolveStageName(pipelineName, requestedStageName) {
   return IA360_PARTNER_STAGE_MAP[requestedStageName] || requestedStageName;
 }
 
+// ============================================================================
+// G10 (P2): secuencias Blueprint / Propuesta del journey aliado — STUB INERTE
+// detrás de un flag que FALLA CERRADO.
+//
+// Hoy NO existen los templates de Meta para estas dos etapas (es el gap P2: hay
+// que crearlos y aprobarlos). Hasta que existan, NO debe poder salir nada: ni
+// ofrecerse en menús/readouts (flag OFF) ni enviarse sin template aprobado
+// (predicado fail-closed). Este módulo solo declara el catálogo y los predicados
+// PUROS; la lógica de envío real (cuando exista) vive en webhook.js y DEBE pasar
+// por los gates de cold-send existentes (outside_window_template_not_approved /
+// cold_template_status_check_failed). Sin template aprobado → no enviable.
+//
+// DEFAULT OFF: solo se activa con IA360_PARTNER_BLUEPRINT=on en el entorno.
+const IA360_PARTNER_BLUEPRINT_ENABLED = process.env.IA360_PARTNER_BLUEPRINT === 'on';
+
+// Catálogo INERTE: describe las dos secuencias nuevas y a qué stage real del
+// pipeline 6 llevan ("Diagnóstico compartido", pos 3). metaTemplateName apunta al
+// template de Meta que TODAVÍA no existe — por eso el predicado falla cerrado.
+const IA360_PARTNER_BLUEPRINT_SEQUENCES = [
+  {
+    id: 'partner_blueprint',
+    label: 'Blueprint compartido',
+    metaTemplateName: 'ia360_partner_blueprint',
+    stage: 'Diagnóstico compartido',
+  },
+  {
+    id: 'partner_propuesta',
+    label: 'Propuesta enviada',
+    metaTemplateName: 'ia360_partner_propuesta',
+    stage: 'Diagnóstico compartido',
+  },
+];
+
+// Devuelve las secuencias OFRECIBLES. Con el flag OFF → [] (no se ofrecen en
+// ningún menú/readout). El estado del flag es inyectable para poder testear
+// ambos lados sin recargar el proceso (el const se evalúa en load-time).
+function ia360PartnerBlueprintSequences(enabled = IA360_PARTNER_BLUEPRINT_ENABLED) {
+  return enabled ? IA360_PARTNER_BLUEPRINT_SEQUENCES.slice() : [];
+}
+
+// Predicado fail-closed: una secuencia Blueprint/Propuesta SOLO es enviable si
+//   (a) el flag está ON, y
+//   (b) su template de Meta está aprobado/presente (approvedTemplateName coincide
+//       con el metaTemplateName de la secuencia).
+// Falta el template (''/null/no coincide) → FALSE. Flag OFF → FALSE. Este es el
+// corazón del fail-closed: sin template aprobado NO se envía.
+function ia360PartnerBlueprintSendable(seq, approvedTemplateName, enabled = IA360_PARTNER_BLUEPRINT_ENABLED) {
+  if (!enabled) return false;
+  if (!seq || !seq.metaTemplateName) return false;
+  const approved = String(approvedTemplateName || '').trim();
+  if (!approved) return false;
+  return approved === seq.metaTemplateName;
+}
+
 module.exports = {
   IA360_DEFAULT_PIPELINE_NAME,
   IA360_PARTNERS_PIPELINE_NAME,
@@ -69,4 +129,8 @@ module.exports = {
   IA360_PARTNER_STAGE_MAP,
   ia360PipelineForRelationship,
   ia360ResolveStageName,
+  IA360_PARTNER_BLUEPRINT_ENABLED,
+  IA360_PARTNER_BLUEPRINT_SEQUENCES,
+  ia360PartnerBlueprintSequences,
+  ia360PartnerBlueprintSendable,
 };
