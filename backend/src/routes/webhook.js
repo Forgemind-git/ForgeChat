@@ -10,6 +10,12 @@ const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
 const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
 const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
+const {
+  IA360_DEFAULT_PIPELINE_NAME,
+  IA360_PARTNERS_PIPELINE_NAME,
+  ia360PipelineForRelationship,
+  ia360ResolveStageName,
+} = require('./ia360DealRouting');
 
 const router = Router();
 
@@ -1161,20 +1167,34 @@ async function recordBlockedOwnerNumberVcard({ record, shared }) {
   }).catch(e => console.error('[ia360-vcard] owner-number block persist:', e.message));
 }
 
-async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes = '' }) {
+// G8: `pipelineName` enruta el deal. Default = Revenue genérico (no rompe lo
+// existente). Los callsites del journey de aliado/referido BNI pasan
+// IA360_PARTNERS_PIPELINE_NAME ('Partners / Aliados (BNI)', id 6) — derivado de
+// flow.relationshipContext vía ia360PipelineForRelationship.
+async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes = '', pipelineName = IA360_DEFAULT_PIPELINE_NAME }) {
   if (!record || !record.wa_number || !record.contact_number || !targetStageName) return null;
   const { rows: pipeRows } = await pool.query(
-    `SELECT id FROM coexistence.pipelines WHERE name = 'IA360 WhatsApp Revenue Pipeline' LIMIT 1`
+    `SELECT id FROM coexistence.pipelines WHERE name = $1 LIMIT 1`,
+    [pipelineName]
   );
   const pipelineId = pipeRows[0]?.id;
   if (!pipelineId) return null;
+
+  // targetStageName usa la semántica del Revenue pipeline (compartida por los
+  // handlers persona-first). El pipeline Partners no tiene esos nombres, así que
+  // se traduce al stage REAL del pipeline 6 (ia360ResolveStageName). El nombre
+  // LÓGICO original se conserva en requestedStageName para no romper disparadores
+  // semánticos — p. ej. el handoff n8n de "Requiere Alek", que NO es un stage del
+  // pipeline Partners pero sí un evento que debe seguir disparándose.
+  const requestedStageName = targetStageName;
+  const resolvedStageName = ia360ResolveStageName(pipelineName, requestedStageName);
 
   const { rows: stageRows } = await pool.query(
     `SELECT id, name, position, stage_type
        FROM coexistence.pipeline_stages
       WHERE pipeline_id = $1 AND name = $2
       LIMIT 1`,
-    [pipelineId, targetStageName]
+    [pipelineId, resolvedStageName]
   );
   const targetStage = stageRows[0];
   if (!targetStage) return null;
@@ -1222,7 +1242,9 @@ async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes 
       [pipelineId, targetStage.id, title, status, createdBy, record.wa_number, record.contact_number, contactName, nextNote, posRows[0].pos, createdBy]
     );
     // G-G: hot lead created directly at "Requiere Alek" → handoff to EspoCRM (priority high so a human Task is created).
-    if (targetStage.name === 'Requiere Alek') {
+    // G8: se evalúa sobre el nombre LÓGICO solicitado (no el stage resuelto), para
+    // que el handoff siga disparando aunque el pipeline Partners lo mapee a otro stage.
+    if (requestedStageName === 'Requiere Alek') {
       emitIa360N8nHandoff({
         record,
         eventType: 'requires_alek',
@@ -1256,7 +1278,7 @@ async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes 
   // G-G: deal just ENTERED "Requiere Alek" (was at a different stage) → handoff to EspoCRM, priority high (creates human Task).
   // Transition-detection = idempotent (only fires when crossing into the stage, not on every re-touch while already there).
   // No-dup-with-booking: the n8n handoff upserts Contact/Opportunity/Task by name, so a later meeting_confirmed updates the SAME records.
-  if (shouldMove && targetStage.name === 'Requiere Alek' && existing.current_stage_name !== 'Requiere Alek') {
+  if (shouldMove && requestedStageName === 'Requiere Alek' && existing.current_stage_name !== targetStage.name) {
     emitIa360N8nHandoff({
       record,
       eventType: 'requires_alek',
@@ -3501,7 +3523,10 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
   const optionKey = m[2];
   const found = findIa360SequenceFlow(sequenceId);
   if (!found) return false;
-  const { sequence } = found;
+  const { flow, sequence } = found;
+  // G8: aliado_socio / referido_bni → pipeline "Partners / Aliados (BNI)" (id 6);
+  // el resto de personas (cliente, beta, sponsor, …) sigue en el Revenue genérico.
+  const dealPipelineName = ia360PipelineForRelationship(flow?.relationshipContext);
   const option = (sequence.openerOptions?.options || [])
     .find(o => String(o.id).toLowerCase() === `seq_${sequenceId}:${optionKey}`);
   if (!option) return false;
@@ -3573,6 +3598,7 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
         targetStageName: 'Requiere Alek',
         titleSuffix: sequence.label,
         notes: `Respuesta al opener ${sequence.id}: pidió hablar directo con Alek.`,
+        pipelineName: dealPipelineName,
       }).catch(e => console.error('[ia360-seq] deal alek_directo:', e.message));
       await notifyOwner('Pidió que le escribas TÚ directo. Deal en "Requiere Alek".');
       return true;
@@ -3596,6 +3622,7 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
         targetStageName: 'Nutrición',
         titleSuffix: sequence.label,
         notes: `Respuesta al opener ${sequence.id}: ahora no. Pasa a nutrición suave.`,
+        pipelineName: dealPipelineName,
       }).catch(e => console.error('[ia360-seq] deal ahora_no:', e.message));
       await notifyOwner('Respondió que ahora no; queda en nutrición suave.');
       return true;
@@ -3624,6 +3651,7 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
         targetStageName: 'Agenda en proceso',
         titleSuffix: sequence.label,
         notes: `Respuesta al opener ${sequence.id}: pidió horarios. Deal a "Agenda en proceso".`,
+        pipelineName: dealPipelineName,
       }).catch(e => console.error('[ia360-seq] deal horarios:', e.message));
       await notifyOwner('Pidió horarios para una llamada contigo. Deal en "Agenda en proceso".');
       return true;
@@ -3642,6 +3670,7 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
         targetStageName: 'Intención detectada',
         titleSuffix: sequence.label,
         notes: `Respuesta al opener ${sequence.id}: "${option.title}". Paso 2 de la secuencia enviado.`,
+        pipelineName: dealPipelineName,
       }).catch(e => console.error('[ia360-seq] deal step2:', e.message));
       await notifyOwner(`Le envié el paso 2 de la secuencia. Next action sugerida: ${sequence.nextAction}`);
       return true;
@@ -3659,6 +3688,7 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
       targetStageName: 'Intención detectada',
       titleSuffix: sequence.label,
       notes: `Respuesta al opener ${sequence.id}: "${option.title}". Acuse enviado; siguiente paso con Alek.`,
+      pipelineName: dealPipelineName,
     }).catch(e => console.error('[ia360-seq] deal ack:', e.message));
     await notifyOwner(`Next action sugerida: ${sequence.nextAction}`);
     return true;
@@ -4771,12 +4801,14 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     return;
   }
 
-  // Avance del pipeline: el opener salió → "Diagnóstico enviado".
+  // Avance del pipeline: el opener salió → "Diagnóstico enviado" (genérico) o, para
+  // aliado/referido BNI, "Introducción enviada" del pipeline Partners (id 6).
   await syncIa360Deal({
     record: targetRecord,
     targetStageName: 'Diagnóstico enviado',
     titleSuffix: 'Opener aprobado',
     notes: `Opener de secuencia ${sequence.id} aprobado por Alek y enviado (${insideWindow ? 'texto, ventana abierta' : 'template'}). Stage → Diagnóstico enviado.`,
+    pipelineName: ia360PipelineForRelationship(flow?.relationshipContext),
   }).catch(e => console.error('[ia360-approve] syncIa360Deal:', e.message));
 
   await sendIa360DirectText({
@@ -4803,6 +4835,9 @@ async function handleIa360OwnerApproveManual({ record, targetContact }) {
     targetStageName: 'Requiere Alek',
     titleSuffix: 'Tomado manual',
     notes: 'Alek tomó el contacto manualmente desde la tarjeta de aprobación. Sin envío del bot.',
+    // G8: si el contacto es aliado/referido BNI, el takeover manual también cae en
+    // el pipeline Partners (id 6); si no hay relación partner, queda en el genérico.
+    pipelineName: ia360PipelineForRelationship(contact?.custom_fields?.relationship_context),
   }).catch(e => console.error('[ia360-approve] manual deal:', e.message));
   await sendIa360DirectText({
     record,
