@@ -79,15 +79,16 @@ DBURL=$(grep -E '^DATABASE_URL=' ~/stack/forgechat-poc/backend/.env | cut -d= -f
 docker exec -i forgecrm-db psql "$DBURL" -t -A -F'|' < /tmp/q.sql
 ```
 
-## Estado del trabajo — cierre 2026-06-15 (DESPLEGADO en producción, main)
+## Estado del trabajo — cierre 2026-06-16 (DESPLEGADO en producción, main)
+- **G10** P2 stages: `IA360_PARTNER_STAGE_MAP` ahora alcanza `Fit identificado` (pos 0) y `Diagnóstico compartido` (pos 3). Callsite Fit en `handleIa360OwnerSequenceChoice` (pre-envío, partner): cuando el owner elige secuencia para un aliado/referido, su deal nace en pos 0. Secuencias Blueprint/Propuesta = **stub inerte detrás de flag `IA360_PARTNER_BLUEPRINT` (default OFF)** con predicado `ia360PartnerBlueprintSendable` fail-closed (sin template aprobado → no envía; no hay ruta de envío todavía). Módulo `ia360DealRouting.js`, test `ia360PartnerBlueprintStages.test.js` (9/9). Bugfix `d8f68ee`: el callsite Fit re-scopea `record` a `targetContact` (si no, el deal se creaba bajo el número del owner — lo cazó la prueba viva). Verificado en vivo: deal del aliado en pos 0, y guard de no-regresión (deal avanzado no vuelve a pos 0).
 - **G6** botones de opener ("Sí, cuéntame"→Revenue OS paso2 / "Ahora no"→cierre).
 - **G5** circuit breaker de pago: detecta status `failed` 131042 en el webhook, alerta al owner (anti-spam), `skipRetry` en sendQueue; gate de pausa NO activado (deadlock).
 - **G8** ruteo: deals con `relationshipContext` `aliado_socio`/`referido_bni` → pipeline "Partners / Aliados (BNI)" (id 6), no al genérico. `syncIa360Deal(pipelineName=...)`, módulo `ia360DealRouting.js`.
 - **G9** comando owner `intro <contacto>: <quien>` (atajo `referido <contacto> de <quien>`) puebla `quien_intro` → desbloquea la secuencia de referido. Módulo `ia360ReferidoIntro.js`.
 
 ## Pendientes (backlog)
-- **P1 (test vivo):** Alek teclea `intro 5210000002102: <quien>` desde su WhatsApp → verificar `quien_intro` en `coexistence.contacts`.
-- **P2 (journey aliado):** faltan etapas **Blueprint** y **Propuesta** (templates nuevos en Meta + secuencias). Stages del pipeline 6 `Fit identificado` (pos 0) y `Diagnóstico compartido` (pos 3) no los setea ningún callsite.
+- **P1 (test vivo): ✅ HECHO 2026-06-16.** Verificado end-to-end por inyección de webhook firmado del owner: `quien_intro` se puebla en `coexistence.contacts`, y el efecto downstream queda probado con las funciones de producción — el gate COLD (`cold_send_missing_quien_intro`) y el HOT (`copy_blocked`, placeholder en draft) pasan de BLOCKED→CLEAR. Falta solo, si se quiere, que Alek lo teclee desde su WhatsApp real (la lógica ya está verificada).
+- **P2 (journey aliado): código HECHO (G10), falta lo externo.** Stages `Fit identificado`/`Diagnóstico compartido` ya cableados + stub Blueprint/Propuesta fail-closed desplegado. **Pendiente NO-código:** crear y aprobar en Meta los templates `ia360_partner_blueprint` y `ia360_partner_propuesta`, luego activar `IA360_PARTNER_BLUEPRINT=on` y cablear la ruta de envío real (que DEBE pasar por los gates `outside_window_template_not_approved`/`cold_template_status_check_failed`). Sin esos templates no se ofrece ni envía nada (por diseño).
 - **DEFERRED (optimización, NO ahora):** latencia del cerebro Brain v2 (nodo responder gpt-5 ~27s) se corta por timeout 30s de `callIa360Agent` (webhook.js ~L2669). Opción: async sin timeout. Nota: Hermes edita mensajes porque usa **Baileys/WhatsApp-Web** (`/opt/hermes-agent/.../whatsapp-bridge/bridge.js`), no la Cloud API; la Cloud API oficial NO edita salientes.
 - **BLOQUEO push:** `git push` del backend falla **403** (usuario `AlekZen` sin permiso a `Forgemind-git/ForgeChat`). Los commits están en `main` local del VPS; resolver permiso o pushear con la cuenta dueña.
 
