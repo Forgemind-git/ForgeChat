@@ -1,0 +1,1767 @@
+const { Router } = require('express');
+const pool = require('../db');
+const { decrypt } = require('../util/crypto');
+const { safeEqual, verifyMetaSignature } = require('../util/webhookSignature');
+const { evaluateTriggers, resumeAutomation } = require('../engine/automationEngine');
+const { markPending, MEDIA_TYPES } = require('../services/mediaDownloader');
+const { enqueueMediaDownload } = require('../queue/mediaQueue');
+const { resolveAccount, insertPendingRow } = require('../services/messageSender');
+const { enqueueSend } = require('../queue/sendQueue');
+const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
+
+const router = Router();
+
+/**
+ * Parse a Meta WhatsApp Cloud API webhook payload and extract message records.
+ * Handles: text, image, video, audio, document, location, sticker, contacts,
+ *          interactive (button_reply / list_reply), reaction, and status updates.
+ */
+// Normalize WhatsApp phone numbers to digits-only — strips '+', spaces, dashes.
+// Meta sometimes includes leading '+' in display_phone_number, sometimes not;
+// without this, the same conversation lands under two different wa_numbers and
+// shows as duplicate chat threads.
+function normalizePhone(s) {
+  if (!s) return s;
+  return String(s).replace(/\D/g, '');
+}
+
+function parseMetaPayload(body) {
+  const records = [];
+
+  if (!body || body.object !== 'whatsapp_business_account') {
+    return records;
+  }
+
+  const entries = body.entry || [];
+  for (const entry of entries) {
+    const changes = entry.changes || [];
+    for (const change of changes) {
+      const value = change.value || {};
+      if (value.messaging_product !== 'whatsapp') continue;
+
+      const metadata = value.metadata || {};
+      const phoneNumberId = metadata.phone_number_id || '';
+      const displayPhoneNumber = metadata.display_phone_number || '';
+
+      // Contact profile info (name mapping)
+      const contactProfiles = {};
+      (value.contacts || []).forEach(c => {
+        const waId = c.wa_id || '';
+        const name = c.profile?.name || '';
+        if (waId && name) contactProfiles[waId] = name;
+      });
+
+      // Parse a single message (shared logic for incoming and outgoing)
+      function parseMessage(msg, direction, waNum, contactNum) {
+        const record = {
+          message_id: msg.id || '',
+          phone_number_id: phoneNumberId,
+          wa_number: normalizePhone(waNum || displayPhoneNumber),
+          contact_number: normalizePhone(contactNum || ''),
+          to_number: normalizePhone(msg.to || ''),
+          direction,
+          message_type: msg.type || 'unknown',
+          message_body: null,
+          raw_payload: JSON.stringify(body),
+          media_url: null,
+          media_mime_type: null,
+          status: direction === 'incoming' ? 'received' : 'sent',
+          timestamp: msg.timestamp
+            ? new Date(parseInt(msg.timestamp, 10) * 1000).toISOString()
+            : new Date().toISOString(),
+          contact_name: contactProfiles[contactNum] || null,
+          // Quote-reply: when the customer replies to a specific message, Meta
+          // sends the quoted message's wamid here. Stored so we can render the
+          // quoted bubble above their reply.
+          context_message_id: msg.context?.id || null,
+        };
+
+        const type = msg.type;
+        if (type === 'text' && msg.text) {
+          record.message_body = msg.text.body || '';
+        } else if (type === 'image' && msg.image) {
+          record.message_body = msg.image.caption || '';
+          record.media_mime_type = msg.image.mime_type || null;
+          record.media_url = msg.image.id || null;
+        } else if (type === 'video' && msg.video) {
+          record.message_body = msg.video.caption || '';
+          record.media_mime_type = msg.video.mime_type || null;
+          record.media_url = msg.video.id || null;
+        } else if (type === 'audio' && msg.audio) {
+          record.message_body = 'Audio message';
+          record.media_mime_type = msg.audio.mime_type || null;
+          record.media_url = msg.audio.id || null;
+        } else if (type === 'voice' && msg.voice) {
+          record.message_body = 'Voice message';
+          record.media_mime_type = msg.voice.mime_type || null;
+          record.media_url = msg.voice.id || null;
+        } else if (type === 'document' && msg.document) {
+          record.message_body = msg.document.filename || '';
+          record.media_mime_type = msg.document.mime_type || null;
+          record.media_url = msg.document.id || null;
+          record.media_filename = msg.document.filename || null;
+        } else if (type === 'location' && msg.location) {
+          const lat = msg.location.latitude || '';
+          const lng = msg.location.longitude || '';
+          record.message_body = `Location: ${lat}, ${lng}`;
+        } else if (type === 'sticker' && msg.sticker) {
+          record.message_body = 'Sticker';
+          record.media_mime_type = msg.sticker.mime_type || null;
+          record.media_url = msg.sticker.id || null;
+        } else if (type === 'contacts' && msg.contacts) {
+          const names = msg.contacts.map(c => c.name?.formatted_name || c.name?.first_name || 'Contact').join(', ');
+          record.message_body = `Shared contact(s): ${names}`;
+        } else if (type === 'interactive' && msg.interactive) {
+          const reply = msg.interactive.button_reply || msg.interactive.list_reply || {};
+          record.message_body = reply.title || 'Interactive response';
+          record.message_type = 'interactive';
+        } else if (type === 'button' && msg.button) {
+          record.message_body = msg.button.text || msg.button.payload || 'Button response';
+          record.message_type = 'button';
+        } else if (type === 'reaction' && msg.reaction) {
+          record.message_body = `Reaction: ${msg.reaction.emoji || ''}`;
+          record.message_type = 'reaction';
+          // Capture the target message + emoji so the insert loop can attach it
+          // to that message instead of creating a standalone bubble. Empty emoji
+          // = the customer removed their reaction.
+          record.reaction = {
+            targetMessageId: msg.reaction.message_id || null,
+            emoji: msg.reaction.emoji || '',
+            from: msg.from || null,
+          };
+        } else if (type === 'order' && msg.order) {
+          record.message_body = 'Order received';
+        } else if (type === 'system' && msg.system) {
+          record.message_body = msg.system.body || 'System message';
+        } else if (type === 'unknown' && msg.errors) {
+          record.message_body = `Error: ${msg.errors[0]?.message || 'Unknown error'}`;
+          record.status = 'error';
+        }
+
+        return record;
+      }
+
+      // Incoming messages
+      const messages = value.messages || [];
+      for (const msg of messages) {
+        records.push(parseMessage(msg, 'incoming', displayPhoneNumber, msg.from));
+      }
+
+      // Outgoing message echoes (messages sent from the WhatsApp Business app)
+      const messageEchoes = value.message_echoes || [];
+      for (const msg of messageEchoes) {
+        // For echoes: from = business number, to = customer
+        records.push(parseMessage(msg, 'outgoing', displayPhoneNumber, msg.to));
+      }
+
+      // Status updates (delivered, read, sent)
+      const statuses = value.statuses || [];
+      for (const status of statuses) {
+        records.push({
+          message_id: status.id || '',
+          phone_number_id: phoneNumberId,
+          wa_number: normalizePhone(displayPhoneNumber),
+          contact_number: normalizePhone(status.recipient_id || ''),
+          to_number: normalizePhone(status.recipient_id || ''),
+          direction: 'outgoing',
+          message_type: 'status',
+          message_body: `Status: ${status.status || ''}`,
+          raw_payload: JSON.stringify(body),
+          media_url: null,
+          media_mime_type: null,
+          status: status.status || 'unknown',
+          timestamp: status.timestamp
+            ? new Date(parseInt(status.timestamp, 10) * 1000).toISOString()
+            : new Date().toISOString(),
+          contact_name: contactProfiles[status.recipient_id] || null,
+          // Include full status payload for trigger evaluation
+          conversation: status.conversation || null,
+          pricing: status.pricing || null,
+          errors: status.errors || null,
+        });
+      }
+    }
+  }
+
+  return records;
+}
+
+async function mergeContactIa360State({ waNumber, contactNumber, tags = [], customFields = {} }) {
+  if (!waNumber || !contactNumber) return;
+  await pool.query(
+    `INSERT INTO coexistence.contacts (wa_number, contact_number, tags, custom_fields, updated_at)
+     VALUES ($1, $2, $3::jsonb, $4::jsonb, NOW())
+     ON CONFLICT (wa_number, contact_number) DO UPDATE SET
+       tags = (
+         SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+         FROM jsonb_array_elements_text(
+           COALESCE(coexistence.contacts.tags, '[]'::jsonb) || EXCLUDED.tags
+         ) AS value
+       ),
+       custom_fields = COALESCE(coexistence.contacts.custom_fields, '{}'::jsonb) || EXCLUDED.custom_fields,
+       updated_at = NOW()`,
+    [waNumber, contactNumber, JSON.stringify(tags), JSON.stringify(customFields)]
+  );
+}
+
+async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes = '' }) {
+  if (!record || !record.wa_number || !record.contact_number || !targetStageName) return null;
+  const { rows: pipeRows } = await pool.query(
+    `SELECT id FROM coexistence.pipelines WHERE name = 'IA360 WhatsApp Revenue Pipeline' LIMIT 1`
+  );
+  const pipelineId = pipeRows[0]?.id;
+  if (!pipelineId) return null;
+
+  const { rows: stageRows } = await pool.query(
+    `SELECT id, name, position, stage_type
+       FROM coexistence.pipeline_stages
+      WHERE pipeline_id = $1 AND name = $2
+      LIMIT 1`,
+    [pipelineId, targetStageName]
+  );
+  const targetStage = stageRows[0];
+  if (!targetStage) return null;
+
+  const { rows: userRows } = await pool.query(
+    `SELECT id FROM coexistence.forgecrm_users WHERE role='admin' ORDER BY id LIMIT 1`
+  );
+  const createdBy = userRows[0]?.id || null;
+
+  const { rows: contactRows } = await pool.query(
+    `SELECT COALESCE(name, profile_name, $3) AS name
+       FROM coexistence.contacts
+      WHERE wa_number=$1 AND contact_number=$2
+      LIMIT 1`,
+    [record.wa_number, record.contact_number, record.contact_number]
+  );
+  const contactName = contactRows[0]?.name || record.contact_number;
+  const title = `IA360 · ${contactName}${titleSuffix ? ' · ' + titleSuffix : ''}`;
+  const nextNote = `[${new Date().toISOString()}] ${notes || `Stage → ${targetStageName}; input=${record.message_body || ''}`}`;
+
+  const { rows: existingRows } = await pool.query(
+    `SELECT d.*, s.position AS current_stage_position, s.name AS current_stage_name
+       FROM coexistence.deals d
+       JOIN coexistence.pipeline_stages s ON s.id=d.stage_id
+      WHERE d.pipeline_id=$1 AND d.contact_wa_number=$2 AND d.contact_number=$3
+      ORDER BY d.updated_at DESC NULLS LAST, d.id DESC
+      LIMIT 1`,
+    [pipelineId, record.wa_number, record.contact_number]
+  );
+
+  if (existingRows.length === 0) {
+    const { rows: posRows } = await pool.query(
+      `SELECT COALESCE(MAX(position),-1)+1 AS pos FROM coexistence.deals WHERE stage_id=$1`,
+      [targetStage.id]
+    );
+    const status = targetStage.stage_type === 'won' ? 'won' : targetStage.stage_type === 'lost' ? 'lost' : 'open';
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.deals
+         (pipeline_id, stage_id, title, value, currency, status, assigned_user_id,
+          contact_wa_number, contact_number, contact_name, notes, position, created_by,
+          won_at, lost_at)
+       VALUES ($1,$2,$3,0,'MXN',$4,$5,$6,$7,$8,$9,$10,$11,
+               ${status === 'won' ? 'NOW()' : 'NULL'}, ${status === 'lost' ? 'NOW()' : 'NULL'})
+       RETURNING id`,
+      [pipelineId, targetStage.id, title, status, createdBy, record.wa_number, record.contact_number, contactName, nextNote, posRows[0].pos, createdBy]
+    );
+    // G-G: hot lead created directly at "Requiere Alek" → handoff to EspoCRM (priority high so a human Task is created).
+    if (targetStage.name === 'Requiere Alek') {
+      emitIa360N8nHandoff({
+        record,
+        eventType: 'requires_alek',
+        targetStage: 'Requiere Alek',
+        priority: 'high',
+        summary: `Lead caliente: pidió/marcó prioridad alta (entró a "Requiere Alek") sin reunión agendada aún. Crear tarea humana y preparar contacto. Última respuesta: ${record.message_body || ''}.`,
+      }).catch(e => console.error('[ia360-n8n] requires_alek handoff (new):', e.message));
+    }
+    return rows[0];
+  }
+
+  const existing = existingRows[0];
+  const forceMoveStages = ['Agenda en proceso', 'Reunión agendada', 'Requiere Alek', 'Ganado', 'Perdido / no fit', 'Nutrición'];
+  const shouldMove = forceMoveStages.includes(targetStage.name) || Number(targetStage.position) >= Number(existing.current_stage_position);
+  const finalStageId = shouldMove ? targetStage.id : existing.stage_id;
+  const finalStatus = targetStage.stage_type === 'won' ? 'won' : targetStage.stage_type === 'lost' ? 'lost' : 'open';
+  const finalNotes = `${existing.notes || ''}${existing.notes ? '\n' : ''}${nextNote}`;
+  await pool.query(
+    `UPDATE coexistence.deals
+        SET stage_id = $1,
+            status = $2,
+            title = $3,
+            contact_name = $4,
+            notes = $5,
+            updated_at = NOW(),
+            won_at = CASE WHEN $2='won' THEN COALESCE(won_at, NOW()) ELSE NULL END,
+            lost_at = CASE WHEN $2='lost' THEN COALESCE(lost_at, NOW()) ELSE NULL END
+      WHERE id = $6`,
+    [finalStageId, shouldMove ? finalStatus : existing.status, title, contactName, finalNotes, existing.id]
+  );
+  // G-G: deal just ENTERED "Requiere Alek" (was at a different stage) → handoff to EspoCRM, priority high (creates human Task).
+  // Transition-detection = idempotent (only fires when crossing into the stage, not on every re-touch while already there).
+  // No-dup-with-booking: the n8n handoff upserts Contact/Opportunity/Task by name, so a later meeting_confirmed updates the SAME records.
+  if (shouldMove && targetStage.name === 'Requiere Alek' && existing.current_stage_name !== 'Requiere Alek') {
+    emitIa360N8nHandoff({
+      record,
+      eventType: 'requires_alek',
+      targetStage: 'Requiere Alek',
+      priority: 'high',
+      summary: `Lead caliente: entró a "Requiere Alek" (desde "${existing.current_stage_name}") sin reunión agendada aún. Crear tarea humana y preparar contacto. Última respuesta: ${record.message_body || ''}.`,
+    }).catch(e => console.error('[ia360-n8n] requires_alek handoff (move):', e.message));
+  }
+  return { id: existing.id, moved: shouldMove };
+}
+
+async function resolveIa360Outbound(record) {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM coexistence.chat_history
+      WHERE direction='outgoing'
+        AND contact_number=$1
+        AND template_meta->>'ia360_handler_for'=$2
+      LIMIT 1`,
+    [record.contact_number, record.message_id]
+  );
+  if (rows.length > 0) return { duplicate: true };
+
+  const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
+  if (error || !account) {
+    console.error('[ia360-lite] account resolution failed:', error || 'unknown');
+    return { error: error || 'unknown' };
+  }
+  return { account };
+}
+
+async function enqueueIa360Interactive({ record, label, messageBody, interactive }) {
+  const resolved = await resolveIa360Outbound(record);
+  if (resolved.duplicate || resolved.error) return false;
+  const { account } = resolved;
+
+  const localId = await insertPendingRow({
+    account,
+    toNumber: record.contact_number,
+    messageType: 'interactive',
+    messageBody,
+    templateMeta: {
+      ux: 'ia360_lite',
+      label,
+      ia360_handler_for: record.message_id,
+      source: 'webhook_interactive_reply',
+    },
+  });
+  await enqueueSend({
+    kind: 'interactive',
+    accountId: account.id,
+    to: record.contact_number,
+    localMessageId: localId,
+    payload: { interactive },
+  });
+  return true;
+}
+
+async function enqueueIa360Text({ record, label, body }) {
+  const resolved = await resolveIa360Outbound(record);
+  if (resolved.duplicate || resolved.error) return false;
+  const { account } = resolved;
+
+  const localId = await insertPendingRow({
+    account,
+    toNumber: record.contact_number,
+    messageType: 'text',
+    messageBody: body,
+    templateMeta: {
+      ux: 'ia360_100m',
+      label,
+      ia360_handler_for: record.message_id,
+      source: 'webhook_terminal_handoff',
+    },
+  });
+  await enqueueSend({
+    kind: 'text',
+    accountId: account.id,
+    to: record.contact_number,
+    localMessageId: localId,
+    payload: { body, previewUrl: false },
+  });
+  return true;
+}
+
+async function emitIa360N8nHandoff({ record, eventType, targetStage, summary, priority = 'normal' }) {
+  const url = process.env.N8N_IA360_HANDOFF_WEBHOOK_URL;
+  if (!url) return false;
+  try {
+    const payload = {
+      source: 'forgechat-ia360-webhook',
+      eventType,
+      priority,
+      targetStage,
+      summary,
+      occurredAt: new Date().toISOString(),
+      contact: {
+        waNumber: record.wa_number,
+        contactNumber: record.contact_number,
+        contactName: record.contact_name || null,
+      },
+      trigger: {
+        messageId: record.message_id,
+        messageType: record.message_type,
+        messageBody: record.message_body,
+        timestamp: record.timestamp,
+      },
+      recommendedActions: [
+        'upsert_espocrm_contact',
+        'create_human_task',
+        'prepare_call_context',
+        'optionally_create_zoom_or_calendar_event',
+      ],
+    };
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      console.error('[ia360-n8n] handoff failed:', res.status, await res.text().catch(() => ''));
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[ia360-n8n] handoff error:', err.message);
+    return false;
+  }
+}
+
+async function requestIa360Availability({ record, day }) {
+  const url = process.env.N8N_IA360_AVAILABILITY_WEBHOOK_URL;
+  if (!url) return null;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'forgechat-ia360-webhook',
+        day,
+        workStartHour: 10,
+        workEndHour: 18,
+        slotMinutes: 60,
+        contact: {
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          contactName: record.contact_name || null,
+        },
+      }),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      console.error('[ia360-calendar] availability failed:', res.status, text);
+      return null;
+    }
+    return JSON.parse(text);
+  } catch (err) {
+    console.error('[ia360-calendar] availability error:', err.message);
+    return null;
+  }
+}
+
+function parseIa360SlotId(replyId) {
+  const m = String(replyId || '').match(/^slot_(\d{8})t(\d{6})z$/i);
+  if (!m) return null;
+  const [, ymd, hms] = m;
+  const start = `${ymd.slice(0,4)}-${ymd.slice(4,6)}-${ymd.slice(6,8)}T${hms.slice(0,2)}:${hms.slice(2,4)}:${hms.slice(4,6)}.000Z`;
+  const end = new Date(new Date(start).getTime() + 60 * 60 * 1000).toISOString();
+  return { start, end };
+}
+
+async function bookIa360Slot({ record, start, end }) {
+  const url = process.env.N8N_IA360_BOOK_WEBHOOK_URL;
+  if (!url) return null;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'forgechat-ia360-webhook',
+        start,
+        end,
+        contact: {
+          waNumber: record.wa_number,
+          contactNumber: record.contact_number,
+          contactName: record.contact_name || 'WhatsApp IA360',
+        },
+      }),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      console.error('[ia360-calendar] book failed:', res.status, text);
+      return { ok: false, reason: 'book_failed' };
+    }
+    return JSON.parse(text || '{}');
+  } catch (err) {
+    console.error('[ia360-calendar] book error:', err.message);
+    return { ok: false, reason: 'book_error' };
+  }
+}
+
+function getInteractiveReplyId(record) {
+  try {
+    const payload = typeof record.raw_payload === 'string' ? JSON.parse(record.raw_payload) : record.raw_payload;
+    const msg = payload?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const interactive = msg?.interactive;
+    if (interactive) {
+      if (interactive.button_reply?.id) return String(interactive.button_reply.id).trim().toLowerCase();
+      if (interactive.list_reply?.id) return String(interactive.list_reply.id).trim().toLowerCase();
+    }
+    if (msg?.button?.payload) return String(msg.button.payload).trim().toLowerCase();
+    if (msg?.button?.text) return String(msg.button.text).trim().toLowerCase();
+  } catch (_) {
+    // ignore malformed/non-JSON payloads; fallback to visible title
+  }
+  return '';
+}
+
+
+// ── IA360 free-text AI agent (G-B fix) ───────────────────────────────────────
+// When a prospect with an ACTIVE, NON-TERMINAL IA360 deal sends FREE TEXT (not a
+// button), the button state machine no-ops. Instead of silence, hand off to the
+// n8n AI agent which classifies intent + extracts a date, then ForgeChat acts:
+//   - offer_slots: query REAL Calendar freebusy for the agent's date, send slots
+//   - optout:      send reply, move deal to "Perdido / no fit"
+//   - else:        send the agent's coherent reply (and advance pain if asked)
+// Fire-and-forget from the inbound loop so it never blocks the Meta 200 ack.
+async function getActiveNonTerminalIa360Deal(record) {
+  const { rows: pipeRows } = await pool.query(
+    `SELECT id FROM coexistence.pipelines WHERE name = 'IA360 WhatsApp Revenue Pipeline' LIMIT 1`
+  );
+  const pipelineId = pipeRows[0]?.id;
+  if (!pipelineId) return null;
+  const { rows } = await pool.query(
+    `SELECT d.id, s.name AS stage_name, s.stage_type
+       FROM coexistence.deals d
+       JOIN coexistence.pipeline_stages s ON s.id = d.stage_id
+      WHERE d.pipeline_id = $1 AND d.contact_wa_number = $2 AND d.contact_number = $3
+      ORDER BY d.updated_at DESC NULLS LAST, d.id DESC
+      LIMIT 1`,
+    [pipelineId, record.wa_number, record.contact_number]
+  );
+  const deal = rows[0];
+  if (!deal) return null;
+  const txt = String(record.message_body || '').toLowerCase();
+  // Reschedule intent: a prospect with an already-booked meeting who wants to move it
+  // SHOULD reach the agent (we explicitly invite "escríbeme por aquí" in the confirmation).
+  const wantsReschedule = /reagend|reprogram|mover|mu[eé]v|cambi|otro d[ií]a|otra hora|otro horario|otra fecha|posponer|recorr|adelantar|cancel|anul|ya no (podr|voy|asist)/.test(txt);
+  // Always-terminal = won/lost → never auto-answer.
+  if (deal.stage_type === 'won' || deal.stage_type === 'lost' || deal.stage_name === 'Ganado' || deal.stage_name === 'Perdido / no fit') return null;
+  // "Reunión agendada" only passes for reschedule intent (avoids spurious re-fire on every "gracias").
+  if (deal.stage_name === 'Reunión agendada' && !wantsReschedule) return null;
+  return deal;
+}
+
+async function callIa360Agent({ record, stageName }) {
+  const url = process.env.N8N_IA360_AGENT_WEBHOOK_URL;
+  if (!url) return null;
+  // Recent conversation for context (last 8 messages).
+  const { rows: hist } = await pool.query(
+    `SELECT direction AS dir, message_body AS body
+       FROM coexistence.chat_history
+      WHERE wa_number = $1 AND contact_number = $2
+      ORDER BY timestamp DESC LIMIT 8`,
+    [record.wa_number, record.contact_number]
+  );
+  const history = hist.reverse().map(h => ({ dir: h.dir, body: h.body }));
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'forgechat-ia360-webhook',
+        text: record.message_body || '',
+        stage: stageName,
+        history,
+      }),
+    });
+    if (!res.ok) { console.error('[ia360-agent] failed:', res.status); return null; }
+    return await res.json();
+  } catch (err) {
+    console.error('[ia360-agent] error:', err.message);
+    return null;
+  }
+}
+
+async function handleIa360FreeText(record) {
+  try {
+    if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return;
+    if (!record.message_body || !String(record.message_body).trim()) return;
+    const deal = await getActiveNonTerminalIa360Deal(record);
+    if (!deal) return; // only inside an active, non-terminal IA360 funnel
+    const agent = await callIa360Agent({ record, stageName: deal.stage_name });
+    if (!agent || !agent.reply) {
+      // Agent unavailable (n8n down / webhook unregistered) → holding reply, never silence.
+      await enqueueIa360Text({ record, label: 'ia360_ai_holding', body: 'Déjame revisar esto y te confirmo en un momento.' }).catch(() => {});
+      return;
+    }
+
+    // RESCHEDULE/CANCEL on an ALREADY-BOOKED meeting (deal at "Reunión agendada"):
+    // do NOT auto-offer slots → tapping one would CREATE a 2nd meeting without
+    // cancelling the existing one (double-book). True update needs the stored
+    // calendarEventId/zoomMeetingId per contact (not persisted yet). Cheap, coherent
+    // guard: acknowledge + hand off to Alek (Task), let him move/cancel the real event.
+    if (deal.stage_name === 'Reunión agendada') {
+      const isCancel = /cancel|anul|ya no (podr|voy|asist)/i.test(String(record.message_body || ''));
+      await enqueueIa360Text({
+        record,
+        label: isCancel ? 'ia360_ai_cancel_request' : 'ia360_ai_reschedule_request',
+        body: isCancel
+          ? 'Entendido, le aviso a Alek para cancelar la reunión. Te confirma en breve por aquí.'
+          : 'Va, le paso a Alek que quieres mover la reunión. Él te confirma el nuevo horario por aquí en un momento.',
+      });
+      emitIa360N8nHandoff({
+        record,
+        eventType: isCancel ? 'meeting_cancel_requested' : 'meeting_reschedule_requested',
+        targetStage: 'Reunión agendada',
+        priority: 'high',
+        summary: `El contacto pidió ${isCancel ? 'CANCELAR' : 'REPROGRAMAR'} su reunión ya agendada. Mensaje: "${record.message_body || ''}". ${agent.date ? 'Fecha sugerida: ' + agent.date + '. ' : ''}Acción humana: ${isCancel ? 'cancelar el evento Calendar/Zoom existente' : 'mover el evento Calendar/Zoom existente a la nueva fecha (NO crear uno nuevo)'} y confirmar al contacto.`,
+      }).catch(e => console.error('[ia360-n8n] reschedule/cancel handoff:', e.message));
+      return;
+    }
+
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'texto-libre-ia'],
+      customFields: {
+        ia360_ultima_respuesta: record.message_body,
+        ultimo_cta_enviado: 'ia360_ai_agent_' + (agent.action || 'reply'),
+        ...(agent.extracted && agent.extracted.area_operacion ? { area_operacion: agent.extracted.area_operacion } : {}),
+      },
+    });
+
+    // OPT-OUT → reply + move to lost.
+    if (agent.action === 'optout' || agent.intent === 'optout') {
+      await syncIa360Deal({ record, targetStageName: 'Perdido / no fit', titleSuffix: 'Opt-out (texto libre)', notes: `Opt-out por texto libre: ${record.message_body}` });
+      await enqueueIa360Text({ record, label: 'ia360_ai_optout', body: agent.reply });
+      return;
+    }
+
+    // OFFER SLOTS → query REAL availability for the agent's date, send list.
+    if ((agent.action === 'offer_slots' || agent.action === 'book') && agent.date) {
+      await syncIa360Deal({
+        record,
+        targetStageName: getIa360StageForEvent('agenda_preference_selected', 'Agenda en proceso'),
+        titleSuffix: 'Agenda (texto libre)',
+        notes: `Solicitó agenda por texto libre (${record.message_body}); fecha interpretada ${agent.date}; se consulta Calendar real`,
+      });
+      // Single outbound only (resolveIa360Outbound dedups per inbound message_id):
+      // fold the agent reply into the slot-list body below instead of a separate text.
+      // Availability node accepts an explicit ISO `date` override (NOT `day`).
+      const url = process.env.N8N_IA360_AVAILABILITY_WEBHOOK_URL;
+      let availability = null;
+      if (url) {
+        try {
+          const r = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ source: 'forgechat-ia360-webhook', date: agent.date, workStartHour: 10, workEndHour: 18, slotMinutes: 60 }),
+          });
+          availability = r.ok ? await r.json() : null;
+        } catch (e) { console.error('[ia360-agent] availability error:', e.message); }
+      }
+      const slots = (availability && availability.slots) || [];
+      if (slots.length === 0) {
+        await enqueueIa360Text({ record, label: 'ia360_ai_no_slots', body: 'Revisé la agenda real de Alek para ese día y no hay espacios de 1 hora libres. ¿Quieres que te ofrezca otro día?' });
+        return;
+      }
+      await enqueueIa360Interactive({
+        record,
+        label: 'ia360_ai_available_slots',
+        messageBody: `IA360: horarios disponibles ${availability.date}`,
+        interactive: {
+          type: 'list',
+          header: { type: 'text', text: 'Horarios libres' },
+          body: { text: (agent.reply ? agent.reply + String.fromCharCode(10) + String.fromCharCode(10) : '') + `Estos espacios de 1 hora estan libres (${availability.date}, hora CDMX). Elige uno y lo confirmo con Calendar + Zoom.` },
+          footer: { text: 'Se revalida antes de reservar' },
+          action: {
+            button: 'Elegir hora',
+            sections: [{ title: 'Disponibles', rows: slots.slice(0, 10).map((slot) => ({ id: slot.id, title: slot.title, description: slot.description })) }],
+          },
+        },
+      });
+      return;
+    }
+
+    // DEFAULT → just send the agent's coherent reply (ask_pain / provide_info / smalltalk / other).
+    if (agent.action === 'advance_pain' || agent.intent === 'ask_pain') {
+      await syncIa360Deal({ record, targetStageName: 'Dolor calificado', titleSuffix: 'Dolor (texto libre)', notes: `Dolor por texto libre: ${record.message_body}${agent.extracted && agent.extracted.area_operacion ? ' (área: ' + agent.extracted.area_operacion + ')' : ''}` });
+    }
+    await enqueueIa360Text({ record, label: 'ia360_ai_reply', body: agent.reply });
+  } catch (err) {
+    console.error('[ia360-agent] handleIa360FreeText error:', err.message);
+  }
+}
+
+async function handleIa360LiteInteractive(record) {
+  if (!record || record.direction !== 'incoming' || !['interactive', 'button'].includes(record.message_type)) return;
+  const answer = String(record.message_body || '').trim().toLowerCase();
+  const replyId = getInteractiveReplyId(record);
+
+  // IA360 100M WhatsApp prospecting flow: coherent stage machine for approved templates.
+  const reply100m = {
+    'diagnóstico rápido': {
+      stage: 'Intención detectada', tag: 'problema-reconocido', title: 'Diagnóstico rápido',
+      body: 'Perfecto. Para que esto no sea genérico: ¿cuál de estos síntomas te cuesta más dinero o tiempo hoy?',
+      buttons: [
+        { id: '100m_capture_manual', title: 'Captura manual' },
+        { id: '100m_reports_late', title: 'Reportes tarde' },
+        { id: '100m_sales_followup', title: 'Seguimiento ventas' },
+      ],
+    },
+    'ver mapa 30-60-90': {
+      stage: 'Diagnóstico enviado', tag: 'mapa-solicitado', title: 'Mapa 30-60-90',
+      body: 'Va. El mapa 30-60-90 necesita ubicar primero la fuga principal: operación manual, datos tardíos o seguimiento comercial. ¿Cuál quieres atacar primero?',
+      buttons: [
+        { id: '100m_capture_manual', title: 'Captura manual' },
+        { id: '100m_reports_late', title: 'Reportes tarde' },
+        { id: '100m_sales_followup', title: 'Seguimiento ventas' },
+      ],
+    },
+    'no ahora': {
+      stage: 'Nutrición', tag: 'nutricion-suave', title: 'No ahora',
+      body: 'Perfecto, no te saturo. Te dejo una regla simple: si una tarea se repite, depende de Excel/WhatsApp o retrasa decisiones, probablemente hay oportunidad IA360.',
+      buttons: [
+        { id: '100m_apply_later', title: 'Aplicarlo' },
+        { id: '100m_more_later', title: 'Más adelante' },
+        { id: '100m_optout', title: 'Baja' },
+      ],
+    },
+    'captura manual': {
+      stage: 'Dolor calificado', tag: 'dolor-captura-manual', title: 'Captura manual',
+      body: 'Ese suele ser quick win: reducir doble captura y pasar datos entre WhatsApp, CRM, ERP o Excel sin depender de copiar/pegar. ¿Qué mecanismo quieres ver?',
+      buttons: [
+        { id: '100m_wa_crm', title: 'WhatsApp → CRM' },
+        { id: '100m_erp_bi', title: 'ERP → BI' },
+        { id: '100m_agent_followup', title: 'Agente follow-up' },
+      ],
+    },
+    'reportes tarde': {
+      stage: 'Dolor calificado', tag: 'dolor-reportes-tarde', title: 'Reportes tarde',
+      body: 'Aquí el valor está en convertir datos operativos en alertas y tablero semanal, no en esperar reportes manuales. ¿Qué ejemplo quieres ver?',
+      buttons: [
+        { id: '100m_erp_bi', title: 'ERP → BI' },
+        { id: '100m_wa_crm', title: 'WhatsApp → CRM' },
+        { id: '100m_agent_followup', title: 'Agente follow-up' },
+      ],
+    },
+    'seguimiento ventas': {
+      stage: 'Dolor calificado', tag: 'dolor-seguimiento-ventas', title: 'Seguimiento ventas',
+      body: 'Ahí IA360 puede clasificar intención, mover pipeline y crear tareas humanas antes de que se enfríe el lead. ¿Qué mecanismo quieres ver?',
+      buttons: [
+        { id: '100m_wa_crm', title: 'WhatsApp → CRM' },
+        { id: '100m_agent_followup', title: 'Agente follow-up' },
+        { id: '100m_erp_bi', title: 'ERP → BI' },
+      ],
+    },
+    'whatsapp → crm': {
+      stage: 'Propuesta / siguiente paso', tag: 'mecanismo-whatsapp-crm', title: 'WhatsApp → CRM',
+      body: 'Flujo: mensaje entra → se clasifica intención → aplica tags/campos → mueve deal → si hay alta intención crea tarea humana. ¿Qué hacemos con este caso?',
+      buttons: [
+        { id: '100m_want_map', title: 'Quiero mapa' },
+        { id: '100m_schedule', title: 'Agendar' },
+        { id: '100m_see_example', title: 'Ver ejemplo' },
+      ],
+    },
+    'erp → bi': {
+      stage: 'Propuesta / siguiente paso', tag: 'mecanismo-erp-bi', title: 'ERP → BI',
+      body: 'Flujo: ERP/CRM/Excel → datos normalizados → dashboard ejecutivo → alertas → decisiones semanales. ¿Qué hacemos con este caso?',
+      buttons: [
+        { id: '100m_want_map', title: 'Quiero mapa' },
+        { id: '100m_schedule', title: 'Agendar' },
+        { id: '100m_see_example', title: 'Ver ejemplo' },
+      ],
+    },
+    'agente follow-up': {
+      stage: 'Propuesta / siguiente paso', tag: 'mecanismo-agentic-followup', title: 'Agente follow-up',
+      body: 'Flujo: agente detecta intención, prepara respuesta, actualiza CRM y escala al humano antes de comprometer algo sensible. ¿Qué hacemos con este caso?',
+      buttons: [
+        { id: '100m_want_map', title: 'Quiero mapa' },
+        { id: '100m_schedule', title: 'Agendar' },
+        { id: '100m_see_example', title: 'Ver ejemplo' },
+      ],
+    },
+    'quiero mapa': {
+      stage: 'Diagnóstico enviado', tag: 'mapa-30-60-90-solicitado', title: 'Quiero mapa',
+      body: 'Perfecto. Para armar mapa sin humo necesito prioridad real: ¿esto urge, estás explorando o no es prioridad todavía?',
+      buttons: [
+        { id: '100m_urgent', title: 'Sí, urgente' },
+        { id: '100m_exploring', title: 'Estoy explorando' },
+        { id: '100m_not_priority', title: 'No prioritario' },
+      ],
+    },
+    'ver ejemplo': {
+      stage: 'Propuesta / siguiente paso', tag: 'ejemplo-solicitado', title: 'Ver ejemplo',
+      body: 'Ejemplo corto: WhatsApp detecta interés, ForgeChat etiqueta y mueve pipeline, n8n crea tarea en CRM, y Alek recibe resumen antes de hablar con el prospecto.',
+      buttons: [
+        { id: '100m_want_map', title: 'Quiero mapa' },
+        { id: '100m_schedule', title: 'Agendar' },
+        { id: '100m_urgent', title: 'Sí, urgente' },
+      ],
+    },
+    'sí, urgente': {
+      stage: 'Requiere Alek', tag: 'hot-lead', title: 'Sí, urgente',
+      body: 'Marcado como prioridad alta. Siguiente paso sensato: Alek revisa contexto y propone llamada con objetivo claro, no demo genérica.',
+      buttons: [
+        { id: 'sched_today', title: 'Hoy' },
+        { id: 'sched_tomorrow', title: 'Mañana' },
+        { id: 'sched_week', title: 'Esta semana' },
+      ],
+    },
+    'estoy explorando': {
+      stage: 'Nutrición', tag: 'explorando', title: 'Estoy explorando',
+      body: 'Bien. Te mantengo en modo exploración: ejemplos concretos, sin presión. Cuando veas un caso aplicable, lo convertimos en mapa.',
+      buttons: [
+        { id: '100m_wa_crm', title: 'WhatsApp → CRM' },
+        { id: '100m_erp_bi', title: 'ERP → BI' },
+        { id: '100m_schedule', title: 'Agendar' },
+      ],
+    },
+    'no prioritario': {
+      stage: 'Nutrición', tag: 'no-prioritario', title: 'No prioritario',
+      body: 'Perfecto. Lo dejo en nutrición suave. Si después detectas doble captura, reportes tarde o leads sin seguimiento, ahí sí vale la pena retomarlo.',
+      buttons: [
+        { id: '100m_more_later', title: 'Más adelante' },
+        { id: '100m_apply_later', title: 'Aplicarlo' },
+        { id: '100m_optout', title: 'Baja' },
+      ],
+    },
+    'más adelante': {
+      stage: 'Nutrición', tag: 'nutricion-suave', title: 'Más adelante',
+      body: 'Listo. Queda para más adelante; no avanzo a venta. Te mandaré solo recursos de criterio/diagnóstico cuando tenga sentido.',
+      buttons: [
+        { id: '100m_apply_later', title: 'Aplicarlo' },
+        { id: '100m_optout', title: 'Baja' },
+      ],
+    },
+    'baja': {
+      stage: 'Perdido / no fit', tag: 'no-contactar', title: 'Baja',
+      body: 'Entendido. Marco este contacto como no contactar para esta secuencia.',
+      buttons: [],
+    },
+  };
+
+  const key100mById = {
+    '100m_diagnostico_rapido': 'diagnóstico rápido',
+    '100m_capture_manual': 'captura manual',
+    '100m_reports_late': 'reportes tarde',
+    '100m_sales_followup': 'seguimiento ventas',
+    '100m_wa_crm': 'whatsapp → crm',
+    '100m_erp_bi': 'erp → bi',
+    '100m_agent_followup': 'agente follow-up',
+    '100m_want_map': 'quiero mapa',
+    '100m_schedule': 'agendar',
+    '100m_see_example': 'ver ejemplo',
+    '100m_urgent': 'sí, urgente',
+    '100m_exploring': 'estoy explorando',
+    '100m_not_priority': 'no prioritario',
+    '100m_more_later': 'más adelante',
+    '100m_apply_later': 'aplicarlo',
+    '100m_optout': 'baja',
+  };
+  const flow100m = reply100m[key100mById[replyId]] || reply100m[replyId] || reply100m[answer];
+  if (flow100m) {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'prospecting-100m', flow100m.tag],
+      customFields: {
+        campana_ia360: 'IA360 100M WhatsApp prospecting',
+        fuente_origen: 'whatsapp-template-100m',
+        ia360_ultima_respuesta: record.message_body,
+        ultimo_cta_enviado: `ia360_100m_${flow100m.tag}`,
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: flow100m.stage,
+      titleSuffix: flow100m.title,
+      notes: `100M flow: ${record.message_body} → ${flow100m.stage}`,
+    });
+    // G-G: hot lead que alcanza "Requiere Alek" debe surgir en EspoCRM aunque
+    // nunca se autoagende (si no, el lead mas caliente es invisible para Alek).
+    // Idempotente: el handoff n8n hace upsert de Contact/Opportunity/Task por nombre.
+    if (flow100m.stage === 'Requiere Alek') {
+      emitIa360N8nHandoff({
+        record,
+        eventType: 'hot_lead_requires_alek',
+        targetStage: 'Requiere Alek',
+        priority: 'high',
+        summary: `Hot lead IA360 (${flow100m.title}): "${record.message_body}". Crear/actualizar Contact + Opportunity (Qualification) + Task ALTA; preparar contexto para que Alek contacte de inmediato.`,
+      }).catch(e => console.error('[ia360-n8n] hot-lead handoff:', e.message));
+    }
+    if (flow100m.buttons.length > 0) {
+      await enqueueIa360Interactive({
+        record,
+        label: `ia360_100m_${flow100m.tag}`,
+        messageBody: `IA360 100M: ${flow100m.title}`,
+        interactive: {
+          type: 'button',
+          header: { type: 'text', text: flow100m.title },
+          body: { text: flow100m.body },
+          footer: { text: 'IA360 · micro-paso' },
+          action: { buttons: flow100m.buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } })) },
+        },
+      });
+    } else {
+      await enqueueIa360Interactive({
+        record,
+        label: `ia360_100m_${flow100m.tag}`,
+        messageBody: `IA360 100M: ${flow100m.title}`,
+        interactive: {
+          type: 'button',
+          header: { type: 'text', text: flow100m.title },
+          body: { text: flow100m.body },
+          footer: { text: 'IA360' },
+          action: { buttons: [{ type: 'reply', reply: { id: '100m_more_later', title: 'Más adelante' } }] },
+        },
+      });
+    }
+    return;
+  }
+
+  if (answer === 'diagnóstico' || answer === 'diagnostico') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'interes-og4-diagnostico'],
+      customFields: {
+        campana_ia360: 'IA360 WhatsApp lite flow',
+        fuente_origen: 'whatsapp-interactive',
+        ultimo_cta_enviado: 'ia360_lite_inicio',
+        servicio_recomendado: 'Diagnóstico IA360',
+        ia360_ultima_respuesta: 'Diagnóstico',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: 'Intención detectada',
+      titleSuffix: 'Diagnóstico',
+      notes: `Input: ${record.message_body}; intención inicial detectada`,
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_area_after_diagnostico',
+      messageBody: 'IA360: elegir área de dolor',
+      interactive: {
+        type: 'list',
+        header: { type: 'text', text: 'Área de dolor' },
+        body: { text: 'Va. Para aterrizarlo rápido: ¿dónde duele más hoy?' },
+        footer: { text: 'Elige una opción' },
+        action: {
+          button: 'Elegir área',
+          sections: [{
+            title: 'Áreas frecuentes',
+            rows: [
+              { id: 'pain_sales', title: 'Ventas', description: 'Seguimiento, leads, cierre' },
+              { id: 'pain_ops', title: 'Operación', description: 'Procesos, doble captura' },
+              { id: 'pain_bi', title: 'Datos / BI', description: 'Reportes y decisiones tardías' },
+              { id: 'pain_erp', title: 'ERP / CRM', description: 'Integraciones y visibilidad' },
+              { id: 'pain_ai_gov', title: 'Gobierno IA', description: 'Reglas, seguridad, control' },
+            ],
+          }],
+        },
+      },
+    });
+    return;
+  }
+
+  const areaMap = {
+    'pain_sales': { tag: 'interes-og4-diagnostico', area: 'Ventas' },
+    'pain_ops': { tag: 'interes-synapse', area: 'Operación' },
+    'pain_bi': { tag: 'interes-datapower', area: 'Datos / BI' },
+    'pain_erp': { tag: 'interes-erp-integraciones', area: 'ERP / CRM' },
+    'pain_ai_gov': { tag: 'interes-gobierno-ia', area: 'Gobierno IA' },
+    'ventas': { tag: 'interes-og4-diagnostico', area: 'Ventas' },
+    'operación': { tag: 'interes-synapse', area: 'Operación' },
+    'operacion': { tag: 'interes-synapse', area: 'Operación' },
+    'datos / bi': { tag: 'interes-datapower', area: 'Datos / BI' },
+    'erp / crm': { tag: 'interes-erp-integraciones', area: 'ERP / CRM' },
+    'erp / bi': { tag: 'interes-erp-integraciones', area: 'ERP / CRM' },
+    'gobierno ia': { tag: 'interes-gobierno-ia', area: 'Gobierno IA' },
+    'agentes ia': { tag: 'interes-gobierno-ia', area: 'Gobierno IA' },
+  };
+  const mapped = areaMap[replyId] || areaMap[answer];
+  if (mapped) {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', mapped.tag, 'intencion-detectada'],
+      customFields: {
+        area_dolor: mapped.area,
+        ia360_ultima_respuesta: mapped.area,
+        ultimo_cta_enviado: 'ia360_lite_area_dolor',
+        servicio_recomendado: mapped.area === 'ERP / CRM' ? 'ERP / Integraciones / BI' : 'Diagnóstico IA360',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: 'Dolor calificado',
+      titleSuffix: mapped.area,
+      notes: `Área de dolor seleccionada: ${mapped.area}`,
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_next_step_after_area',
+      messageBody: `IA360: siguiente paso para ${mapped.area}`,
+      interactive: {
+        type: 'button',
+        header: { type: 'text', text: mapped.area },
+        body: { text: 'Perfecto. Con eso ya puedo perfilar el caso. ¿Qué prefieres como siguiente paso?' },
+        footer: { text: 'Sin compromiso' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'next_5q', title: '5 preguntas' } },
+            { type: 'reply', reply: { id: 'next_schedule', title: 'Agendar' } },
+            { type: 'reply', reply: { id: 'next_example', title: 'Enviar ejemplo' } },
+          ],
+        },
+      },
+    });
+    return;
+  }
+
+  if (answer === '5 preguntas') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'diagnostico-enviado'],
+      customFields: {
+        ultimo_cta_enviado: 'ia360_lite_5_preguntas',
+        ia360_ultima_respuesta: '5 preguntas',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: 'Diagnóstico enviado',
+      titleSuffix: 'Diagnóstico solicitado',
+      notes: 'Solicitó diagnóstico ligero de 5 preguntas',
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_q2_manual_work',
+      messageBody: 'IA360 pregunta ligera: dónde hay trabajo manual',
+      interactive: {
+        type: 'list',
+        header: { type: 'text', text: 'Pregunta 1/5' },
+        body: { text: 'Empecemos suave: ¿dónde ves más trabajo manual o doble captura?' },
+        footer: { text: 'Una opción basta' },
+        action: {
+          button: 'Elegir punto',
+          sections: [{
+            title: 'Puntos frecuentes',
+            rows: [
+              { id: 'manual_whatsapp', title: 'WhatsApp', description: 'Seguimiento y mensajes manuales' },
+              { id: 'manual_excel', title: 'Excel', description: 'Captura y reportes manuales' },
+              { id: 'manual_erp', title: 'ERP', description: 'Datos/reprocesos entre sistemas' },
+              { id: 'manual_crm', title: 'CRM', description: 'Seguimiento comercial' },
+              { id: 'manual_reports', title: 'Reportes', description: 'Dashboards o KPIs tardíos' },
+            ],
+          }],
+        },
+      },
+    });
+    return;
+  }
+
+  const manualPainMap = {
+    manual_whatsapp: { label: 'WhatsApp', tag: 'interes-whatsapp-business' },
+    manual_excel: { label: 'Excel', tag: 'interes-datapower' },
+    manual_erp: { label: 'ERP', tag: 'interes-erp-integraciones' },
+    manual_crm: { label: 'CRM', tag: 'interes-erp-integraciones' },
+    manual_reports: { label: 'Reportes', tag: 'interes-datapower' },
+  };
+  const manualPain = manualPainMap[replyId];
+  if (manualPain) {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'respondio-diagnostico', manualPain.tag],
+      customFields: {
+        dolor_principal: `Trabajo manual / doble captura en ${manualPain.label}`,
+        ia360_ultima_respuesta: record.message_body,
+        ultimo_cta_enviado: 'ia360_lite_q1_manual_work',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: 'Respondió preguntas',
+      titleSuffix: `Dolor ${manualPain.label}`,
+      notes: `Pregunta 1/5: trabajo manual o doble captura en ${manualPain.label}`,
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_q1_ack_next',
+      messageBody: `IA360: dolor manual ${manualPain.label}`,
+      interactive: {
+        type: 'button',
+        header: { type: 'text', text: manualPain.label },
+        body: { text: `Entendido: hay fricción en ${manualPain.label}. Para seguir ligero, puedo mostrar arquitectura, ejemplo aplicado o pedir agenda.` },
+        footer: { text: 'Una opción basta' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'flow_architecture', title: 'Arquitectura' } },
+            { type: 'reply', reply: { id: 'wa_apply', title: 'Aplicarlo' } },
+            { type: 'reply', reply: { id: 'wa_schedule', title: 'Agendar' } },
+          ],
+        },
+      },
+    });
+    return;
+  }
+
+  if (answer === 'agendar' || replyId === 'next_schedule' || replyId === 'wa_schedule') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'requiere-alek', 'hot-lead'],
+      customFields: {
+        ultimo_cta_enviado: 'ia360_lite_agendar',
+        ia360_ultima_respuesta: 'Agendar',
+        proximo_followup: 'Alek debe proponer horario',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForReply({ replyId: 'wa_schedule', answer: record.message_body }, 'Agenda en proceso'),
+      titleSuffix: 'Agendar',
+      notes: 'Solicitó agendar; se mueve a agenda en proceso hasta confirmar Calendar/Zoom',
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_schedule_window',
+      messageBody: 'IA360: preferencia para agendar',
+      interactive: {
+        type: 'button',
+        header: { type: 'text', text: 'Agenda' },
+        body: { text: 'Va. Para que Alek te proponga horario: ¿qué ventana te acomoda mejor?' },
+        footer: { text: 'Luego se conecta calendario/CRM' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'sched_today', title: 'Hoy' } },
+            { type: 'reply', reply: { id: 'sched_tomorrow', title: 'Mañana' } },
+            { type: 'reply', reply: { id: 'sched_week', title: 'Esta semana' } },
+          ],
+        },
+      },
+    });
+    return;
+  }
+
+  if (answer === 'enviar ejemplo') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'ejemplo-solicitado'],
+      customFields: {
+        ultimo_cta_enviado: 'ia360_lite_enviar_ejemplo',
+        ia360_ultima_respuesta: 'Enviar ejemplo',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: 'Dolor calificado',
+      titleSuffix: 'Ejemplo solicitado',
+      notes: 'Solicitó ejemplo IA360',
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_example_selector',
+      messageBody: 'IA360: selector de ejemplo',
+      interactive: {
+        type: 'list',
+        header: { type: 'text', text: 'Ejemplos IA360' },
+        body: { text: 'Claro. ¿Qué ejemplo quieres ver primero?' },
+        footer: { text: 'Elige uno' },
+        action: {
+          button: 'Ver ejemplos',
+          sections: [{
+            title: 'Casos rápidos',
+            rows: [
+              { id: 'ex_erp_bi', title: 'ERP → BI', description: 'Dashboard ejecutivo y alertas' },
+              { id: 'ex_wa_crm', title: 'WhatsApp', description: 'Lead, tags, pipeline y tarea CRM' },
+              { id: 'ex_agent_followup', title: 'Agente follow-up', description: 'Seguimiento con humano en control' },
+              { id: 'ex_gov_ai', title: 'Gobierno IA', description: 'Reglas, roles y seguridad' },
+            ],
+          }],
+        },
+      },
+    });
+    return;
+  }
+
+  if (replyId === 'ex_wa_crm' || answer === 'whatsapp → crm' || answer === 'whatsapp -> crm') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'interes-whatsapp-business', 'ejemplo-solicitado'],
+      customFields: {
+        ultimo_cta_enviado: 'ia360_lite_example_whatsapp_crm',
+        ia360_ultima_respuesta: 'WhatsApp → CRM',
+        servicio_recomendado: 'WhatsApp Revenue OS / CRM conversacional',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForReply({ replyId, answer: record.message_body }, 'Dolor calificado'),
+      titleSuffix: 'WhatsApp Revenue OS',
+      notes: 'Solicitó ejemplo WhatsApp → CRM; se mantiene como mecanismo elegido hasta que pida aplicarlo/costo/agenda',
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_whatsapp_crm_example',
+      messageBody: 'IA360 ejemplo: WhatsApp a CRM',
+      interactive: {
+        type: 'button',
+        header: { type: 'text', text: 'WhatsApp → CRM' },
+        body: { text: 'Ejemplo: un mensaje entra por WhatsApp, se etiqueta por intención, cae en pipeline, crea/actualiza contacto en CRM y genera tarea humana si hay alta intención.' },
+        footer: { text: 'Este mismo flujo ya empezó aquí' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'wa_flow_map', title: 'Ver flujo' } },
+            { type: 'reply', reply: { id: 'wa_apply', title: 'Aplicarlo' } },
+            { type: 'reply', reply: { id: 'wa_schedule', title: 'Agendar' } },
+          ],
+        },
+      },
+    });
+    return;
+  }
+
+  if (answer === 'hoy' || answer === 'mañana' || answer === 'manana' || answer === 'esta semana' || replyId === 'sched_today' || replyId === 'sched_tomorrow' || replyId === 'sched_week') {
+    const day = replyId === 'sched_today' || answer === 'hoy'
+      ? 'today'
+      : (replyId === 'sched_week' || answer === 'esta semana' ? 'this_week' : 'tomorrow');
+    const availability = await requestIa360Availability({ record, day });
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'requiere-alek', 'hot-lead', 'reunion-solicitada'],
+      customFields: {
+        ia360_ultima_respuesta: record.message_body,
+        proximo_followup: `Elegir hora disponible para: ${record.message_body}`,
+        ultimo_cta_enviado: 'ia360_lite_agenda_slots',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForEvent('agenda_preference_selected', 'Agenda en proceso'),
+      titleSuffix: `Agenda ${record.message_body}`,
+      notes: `Preferencia de día seleccionada: ${record.message_body}; se consultó disponibilidad real de Calendar para ofrecer horas libres`,
+    });
+    const slots = availability?.slots || [];
+    if (slots.length === 0) {
+      await enqueueIa360Text({
+        record,
+        label: 'ia360_100m_schedule_no_slots',
+        body: `Revisé la agenda real de Alek y no veo espacios libres de 1 hora en esa ventana.\n\nElige otra opción de día o escribe una ventana específica y lo revisamos antes de confirmar.`,
+      });
+      return;
+    }
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_available_slots',
+      messageBody: `IA360: horarios disponibles ${availability.date}`,
+      interactive: {
+        type: 'list',
+        header: { type: 'text', text: 'Horarios libres' },
+        body: { text: `Revisé Calendar de Alek. Estos espacios de 1 hora están libres (${availability.date}, hora CDMX). Elige uno y lo confirmo con Calendar + Zoom.` },
+        footer: { text: 'Se revalida antes de reservar' },
+        action: {
+          button: 'Elegir hora',
+          sections: [{
+            title: 'Disponibles',
+            rows: slots.slice(0, 10).map((slot) => ({
+              id: slot.id,
+              title: slot.title,
+              description: slot.description,
+            })),
+          }],
+        },
+      },
+    });
+    return;
+  }
+
+  const selectedSlot = parseIa360SlotId(replyId);
+  if (selectedSlot) {
+    const booking = await bookIa360Slot({ record, ...selectedSlot });
+    if (!booking?.ok) {
+      await enqueueIa360Text({
+        record,
+        label: 'ia360_100m_schedule_slot_busy',
+        body: 'Ese horario ya no está disponible o no pude confirmarlo. Por seguridad no lo agendé. Vuelve a elegir día para mostrar horarios libres actualizados.',
+      });
+      return;
+    }
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'reunion-confirmada', 'zoom-creado'],
+      customFields: {
+        ia360_ultima_respuesta: record.message_body,
+        proximo_followup: `Reunión confirmada: ${booking.start}`,
+        ultimo_cta_enviado: 'ia360_lite_reunion_confirmada',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForEvent('meeting_confirmed_calendar_zoom', 'Reunión agendada'),
+      titleSuffix: 'Reunión confirmada',
+      notes: `Reunión confirmada. Calendar event: ${booking.calendarEventId}; Zoom meeting: ${booking.zoomMeetingId}; inicio: ${booking.start}`,
+    });
+    const confirmedTime = new Intl.DateTimeFormat('es-MX', {
+      timeZone: 'America/Mexico_City',
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(new Date(booking.start));
+    await enqueueIa360Text({
+      record,
+      label: 'ia360_100m_schedule_confirmed',
+      body: `Listo, tu reunión con Alek quedó agendada para ${confirmedTime} (hora CDMX).\n\n${booking.zoomJoinUrl ? 'Aquí tu enlace de Zoom para conectarte:\n' + booking.zoomJoinUrl : 'En un momento te confirmo el enlace de Zoom.'}\n\n¡Nos vemos!`,
+    });
+    await emitIa360N8nHandoff({
+      record,
+      eventType: 'meeting_confirmed_calendar_zoom',
+      targetStage: getIa360StageForEvent('meeting_confirmed_calendar_zoom', 'Reunión agendada'),
+      priority: 'high',
+      summary: `Reunión confirmada con Calendar/Zoom. Calendar event ${booking.calendarEventId}; Zoom meeting ${booking.zoomMeetingId}; inicio ${booking.start}.`,
+    });
+    return;
+  }
+
+  if (replyId === 'ex_erp_bi' || answer === 'erp → bi' || answer === 'erp -> bi') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'interes-datapower', 'ejemplo-solicitado'],
+      customFields: {
+        ia360_ultima_respuesta: 'ERP → BI',
+        servicio_recomendado: 'DataPower BI / ERP analytics',
+        ultimo_cta_enviado: 'ia360_lite_example_erp_bi',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForReply({ replyId, answer: record.message_body }, 'Dolor calificado'),
+      titleSuffix: 'ERP → BI',
+      notes: 'Solicitó ejemplo ERP → BI; se mantiene como mecanismo elegido hasta que pida aplicarlo/costo/agenda',
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: 'ia360_lite_example_erp_bi_detail',
+      messageBody: 'IA360 ejemplo: ERP → BI',
+      interactive: {
+        type: 'button',
+        header: { type: 'text', text: 'ERP → BI' },
+        body: { text: 'Ejemplo: conectamos ERP/CRM, normalizamos datos, generamos dashboard ejecutivo y alertas para decidir sin esperar reportes manuales.' },
+        footer: { text: 'Caso DataPower BI' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'flow_architecture', title: 'Arquitectura' } },
+            { type: 'reply', reply: { id: 'wa_apply', title: 'Aplicarlo' } },
+            { type: 'reply', reply: { id: 'wa_schedule', title: 'Agendar' } },
+          ],
+        },
+      },
+    });
+    return;
+  }
+
+  if (replyId === 'ex_agent_followup' || replyId === 'ex_gov_ai') {
+    const isGov = replyId === 'ex_gov_ai';
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', isGov ? 'interes-gobierno-ia' : 'interes-agentic-automation', 'ejemplo-solicitado'],
+      customFields: {
+        ia360_ultima_respuesta: record.message_body,
+        servicio_recomendado: isGov ? 'Gobierno IA' : 'Agentic Follow-up',
+        ultimo_cta_enviado: isGov ? 'ia360_lite_example_gov_ai' : 'ia360_lite_example_agent_followup',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForReply({ replyId, answer: record.message_body }, 'Dolor calificado'),
+      titleSuffix: record.message_body,
+      notes: `Solicitó ejemplo ${record.message_body}; se mantiene como mecanismo elegido hasta que pida aplicarlo/costo/agenda`,
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: isGov ? 'ia360_lite_example_gov_ai_detail' : 'ia360_lite_example_agent_followup_detail',
+      messageBody: `IA360 ejemplo: ${record.message_body}`,
+      interactive: {
+        type: 'button',
+        header: { type: 'text', text: record.message_body },
+        body: { text: isGov ? 'Ejemplo: definimos reglas, roles, permisos, bitácora y criterios de escalamiento para usar IA sin perder control.' : 'Ejemplo: un agente detecta intención, prepara respuesta, actualiza CRM y escala al humano antes de compromisos sensibles.' },
+        footer: { text: 'Humano en control' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'flow_architecture', title: 'Arquitectura' } },
+            { type: 'reply', reply: { id: 'wa_apply', title: 'Aplicarlo' } },
+            { type: 'reply', reply: { id: 'wa_schedule', title: 'Agendar' } },
+          ],
+        },
+      },
+    });
+    return;
+  }
+
+  if (replyId === 'wa_flow_map' || replyId === 'wa_apply' || answer === 'ver flujo' || answer === 'aplicarlo') {
+    const isApply = replyId === 'wa_apply' || answer === 'aplicarlo';
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'hot-lead', isApply ? 'requiere-alek' : 'flujo-solicitado'],
+      customFields: {
+        ia360_ultima_respuesta: record.message_body,
+        ultimo_cta_enviado: isApply ? 'ia360_lite_aplicar' : 'ia360_lite_ver_flujo',
+        proximo_followup: isApply ? 'Alek debe convertir a propuesta/implementación' : 'Enviar mapa visual del flujo WhatsApp → CRM',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForReply({ replyId, answer: record.message_body }, isApply ? 'Requiere Alek' : 'Dolor calificado'),
+      titleSuffix: record.message_body,
+      notes: `Solicitó ${record.message_body} del ejemplo WhatsApp → CRM`,
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: isApply ? 'ia360_lite_apply_next' : 'ia360_lite_flow_map',
+      messageBody: isApply ? 'IA360: aplicar flujo WhatsApp Revenue OS' : 'IA360: mapa del flujo WhatsApp → CRM',
+      interactive: isApply ? {
+        type: 'button',
+        header: { type: 'text', text: 'Aplicarlo' },
+        body: { text: 'Perfecto. Lo convertiría así: 1) objetivos y reglas, 2) inbox + tags, 3) pipeline, 4) handoff humano, 5) medición. ¿Qué quieres que prepare?' },
+        footer: { text: 'Siguiente paso comercial' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'apply_scope', title: 'Alcance' } },
+            { type: 'reply', reply: { id: 'apply_cost', title: 'Costo' } },
+            { type: 'reply', reply: { id: 'apply_call', title: 'Llamada' } },
+          ],
+        },
+      } : {
+        type: 'button',
+        header: { type: 'text', text: 'Flujo WhatsApp → CRM' },
+        body: { text: 'Mapa: 1) entra mensaje, 2) se clasifica intención, 3) aplica tags/campos, 4) crea o mueve deal, 5) si hay alta intención crea tarea humana, 6) responde con el siguiente micro-paso.' },
+        footer: { text: 'UX ligera + humano en control' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'flow_architecture', title: 'Arquitectura' } },
+            { type: 'reply', reply: { id: 'wa_apply', title: 'Aplicarlo' } },
+            { type: 'reply', reply: { id: 'wa_schedule', title: 'Agendar' } },
+          ],
+        },
+      },
+    });
+    return;
+  }
+
+  if (replyId === 'apply_call') {
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'hot-lead', 'requiere-alek', 'llamada-solicitada'],
+      customFields: {
+        ia360_ultima_respuesta: record.message_body,
+        ultimo_cta_enviado: 'apply_call_terminal',
+        proximo_followup: 'Alek debe proponer llamada y objetivo',
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForEvent('call_requested', 'Agenda en proceso'),
+      titleSuffix: 'Llamada',
+      notes: 'Solicitó llamada; falta crear evento real en calendario/Zoom',
+    });
+    await enqueueIa360Text({
+      record,
+      label: 'ia360_100m_call_terminal_handoff',
+      body: 'Listo: lo marco como solicitud de llamada. No envío más opciones automáticas aquí para no dar vueltas.\n\nSiguiente paso humano: Alek confirma objetivo, horario y enlace. En la siguiente fase n8n debe crear tarea en EspoCRM y evento Zoom/Calendar automáticamente.',
+    });
+    await emitIa360N8nHandoff({
+      record,
+      eventType: 'call_requested',
+      targetStage: 'Agenda en proceso',
+      priority: 'high',
+      summary: 'El contacto pidió llamada. Crear tarea humana, preparar resumen y proponer horario/enlace.',
+    });
+    return;
+  }
+
+  if (replyId === 'flow_architecture' || replyId === 'apply_scope' || replyId === 'apply_cost' || replyId === 'apply_call') {
+    const isCall = replyId === 'apply_call';
+    const isCost = replyId === 'apply_cost';
+    const isScope = replyId === 'apply_scope';
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber: record.contact_number,
+      tags: ['campana-ia360', 'hot-lead', isCall ? 'requiere-alek' : 'detalle-solicitado'],
+      customFields: {
+        ia360_ultima_respuesta: record.message_body,
+        ultimo_cta_enviado: replyId,
+        proximo_followup: isCall ? 'Alek debe proponer llamada' : `Enviar detalle: ${record.message_body}`,
+      },
+    });
+    await syncIa360Deal({
+      record,
+      targetStageName: getIa360StageForReply({ replyId, answer: record.message_body }, isCall ? 'Agenda en proceso' : (isCost ? 'Propuesta / siguiente paso' : 'Requiere Alek')),
+      titleSuffix: record.message_body,
+      notes: `Solicitó detalle: ${record.message_body}`,
+    });
+    await enqueueIa360Interactive({
+      record,
+      label: `ia360_lite_${replyId}`,
+      messageBody: `IA360: detalle ${record.message_body}`,
+      interactive: {
+        type: 'button',
+        header: { type: 'text', text: record.message_body },
+        body: { text: isCost ? 'Para costo real necesito alcance: canales, volumen, integraciones y nivel de IA/humano. Puedo preparar rango inicial o agendar revisión.' : isScope ? 'Alcance base: WhatsApp inbox, tags/campos, pipeline, 3-5 microflujos, handoff humano y medición. Luego se conecta CRM/n8n.' : isCall ? 'Va. Esto ya requiere humano: Alek debe proponerte horario y revisar objetivo, stack e integración.' : 'Arquitectura: WhatsApp Cloud API → ForgeChat inbox/flows → pipeline/tags → n8n/EspoCRM → tareas/resumen humano.' },
+        footer: { text: 'Siguiente micro-paso' },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'wa_apply', title: 'Aplicarlo' } },
+            { type: 'reply', reply: { id: 'wa_schedule', title: 'Agendar' } },
+            { type: 'reply', reply: { id: 'apply_scope', title: 'Alcance' } },
+          ],
+        },
+      },
+    });
+    return;
+  }
+}
+
+
+/**
+ * POST /api/webhook/whatsapp
+ * Receives raw Meta WhatsApp webhook payloads forwarded by n8n.
+ * No auth required — called by internal n8n instance.
+ */
+router.post('/webhook/whatsapp', async (req, res) => {
+  try {
+    // Authenticity: this endpoint is necessarily unauthenticated (public), so
+    // the control is Meta's HMAC signature. When META_APP_SECRET is configured
+    // we REJECT anything unsigned/invalid; if it's not set we log a warning so
+    // operators know inbound webhooks are unverified (forgeable).
+    const sig = verifyMetaSignature(req);
+    if (sig === false) {
+      return res.status(403).json({ error: 'Invalid webhook signature' });
+    }
+    if (sig === null) {
+      console.warn('[webhook] META_APP_SECRET not set — inbound webhook signature NOT verified (set it to reject forged payloads).');
+    }
+
+    const payload = req.body;
+    if (!payload) {
+      return res.status(400).json({ error: 'Empty payload' });
+    }
+
+    // Support both array of payloads (n8n batch) and single payload
+    const payloads = Array.isArray(payload) ? payload : [payload];
+    const allRecords = [];
+    for (const p of payloads) {
+      const records = parseMetaPayload(p);
+      allRecords.push(...records);
+    }
+
+    if (allRecords.length === 0) {
+      // Acknowledge non-message webhooks (e.g. verification, errors)
+      return res.status(200).json({ ok: true, stored: 0 });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      for (const r of allRecords) {
+        // Status receipts (sent/delivered/read/failed) update the ORIGINAL
+        // message's status — they must never create a chat row. Inserting them
+        // produced phantom "Status: delivered" bubbles. If no matching message
+        // exists (e.g. an app-sent message we don't track), this is a no-op.
+        if (r.message_type === 'status') {
+          await client.query(
+            `UPDATE coexistence.chat_history SET status = $1 WHERE message_id = $2`,
+            [r.status, r.message_id]
+          );
+          continue;
+        }
+
+        // Reactions are NOT chat bubbles — attach the emoji to the message it
+        // reacts to (message_reactions). An empty emoji removes the reaction.
+        if (r.message_type === 'reaction') {
+          const tgt = r.reaction?.targetMessageId;
+          if (tgt) {
+            if (r.reaction.emoji) {
+              await client.query(
+                `INSERT INTO coexistence.message_reactions
+                   (wa_number, contact_number, target_message_id, direction, emoji, reactor, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,NOW())
+                 ON CONFLICT (target_message_id, direction)
+                 DO UPDATE SET emoji = EXCLUDED.emoji, reactor = EXCLUDED.reactor, updated_at = NOW()`,
+                [r.wa_number, r.contact_number, tgt, r.direction, r.reaction.emoji, r.reaction.from || null]
+              );
+            } else {
+              await client.query(
+                `DELETE FROM coexistence.message_reactions WHERE target_message_id = $1 AND direction = $2`,
+                [tgt, r.direction]
+              );
+            }
+          }
+          continue;
+        }
+
+        // Upsert chat_history (ignore duplicates on message_id)
+        await client.query(
+          `INSERT INTO coexistence.chat_history
+            (message_id, phone_number_id, wa_number, contact_number, to_number,
+             direction, message_type, message_body, raw_payload, media_url,
+             media_mime_type, media_filename, status, timestamp, context_message_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+           ON CONFLICT (message_id) DO UPDATE SET
+             status = EXCLUDED.status,
+             raw_payload = EXCLUDED.raw_payload`,
+          [
+            r.message_id, r.phone_number_id, r.wa_number, r.contact_number, r.to_number,
+            r.direction, r.message_type, r.message_body, r.raw_payload, r.media_url,
+            r.media_mime_type, r.media_filename || null, r.status, r.timestamp,
+            r.context_message_id || null,
+          ]
+        );
+
+        // Upsert the WhatsApp profile/push name into profile_name (NOT name).
+        // `name` is reserved for a name we explicitly captured (AI ask-name flow
+        // or manual save) so inbound messages don't clobber it — that clobbering
+        // is what made the automation "is the contact known?" condition always
+        // true. Display falls back to COALESCE(name, profile_name).
+        if (r.contact_number && r.wa_number && r.contact_name) {
+          await client.query(
+            `INSERT INTO coexistence.contacts (wa_number, contact_number, profile_name)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (wa_number, contact_number) DO UPDATE SET
+               profile_name = EXCLUDED.profile_name,
+               updated_at = NOW()`,
+            [r.wa_number, r.contact_number, r.contact_name]
+          );
+        }
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    // Evaluate automation triggers
+    // 1. For incoming messages (keyword, anyMessage, newContact triggers)
+    //    First: if this conversation has paused executions awaiting a reply,
+    //    resume them and SKIP fresh trigger evaluation for that record
+    //    (the customer is mid-conversation — see plan: "Resume only — skip
+    //    new trigger").
+    const incomingRecords = allRecords.filter(r => r.direction === 'incoming' && r.message_type !== 'status' && r.message_type !== 'reaction');
+    if (incomingRecords.length > 0) {
+      for (const record of incomingRecords) {
+        try {
+          const { rows: pausedRows } = await pool.query(
+            `SELECT id FROM coexistence.automation_executions
+              WHERE wa_number=$1 AND contact_number=$2
+                AND status='paused' AND expires_at>NOW()
+              ORDER BY paused_at`,
+            [record.wa_number, record.contact_number]
+          );
+          if (pausedRows.length > 0) {
+            for (const p of pausedRows) {
+              try {
+                await resumeAutomation(pool, p.id, record);
+              } catch (resumeErr) {
+                console.error(`[webhook] Resume error for execution ${p.id}:`, resumeErr.message);
+              }
+            }
+            continue; // do not also fire fresh triggers
+          }
+          await handleIa360LiteInteractive(record);
+          // Free text (no button) inside an active funnel → AI agent (fire-and-forget; never blocks the Meta ack).
+          handleIa360FreeText(record).catch(e => console.error('[ia360-agent] fire-and-forget:', e.message));
+          await evaluateTriggers(record);
+        } catch (triggerErr) {
+          console.error('[webhook] Trigger evaluation error:', triggerErr.message);
+        }
+      }
+    }
+
+    // 2. For status updates (messageRead, messageDelivered, messageSent triggers)
+    const statusRecords = allRecords.filter(r => r.message_type === 'status');
+    if (statusRecords.length > 0) {
+      for (const record of statusRecords) {
+        try {
+          await evaluateTriggers(record);
+        } catch (triggerErr) {
+          console.error('[webhook] Status trigger evaluation error:', triggerErr.message);
+        }
+      }
+    }
+
+    // Enqueue durable media downloads via BullMQ (concurrency-capped + retried)
+    for (const r of allRecords) {
+      if (MEDIA_TYPES.has(r.message_type) && r.media_url && r.message_id) {
+        await markPending(r.message_id);
+        enqueueMediaDownload(r.message_id).catch(() => {});
+      }
+    }
+
+    console.log(`[webhook] Stored ${allRecords.length} record(s)`);
+    res.status(200).json({ ok: true, stored: allRecords.length });
+  } catch (err) {
+    console.error('[webhook] Error:', err.message);
+    // Always return 200 to n8n so it doesn't retry infinitely. Use a static
+    // message — err.message can carry internal Postgres/schema details.
+    res.status(200).json({ ok: false, error: 'Processing error' });
+  }
+});
+
+/**
+ * GET /api/webhook/whatsapp
+ * Meta webhook verification endpoint (for direct Meta → ForgeChat webhooks).
+ * Not needed for n8n forwarding, but included for completeness.
+ */
+router.get('/webhook/whatsapp', async (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  let accepted = false;
+  if (mode === 'subscribe' && token) {
+    // 1) The per-account Webhook Verify Token set in the connection form.
+    try {
+      const { rows } = await pool.query(
+        `SELECT verify_token_encrypted FROM coexistence.whatsapp_accounts
+          WHERE verify_token_encrypted IS NOT NULL`
+      );
+      for (const r of rows) {
+        if (safeEqual(decrypt(r.verify_token_encrypted), token)) { accepted = true; break; }
+      }
+    } catch (err) {
+      console.error('[webhook] verify-token lookup error:', err.message);
+    }
+    // 2) Backward-compatible env fallback.
+    if (!accepted && process.env.META_WEBHOOK_VERIFY_TOKEN && safeEqual(process.env.META_WEBHOOK_VERIFY_TOKEN, token)) {
+      accepted = true;
+    }
+  }
+
+  if (accepted) {
+    console.log('[webhook] Meta verification accepted');
+    // Echo the challenge as plain text (Meta sends a numeric token). Sending it
+    // as text/plain — not the res.send default of text/html — prevents the
+    // reflected value from being interpreted as HTML (reflected-XSS).
+    return res.status(200).type('text/plain').send(String(challenge ?? ''));
+  }
+  res.status(403).json({ error: 'Verification failed' });
+});
+
+module.exports = { router };

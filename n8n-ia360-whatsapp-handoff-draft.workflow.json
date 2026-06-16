@@ -1,0 +1,265 @@
+{
+  "name": "IA360 WhatsApp Handoff → EspoCRM + Calendar Zoom Draft",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ia360-whatsapp-handoff",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "Webhook_IA360_Handoff",
+      "name": "Webhook IA360 Handoff",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "source-check",
+              "leftValue": "={{$json.body.source}}",
+              "rightValue": "forgechat-ia360-webhook",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "phone-check",
+              "leftValue": "={{$json.body.contact.contactNumber}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            },
+            {
+              "id": "event-check",
+              "leftValue": "={{$json.body.eventType}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "Validate_Payload",
+      "name": "Validate Payload",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -540,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "eventType",
+              "name": "eventType",
+              "value": "={{$json.body.eventType}}",
+              "type": "string"
+            },
+            {
+              "id": "priority",
+              "name": "priority",
+              "value": "={{$json.body.priority || 'normal'}}",
+              "type": "string"
+            },
+            {
+              "id": "phone",
+              "name": "phone",
+              "value": "={{$json.body.contact.contactNumber}}",
+              "type": "string"
+            },
+            {
+              "id": "name",
+              "name": "name",
+              "value": "={{$json.body.contact.contactName || $json.body.contact.contactNumber}}",
+              "type": "string"
+            },
+            {
+              "id": "summary",
+              "name": "summary",
+              "value": "={{$json.body.summary}}",
+              "type": "string"
+            },
+            {
+              "id": "triggerBody",
+              "name": "triggerBody",
+              "value": "={{$json.body.trigger.messageBody}}",
+              "type": "string"
+            },
+            {
+              "id": "targetStage",
+              "name": "targetStage",
+              "value": "={{$json.body.targetStage}}",
+              "type": "string"
+            },
+            {
+              "id": "taskDescription",
+              "name": "taskDescription",
+              "value": "={{'IA360 WhatsApp handoff\\n\\nEvento: ' + $json.body.eventType + '\\nPrioridad: ' + ($json.body.priority || 'normal') + '\\nStage: ' + $json.body.targetStage + '\\nContacto: ' + ($json.body.contact.contactName || '') + ' / ' + $json.body.contact.contactNumber + '\\nÚltima respuesta: ' + $json.body.trigger.messageBody + '\\n\\nResumen: ' + $json.body.summary + '\\n\\nAcciones recomendadas: ' + ($json.body.recommendedActions || []).join(', ')}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "Normalize_Context",
+      "name": "Normalize Lead Context",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -300,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.ESPOCRM_URL + '/api/v1/Task'}}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { name: 'IA360 WhatsApp handoff: ' + $json.eventType, status: 'Not Started', priority: $json.priority === 'high' ? 'High' : 'Normal', description: $json.taskDescription } }}",
+        "options": {}
+      },
+      "id": "Create_EspoCRM_Task",
+      "name": "Create EspoCRM Task (configure credential)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -40,
+        -120
+      ],
+      "disabled": true,
+      "notes": "Enable after configuring EspoCRM URL/API credential. Upsert contact should be added before this node once final field mapping is confirmed."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, received: true, eventType: $json.eventType, phone: $json.phone, next: 'configure EspoCRM/Calendar/Zoom credentials' } }}",
+        "options": {}
+      },
+      "id": "Respond_OK",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, error: 'Invalid IA360 handoff payload' } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "Respond_Bad_Request",
+      "name": "Respond Bad Request",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -300,
+        160
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook IA360 Handoff": {
+      "main": [
+        [
+          {
+            "node": "Validate Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Payload": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bad Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Lead Context": {
+      "main": [
+        [
+          {
+            "node": "Create EspoCRM Task (configure credential)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create EspoCRM Task (configure credential)": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "versionId": "draft-ia360-whatsapp-handoff-2026-06-01",
+  "triggerCount": 0,
+  "tags": [
+    {
+      "name": "IA360"
+    },
+    {
+      "name": "WhatsApp"
+    },
+    {
+      "name": "Draft"
+    }
+  ],
+  "id": "IA360WhatsAppHandoffDraft20260601",
+  "active": false
+}

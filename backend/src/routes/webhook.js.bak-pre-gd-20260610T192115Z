@@ -8,22 +8,6 @@ const { enqueueMediaDownload } = require('../queue/mediaQueue');
 const { resolveAccount, insertPendingRow, secondsSinceLastIncoming } = require('../services/messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
 const { getIa360StageForEvent, getIa360StageForReply } = require('../services/ia360Mapping');
-const { classifyOpenerReply, extractInteractiveReplyId } = require('./ia360OpenerReply');
-const { evaluatePaymentStatus } = require('../services/paymentCircuitBreaker');
-const {
-  IA360_DEFAULT_PIPELINE_NAME,
-  IA360_PARTNERS_PIPELINE_NAME,
-  IA360_PARTNER_RELATIONSHIPS,
-  ia360PipelineForRelationship,
-  ia360ResolveStageName,
-} = require('./ia360DealRouting');
-const {
-  parseIa360OwnerIntroCommand,
-  sanitizeIntroName: sanitizeIa360IntroNamePure,
-  compactQuienIntro: compactQuienIntroPure,
-  buildIntroCustomFields: buildIa360IntroCustomFields,
-  buildReferidoContextoDraft: buildIa360ReferidoContextoDraft,
-} = require('./ia360ReferidoIntro');
 
 const router = Router();
 
@@ -366,179 +350,6 @@ function isIa360ClienteActivoBetaContact(contact) {
     || tags.includes('cliente-activo-beta');
 }
 
-// G-LIVE: números QA del harness E2E (pruebas sintéticas autorizadas). Longitud
-// exacta de 13 dígitos (521 + 99900XXXXX): un '\d*' laxo dejaría pasar móviles
-// reales de la lada 999 (Mérida) como si fueran QA.
-const IA360_QA_NUMBER_RE = /^52199900\d{5}$/;
-
-// G-LIVE: pregunta que requiere DATOS VIVOS del portal del cliente (saldos, listas,
-// estatus). Lectura de estado => handoff explícito, nunca inventar. La guía de uso
-// ("¿cómo subo información al portal?") NO matchea: esa sí la responde el agente.
-function isIa360PortalLiveDataQuestion(body) {
-  const t = String(body || '').toLowerCase();
-  if (!/(portal|plataforma)/.test(t)) return false;
-  return /(cu[aá]nt[oa]s?\b|cu[aá]les\b|qu[eé] (hay|tiene|dice|muestra|aparece)|lista(do)?\s+de|estatus|estado de|sald[oa]s?|pendientes? de pago|cargad[oa]s?|registrad[oa]s?)/.test(t);
-}
-
-// G-LIVE: perfil de comunicación para el agente IA. Viaja como `role` en el payload;
-// el nodo Normalize del workflow n8n lo expone al modelo como contact.role (sin tocar
-// n8n publicado). do_not_pitch => tono ejecutivo: corto, negocio, control/riesgo.
-function isIa360DoNotPitchContact(contact) {
-  const cf = contact?.custom_fields || {};
-  const beta = cf.ia360_cliente_activo_beta || {};
-  const role = beta.contact_role || cf.project_role || cf.rol_comite || 'cliente activo beta';
-  const noPitchRaw = beta.do_not_pitch != null ? beta.do_not_pitch : cf.do_not_pitch;
-  return noPitchRaw === true || noPitchRaw === 1
-    || /^(true|1|s[ií]|yes)$/i.test(String(noPitchRaw || ''))
-    || /cfo|champion|finanzas/i.test(String(role));
-}
-
-function buildIa360ClienteActivoBetaRoleHint(contact) {
-  const cf = contact?.custom_fields || {};
-  const beta = cf.ia360_cliente_activo_beta || {};
-  const role = beta.contact_role || cf.project_role || cf.rol_comite || 'cliente activo beta';
-  const noPitch = isIa360DoNotPitchContact(contact);
-  const parts = [String(role), 'cliente activo en beta supervisada'];
-  if (noPitch) parts.push('do_not_pitch: PROHIBIDO vender, pitchear u ofrecer nuevos servicios');
-  parts.push('estilo ejecutivo: respuesta corta, implicación de negocio, control y riesgo, sin detalle técnico salvo que lo pida');
-  return parts.join(' | ');
-}
-
-// ── G-BRAIN: estado conversacional del agente por contacto ─────────────────────
-// El agente excavaba sin memoria de turno (caso José Ramón 06-11: 8 preguntas
-// seguidas, ninguna propuesta, re-preguntas de lo ya respondido). El estado vive
-// en custom_fields.ia360_conv_state y entra al agente vía roleHint (mecanismo
-// G-LIVE: Normalize lo mapea a contact.role en el agent_input, SIN tocar n8n).
-const IA360_CONV_QUESTION_BUDGET = 4; // preguntas máximas de diagnóstico por conversación
-const IA360_CONV_OPTIONS_EVERY = 3;   // cada N turnos del agente: resumen + opciones
-
-function loadIa360ConvState(contact) {
-  const raw = contact?.custom_fields?.ia360_conv_state;
-  const st = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
-  return {
-    turns: Number(st.turns) || 0,
-    asked_total: Number(st.asked_total) || 0,
-    questions_asked: Array.isArray(st.questions_asked) ? st.questions_asked : [],
-    answered: (st.answered && typeof st.answered === 'object' && !Array.isArray(st.answered)) ? st.answered : {},
-    corrections: Array.isArray(st.corrections) ? st.corrections : [],
-    last_options_turn: Number(st.last_options_turn) || 0,
-  };
-}
-
-// Oraciones interrogativas del reply del agente (terminadas en '?'), compactas.
-function extractIa360Questions(text) {
-  return String(text || '')
-    .split(/(?<=[?.!\n])/)
-    .map(s => s.trim())
-    .filter(s => s.endsWith('?'))
-    .map(s => (s.length > 160 ? s.slice(0, 157) + '...' : s));
-}
-
-// Señal de corrección del contacto ("el problema sí es CRM porque no se usa
-// ninguno"): el agente debe respetarla y nunca volver al dato corregido.
-function detectIa360Correction(body) {
-  return /(no,?\s+(es|era|así)|me refer[ií]|en realidad|m[aá]s bien|te corrijo|no me refiero|no es eso|el problema\s+(s[ií]|si)\s+es)/i.test(String(body || ''));
-}
-
-// Señal de compra o de carencia explícita: el siguiente mensaje propone, no pregunta.
-function detectIa360BuyingSignal(body) {
-  return /(no (tenemos|hay|contamos con|usamos)\s|nos (falta|urge|interesa)|c[oó]mo le (hacemos|hago)|qu[eé] (sigue|necesitas|propones)|me interesa|cu[aá]nto (cuesta|sale)|d[oó]nde (firmo|empiezo)|ay[uú]dame con)/i.test(String(body || ''));
-}
-
-// "Dolor calificado" en adelante: el agente deja de excavar y PROPONE.
-function ia360StageMode(stageName) {
-  return ['Dolor calificado', 'Agenda en proceso', 'Reunión agendada', 'Requiere Alek'].includes(String(stageName || ''))
-    ? 'proponer' : 'excavar';
-}
-
-function buildIa360ConversationRoleHint({ contact, stageName, convState, memory, messageBody = '' }) {
-  const st = convState || loadIa360ConvState(contact);
-  const profile = getIa360ContactProfile(contact);
-  const parts = [];
-  if (profile.name) parts.push(`hablas con ${profile.name}${profile.role ? ` (${profile.role})` : ''}${profile.accountName ? ` de ${profile.accountName}` : ''}`);
-
-  // Memoria del contacto (memory-lookup): el modelo DEBE usarla, no re-preguntarla.
-  const factBits = [];
-  for (const f of (memory?.facts || []).slice(0, 4)) {
-    const bit = [f.recurring_pain, f.preference, f.objection].filter(Boolean).join('; ');
-    if (bit) factBits.push(bit);
-  }
-  for (const e of (memory?.events || []).slice(0, 2)) {
-    if (e.summary) factBits.push(String(e.summary));
-  }
-  if (factBits.length) parts.push(`contexto que YA SABES del contacto (úsalo en tu respuesta, no preguntes lo que ya sabes): ${factBits.slice(0, 5).map(b => String(b).slice(0, 140)).join(' / ')}`);
-
-  // Estado de ESTA conversación.
-  const learned = Object.entries(st.answered).filter(([, v]) => v != null && String(v).trim() !== '')
-    .map(([k, v]) => `${k}=${String(v).slice(0, 80)}`);
-  if (learned.length) parts.push(`el contacto YA respondió: ${learned.join(', ')} — PROHIBIDO volver a preguntarlo`);
-  if (st.corrections.length) parts.push(`correcciones del contacto que DEBES respetar: ${st.corrections.slice(-2).map(c => `«${String(c).slice(0, 110)}»`).join(' ')}`);
-  if (st.questions_asked.length) parts.push(`preguntas que YA hiciste (no las repitas ni las reformules): ${st.questions_asked.slice(-4).map(q => `«${q}»`).join(' ')}`);
-
-  // Modo por etapa.
-  if (ia360StageMode(stageName) === 'proponer') {
-    parts.push(`etapa "${stageName}": MODO PROPONER — deja de excavar; resume el dolor en 1-2 líneas y propone 2-3 acciones concretas (resumen del mapa de su operación, llamada con Alek, mini-plan inicial); si preguntas, que sea SOLO para elegir entre esas opciones`);
-  } else {
-    parts.push(`etapa "${stageName || 'inicio'}": puedes explorar el dolor, con presupuesto de preguntas`);
-  }
-
-  // Presupuesto de preguntas.
-  if (st.asked_total >= IA360_CONV_QUESTION_BUDGET) {
-    parts.push(`presupuesto de preguntas AGOTADO (${st.asked_total}/${IA360_CONV_QUESTION_BUDGET}): NO hagas más preguntas de diagnóstico; resume lo aprendido y propone 2-3 siguientes pasos concretos`);
-  } else {
-    parts.push(`presupuesto de preguntas: ${st.asked_total}/${IA360_CONV_QUESTION_BUDGET} usadas en la conversación; máximo UNA pregunta por mensaje, nunca dos`);
-  }
-
-  // Cadencia de cierre con opciones.
-  if (st.turns > 0 && (st.turns - st.last_options_turn) >= IA360_CONV_OPTIONS_EVERY) {
-    parts.push('en ESTE turno toca cierre: resume en 2-3 líneas lo aprendido hasta ahora y ofrece 2-3 opciones de siguiente paso (resumen del mapa, llamada con Alek, mini-plan), no otra pregunta abierta');
-  }
-  if (detectIa360BuyingSignal(messageBody)) {
-    parts.push('el último mensaje trae SEÑAL DE COMPRA o carencia explícita: responde proponiendo el siguiente paso concreto, NO con otra pregunta de diagnóstico');
-  }
-  parts.push('si dejaste una pregunta abierta y el contacto no la respondió, retómala o ciérrala explícitamente; nunca la abandones en silencio');
-  return parts.join(' | ');
-}
-
-// Persistencia del estado tras CADA reply conversacional enviado.
-async function updateIa360ConvState({ record, contact, agent, replyBody, convState }) {
-  try {
-    const st = convState || loadIa360ConvState(contact);
-    const newQuestions = extractIa360Questions(replyBody);
-    const answered = { ...st.answered };
-    for (const [k, v] of Object.entries(agent?.extracted || {})) {
-      if (v != null && String(v).trim() !== '') answered[k] = String(v).slice(0, 120);
-    }
-    const corrections = [...st.corrections];
-    if (detectIa360Correction(record.message_body)) corrections.push(String(record.message_body).slice(0, 140));
-    const turns = st.turns + 1;
-    const dueOptions = st.turns > 0 && (st.turns - st.last_options_turn) >= IA360_CONV_OPTIONS_EVERY;
-    await mergeContactIa360State({
-      waNumber: record.wa_number,
-      contactNumber: record.contact_number,
-      customFields: {
-        ia360_conv_state: {
-          turns,
-          asked_total: st.asked_total + newQuestions.length,
-          questions_asked: [...st.questions_asked, ...newQuestions].slice(-8),
-          answered,
-          corrections: corrections.slice(-4),
-          // El hint exige el cierre cuando toca; el turno que lo pidió resetea la cadencia.
-          last_options_turn: dueOptions ? turns : st.last_options_turn,
-          updated_at: new Date().toISOString(),
-        },
-      },
-    });
-  } catch (e) {
-    console.error('[ia360-conv-state] update error:', e.message);
-  }
-}
-
-// Deuda G-LIVE: post-filtro de pitch en CÓDIGO (no solo en prompt) para do_not_pitch.
-function ia360ReplySmellsLikePitch(text) {
-  return /(contrat(a|ar|aci[oó]n)|cotizaci[oó]n|precio especial|descuento|promoci[oó]n|plan (mensual|anual)|propuesta comercial|te (vendo|ofrezco el (servicio|plan))|upgrade|upsell)/i.test(String(text || ''));
-}
-
 function getIa360ContactProfile(contact) {
   const cf = contact?.custom_fields || {};
   const beta = cf.ia360_cliente_activo_beta || {};
@@ -827,39 +638,18 @@ async function persistIa360MemorySignals({ record, contact, signals }) {
 
 async function lookupIa360MemoryContext({ record, contact, limit = 8 }) {
   await ensureIa360MemoryTables();
-  // G-RAG (revisión 06-11): la llave de la jaula es SOLO el proyecto declarado
-  // (beta.project o custom_fields.project_name). account_name NO es proxy de
-  // proyecto: usarlo escondía memoria real de contactos con empresa capturada
-  // y sin proyecto activo.
-  const cfJaula = contact?.custom_fields || {};
-  const jaulaProjectKey = (cfJaula.ia360_cliente_activo_beta || {}).project || cfJaula.project_name || null;
+  const profile = getIa360ContactProfile(contact);
   const params = [
     record?.wa_number || null,
     record?.contact_number || null,
-    jaulaProjectKey,
+    profile.projectName || null,
     limit,
   ];
-  // G-RAG JAULA por proyecto (decisión B1 de Alek 06-11): prohibida la fuga
-  // inter-proyecto. Con proyecto activo declarado, el agente recibe SOLO
-  // memoria de ESE proyecto + memoria general de persona (project_name
-  // vacío); lo que el mismo contacto tenga en OTRO proyecto queda FUERA.
-  // Sin proyecto activo no hay jaula que aplicar: se conserva el
-  // comportamiento G-BRAIN (toda la memoria del contacto). La comparación
-  // normaliza guiones/guiones bajos/espacios ('Camiones-Selectos' =
-  // 'Camiones Selectos'). El expediente del owner NO pasa por aquí: ese es
-  // cross-proyecto a propósito.
-  const jaulaWhere = `(
-        (contact_wa_number=$1 AND contact_number=$2
-         AND (COALESCE($3::text,'')=''
-              OR COALESCE(project_name,'')=''
-              OR regexp_replace(lower(project_name),'[-_ ]','','g') = regexp_replace(lower($3),'[-_ ]','','g')))
-        OR ($3::text IS NOT NULL AND $3<>'' AND
-            regexp_replace(lower(project_name),'[-_ ]','','g') = regexp_replace(lower($3),'[-_ ]','','g'))
-      )`;
   const events = await pool.query(
     `SELECT area, signal_type, summary, business_impact, missing_data, next_action, owner_review_status, created_at
        FROM coexistence.ia360_memory_events
-      WHERE ${jaulaWhere}
+      WHERE ((contact_wa_number=$1 AND contact_number=$2)
+             OR ($3::text IS NOT NULL AND project_name=$3))
       ORDER BY created_at DESC
       LIMIT $4`,
     params
@@ -867,13 +657,12 @@ async function lookupIa360MemoryContext({ record, contact, limit = 8 }) {
   const facts = await pool.query(
     `SELECT persona, role, preference, objection, recurring_pain, affected_process, missing_metric, confidence, status, last_seen_at
        FROM coexistence.ia360_memory_facts
-      WHERE ${jaulaWhere}
+      WHERE ((contact_wa_number=$1 AND contact_number=$2)
+             OR ($3::text IS NOT NULL AND project_name=$3))
       ORDER BY last_seen_at DESC
       LIMIT $4`,
     params
   );
-  console.log('[ia360-jaula] contacto=%s proyecto=%s facts=%d eventos=%d',
-    record?.contact_number || '-', jaulaProjectKey || '-', facts.rows.length, events.rows.length);
   return { events: events.rows, facts: facts.rows };
 }
 
@@ -938,7 +727,7 @@ function buildIa360OwnerMemoryReadout({ record, signals, persisted }) {
   return lines.join('\n');
 }
 
-async function handleIa360ClienteActivoBetaLearning({ record, deal, contact, captureOnly = false }) {
+async function handleIa360ClienteActivoBetaLearning({ record, deal, contact }) {
   const memoryBefore = await lookupIa360MemoryContext({ record, contact }).catch(err => {
     console.error('[ia360-memory] lookup before reply:', err.message);
     return { events: [], facts: [] };
@@ -955,24 +744,9 @@ async function handleIa360ClienteActivoBetaLearning({ record, deal, contact, cap
       ia360_memory_last_event_at: new Date().toISOString(),
       ia360_memory_last_areas: signals.map(s => s.area),
       ia360_memory_last_lookup_count: (memoryAfter.events || []).length + (memoryAfter.facts || []).length,
-      // Deuda G-LIVE cerrada: en captureOnly NO hubo reply — escribir el marcador
-      // de "última respuesta" contaminaba el estado informativo del contacto.
-      ...(captureOnly ? {} : { ia360_cliente_activo_beta_last_reply_kind: 'memory_learning' }),
+      ia360_cliente_activo_beta_last_reply_kind: 'memory_learning',
     },
   }).catch(e => console.error('[ia360-memory] contact marker:', e.message));
-  if (captureOnly) {
-    // G-LIVE: la captura de memoria NUNCA es respuesta al cliente. El caller (rama
-    // cliente activo/beta de handleIa360FreeText) responde con el agente IA; aquí
-    // solo se aprende en segundo plano.
-    console.log('[ia360-memory] contact=%s mode=%s events=%d facts=%d stage=%s egress=capture_only',
-      maskIa360Number(record.contact_number),
-      deal?.memory_mode || 'cliente_activo_beta',
-      persisted.filter(x => x.eventId).length,
-      persisted.filter(x => x.factId).length,
-      deal?.stage_name || '-'
-    );
-    return false;
-  }
   const reply = buildIa360ClienteActivoBetaReply({ signals, memoryContext: memoryAfter });
   const ownerReadout = buildIa360OwnerMemoryReadout({ record, signals, persisted });
   if (!IA360_MEMORY_EGRESS_ON) {
@@ -985,18 +759,14 @@ async function handleIa360ClienteActivoBetaLearning({ record, deal, contact, cap
         ia360_memory_last_owner_readout_preview: ownerReadout,
       },
     }).catch(e => console.error('[ia360-memory] dry-run marker:', e.message));
-    console.log('[ia360-memory] contact=%s mode=%s events=%d facts=%d stage=%s egress=dry_run -> fallback_required',
+    console.log('[ia360-memory] contact=%s mode=%s events=%d facts=%d stage=%s egress=dry_run',
       maskIa360Number(record.contact_number),
       deal?.memory_mode || 'cliente_activo_beta',
       persisted.filter(x => x.eventId).length,
       persisted.filter(x => x.factId).length,
       deal?.stage_name || '-'
     );
-    // Important: dry-run memory learning is NOT a customer response. Returning true
-    // made the parent handler believe the message was handled, which produced the
-    // active-client silence bug. Return false so handleIa360FreeText sends the
-    // universal holding fallback + owner alert instead of leaving WhatsApp quiet.
-    return false;
+    return true;
   }
   await enqueueIa360Text({ record, label: 'ia360_cliente_activo_beta_memory_reply', body: reply });
   sendIa360DirectText({
@@ -1076,11 +846,18 @@ function inferIa360QaPersonaHint(name) {
 // el remitente). Se sanitiza antes de persistir: sin caracteres de control ni
 // saltos de línea, sin llaves de placeholder, espacios colapsados y tope de 60
 // caracteres. Devuelve null si no queda nada usable.
-// G9: delega en el modulo puro ia360ReferidoIntro para que el vCard y el comando
-// del owner "intro <contacto>: <quien>" compartan exactamente la misma regla de
-// sanitizado (control/bidi/zero-width fuera, sin llaves, tope 60 code points).
 function sanitizeIa360IntroName(raw) {
-  return sanitizeIa360IntroNamePure(raw);
+  const clean = String(raw || '')
+    .replace(/[\u0000-\u001F\u007F\u2028\u2029\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, ' ')
+    .replace(/[{}]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Corte por code points (no por unidades UTF-16): un emoji en la frontera de
+  // los 60 caracteres no deja un surrogate suelto que rompa el jsonb al persistir.
+  const capped = Array.from(clean).slice(0, 60).join('').trim();
+  if (!capped) return null;
+  if (!/[\p{L}]/u.test(capped)) return null; // sin letras (solo dígitos/símbolos) no sirve como nombre
+  return capped;
 }
 
 async function upsertIa360SharedContact({ record, shared }) {
@@ -1168,34 +945,20 @@ async function recordBlockedOwnerNumberVcard({ record, shared }) {
   }).catch(e => console.error('[ia360-vcard] owner-number block persist:', e.message));
 }
 
-// G8: `pipelineName` enruta el deal. Default = Revenue genérico (no rompe lo
-// existente). Los callsites del journey de aliado/referido BNI pasan
-// IA360_PARTNERS_PIPELINE_NAME ('Partners / Aliados (BNI)', id 6) — derivado de
-// flow.relationshipContext vía ia360PipelineForRelationship.
-async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes = '', pipelineName = IA360_DEFAULT_PIPELINE_NAME }) {
+async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes = '' }) {
   if (!record || !record.wa_number || !record.contact_number || !targetStageName) return null;
   const { rows: pipeRows } = await pool.query(
-    `SELECT id FROM coexistence.pipelines WHERE name = $1 LIMIT 1`,
-    [pipelineName]
+    `SELECT id FROM coexistence.pipelines WHERE name = 'IA360 WhatsApp Revenue Pipeline' LIMIT 1`
   );
   const pipelineId = pipeRows[0]?.id;
   if (!pipelineId) return null;
-
-  // targetStageName usa la semántica del Revenue pipeline (compartida por los
-  // handlers persona-first). El pipeline Partners no tiene esos nombres, así que
-  // se traduce al stage REAL del pipeline 6 (ia360ResolveStageName). El nombre
-  // LÓGICO original se conserva en requestedStageName para no romper disparadores
-  // semánticos — p. ej. el handoff n8n de "Requiere Alek", que NO es un stage del
-  // pipeline Partners pero sí un evento que debe seguir disparándose.
-  const requestedStageName = targetStageName;
-  const resolvedStageName = ia360ResolveStageName(pipelineName, requestedStageName);
 
   const { rows: stageRows } = await pool.query(
     `SELECT id, name, position, stage_type
        FROM coexistence.pipeline_stages
       WHERE pipeline_id = $1 AND name = $2
       LIMIT 1`,
-    [pipelineId, resolvedStageName]
+    [pipelineId, targetStageName]
   );
   const targetStage = stageRows[0];
   if (!targetStage) return null;
@@ -1243,9 +1006,7 @@ async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes 
       [pipelineId, targetStage.id, title, status, createdBy, record.wa_number, record.contact_number, contactName, nextNote, posRows[0].pos, createdBy]
     );
     // G-G: hot lead created directly at "Requiere Alek" → handoff to EspoCRM (priority high so a human Task is created).
-    // G8: se evalúa sobre el nombre LÓGICO solicitado (no el stage resuelto), para
-    // que el handoff siga disparando aunque el pipeline Partners lo mapee a otro stage.
-    if (requestedStageName === 'Requiere Alek') {
+    if (targetStage.name === 'Requiere Alek') {
       emitIa360N8nHandoff({
         record,
         eventType: 'requires_alek',
@@ -1279,7 +1040,7 @@ async function syncIa360Deal({ record, targetStageName, titleSuffix = '', notes 
   // G-G: deal just ENTERED "Requiere Alek" (was at a different stage) → handoff to EspoCRM, priority high (creates human Task).
   // Transition-detection = idempotent (only fires when crossing into the stage, not on every re-touch while already there).
   // No-dup-with-booking: the n8n handoff upserts Contact/Opportunity/Task by name, so a later meeting_confirmed updates the SAME records.
-  if (shouldMove && requestedStageName === 'Requiere Alek' && existing.current_stage_name !== targetStage.name) {
+  if (shouldMove && targetStage.name === 'Requiere Alek' && existing.current_stage_name !== 'Requiere Alek') {
     emitIa360N8nHandoff({
       record,
       eventType: 'requires_alek',
@@ -1605,359 +1366,6 @@ async function handleRevenueOsFreeText(record) {
   }
 }
 
-// ============================================================================
-// G-WIN — Quick-win "Mapa de cartera" (Pipeline 7 "Champions — Adopción y
-// expansión", persona cliente activo / CFO). Patrón Revenue OS P5: máquina de
-// estados en contacts.custom_fields.ia360_cartera_state ('' → esperando_tabla
-// → mapa_entregado), handlers gateados que CORTAN el embudo, egress único vía
-// enqueueIa360Text / sendIa360DirectText → sendQueue.
-//   PASO 1 (texto cartera/saldos que no cuadran) → Hallazgo / Impacto / Dato
-//          faltante (pide la tabla EN TEXTO; el bot no lee imágenes) /
-//          Siguiente acción. SIN pitch y SIN agenda.
-//   PASO 2 (tabla pegada en texto) → mapa estructurado al contacto + nota
-//          completa en su deal P7 + cola ia360_docs_sync + readout al owner +
-//          deal a "Quick win entregado" (solo hacia adelante).
-// GUARDRAIL: nunca agenda automática, no nutrición, no insistencia; si el
-// mensaje no es de cartera, el flujo NO se activa y el agente genérico sigue.
-// ============================================================================
-const CHAMPIONS_PIPELINE_NAME = 'Champions — Adopción y expansión';
-const CARTERA_STAGE_VALIDACION = 'Validación en curso';
-const CARTERA_STAGE_QUICKWIN = 'Quick win entregado';
-const CARTERA_FORMATO_TABLA = 'Cliente | Saldo en portal | Saldo correcto | Fecha de corte | Responsable';
-
-const IA360_CARTERA_COPY = {
-  paso1: [
-    'Gracias por el aviso. Lo dejo ordenado:',
-    '',
-    '*Hallazgo:* los saldos que muestra el portal no cuadran con los saldos reales de cartera; hoy la corrección depende de revisiones manuales y la diferencia no se ve en un solo lugar.',
-    '',
-    '*Impacto:* mientras el portal muestre saldos incorrectos, cobranza trabaja con cifras que el cliente puede rebatir y el seguimiento pierde confiabilidad.',
-    '',
-    '*Dato faltante:* mándame la tabla aquí mismo, en texto, una línea por cuenta con este formato:',
-    CARTERA_FORMATO_TABLA,
-    'Importante: no puedo leer imágenes ni archivos adjuntos; si la tienes en foto o en Excel, pégamela como texto.',
-    '',
-    '*Siguiente acción:* en cuanto la reciba, la convierto en tu mapa de cartera (cuenta → saldo portal → saldo correcto → fecha de corte → responsable → siguiente acción) y lo dejo registrado para Alek.',
-  ].join('\n'),
-  pideTexto: [
-    'Recibí tu archivo, pero no puedo leer imágenes ni documentos adjuntos.',
-    '¿Me pegas la tabla aquí mismo en texto? Una línea por cuenta:',
-    CARTERA_FORMATO_TABLA,
-  ].join('\n'),
-  recordatorioFormato: [
-    'Va, sigo pendiente de la tabla para armar el mapa. Pégala aquí en texto, una línea por cuenta:',
-    CARTERA_FORMATO_TABLA,
-  ].join('\n'),
-};
-
-// Persona cliente activo / CFO: reúsa el helper beta (Andrés) y el perfil
-// persona-first (QA y contactos nuevos). El owner JAMÁS entra a este flujo.
-function ia360IsClienteActivoCartera(contact) {
-  if (!contact) return false;
-  if (isIa360ClienteActivoBetaContact(contact)) return true;
-  const cf = contact.custom_fields || {};
-  const rel = cf?.ia360_persona_first?.classification?.relationship_context || '';
-  const personaCtx = String(cf.persona_context || '').toLowerCase();
-  const tags = Array.isArray(contact.tags) ? contact.tags.map(t => String(t || '').toLowerCase()) : [];
-  return rel === 'cliente_activo'
-    || personaCtx === 'cliente activo'
-    || tags.includes('persona:cliente_activo');
-}
-
-// Disparador del PASO 1: cartera/cobranza explícita, o "saldos" acompañado de
-// señal de descuadre. Mantenerlo angosto: un tema no-cartera NO debe activar
-// el flujo (gate del goal).
-const IA360_CARTERA_TRIGGER_RE = /\b(cartera|cobranza|cuentas?\s+por\s+cobrar)\b/i;
-const IA360_CARTERA_SALDOS_RE = /\bsaldos?\b/i;
-const IA360_CARTERA_DESCUADRE_RE = /no\s+cuadra|descuadr|incorrect|equivocad|diferenc|portal|\bmal\b/i;
-
-function ia360EsMensajeCartera(body) {
-  const t = String(body || '');
-  return IA360_CARTERA_TRIGGER_RE.test(t)
-    || (IA360_CARTERA_SALDOS_RE.test(t) && IA360_CARTERA_DESCUADRE_RE.test(t));
-}
-
-// Parser de la tabla pegada en texto. Separadores: | ; tab. Coma solo si la
-// línea no trae montos con coma de millares ("1,250,000"). Salta encabezados.
-function parseCarteraTabla(text) {
-  const rows = [];
-  const lines = String(text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  for (const line of lines) {
-    let parts = null;
-    if (/[|;\t]/.test(line)) parts = line.split(/[|;\t]/);
-    else if (line.includes(',') && !/\d,\d{3}/.test(line)) parts = line.split(',');
-    if (!parts) continue;
-    parts = parts.map(p => p.trim()).filter(p => p !== '');
-    if (parts.length < 4) continue;
-    const low = line.toLowerCase();
-    if (/cliente|cuenta/.test(low) && /saldo/.test(low)) continue; // encabezado
-    rows.push({
-      cuenta: parts[0],
-      saldo_portal: parts[1],
-      saldo_correcto: parts[2],
-      fecha_corte: parts[3],
-      responsable: parts[4] || 'por confirmar',
-    });
-  }
-  return rows;
-}
-
-function carteraMonto(s) {
-  const limpio = String(s || '').replace(/[^0-9.\-]/g, '');
-  if (!limpio || limpio === '-' || limpio === '.') return null;
-  const n = Number(limpio);
-  return Number.isFinite(n) ? n : null;
-}
-
-function carteraFormatoMonto(n) {
-  if (n === null || !Number.isFinite(n)) return null;
-  const negativo = n < 0;
-  const [ent, dec] = Math.abs(n).toFixed(2).split('.');
-  return `${negativo ? '-' : ''}$${ent.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${dec}`;
-}
-
-// Mapa estructurado: cuenta → saldo portal → saldo correcto → diferencia →
-// fecha de corte → responsable → siguiente acción.
-function buildCarteraMapa(rows) {
-  const bloques = [];
-  let diferenciaTotal = 0;
-  let cuentasConDescuadre = 0;
-  rows.forEach((r, i) => {
-    const portal = carteraMonto(r.saldo_portal);
-    const correcto = carteraMonto(r.saldo_correcto);
-    const dif = portal !== null && correcto !== null ? correcto - portal : null;
-    if (dif !== null) {
-      diferenciaTotal += dif;
-      if (dif !== 0) cuentasConDescuadre += 1;
-    }
-    bloques.push([
-      `${i + 1}) Cuenta: ${r.cuenta}`,
-      `   - Saldo en portal: ${carteraFormatoMonto(portal) || r.saldo_portal}`,
-      `   - Saldo correcto: ${carteraFormatoMonto(correcto) || r.saldo_correcto}`,
-      `   - Diferencia: ${dif !== null ? carteraFormatoMonto(dif) : 'por calcular'}`,
-      `   - Fecha de corte: ${r.fecha_corte}`,
-      `   - Responsable: ${r.responsable}`,
-      `   - Siguiente acción: corregir el saldo en el portal y confirmarlo con ${r.responsable} antes del próximo corte.`,
-    ].join('\n'));
-  });
-  const texto = [
-    '*Mapa de cartera — saldos por corregir*',
-    '',
-    bloques.join('\n\n'),
-    '',
-    `Cuentas con descuadre: ${cuentasConDescuadre} de ${rows.length} · Diferencia acumulada: ${carteraFormatoMonto(diferenciaTotal) || 'por calcular'}`,
-    '',
-    'Ya quedó registrado para Alek con el detalle completo. Cuando el portal refleje los saldos correctos, este mapa sirve para confirmarlo cuenta por cuenta.',
-  ].join('\n');
-  return { texto, diferenciaTotal, cuentasConDescuadre };
-}
-
-// Movimiento de deal dedicado a Pipeline 7 (clon del patrón syncRevenueOsDeal:
-// create-or-move, solo hacia adelante por posición; NO toca otros pipelines).
-async function syncCarteraChampionsDeal({ record, targetStageName, notes = '' }) {
-  if (!record || !record.wa_number || !record.contact_number || !targetStageName) return null;
-  const { rows: pipeRows } = await pool.query(
-    `SELECT id FROM coexistence.pipelines WHERE name = $1 LIMIT 1`,
-    [CHAMPIONS_PIPELINE_NAME]
-  );
-  const pipelineId = pipeRows[0]?.id;
-  if (!pipelineId) return null;
-
-  const { rows: stageRows } = await pool.query(
-    `SELECT id, name, position, stage_type
-       FROM coexistence.pipeline_stages
-      WHERE pipeline_id = $1 AND name = $2
-      LIMIT 1`,
-    [pipelineId, targetStageName]
-  );
-  const targetStage = stageRows[0];
-  if (!targetStage) return null;
-
-  const { rows: userRows } = await pool.query(
-    `SELECT id FROM coexistence.forgecrm_users WHERE role='admin' ORDER BY id LIMIT 1`
-  );
-  const createdBy = userRows[0]?.id || null;
-
-  const { rows: contactRows } = await pool.query(
-    `SELECT COALESCE(name, profile_name, $3) AS name
-       FROM coexistence.contacts
-      WHERE wa_number=$1 AND contact_number=$2
-      LIMIT 1`,
-    [record.wa_number, record.contact_number, record.contact_number]
-  );
-  const contactName = contactRows[0]?.name || record.contact_number;
-  const nextNote = `[${new Date().toISOString()}] ${notes || `Stage → ${targetStageName}`}`;
-
-  const { rows: existingRows } = await pool.query(
-    `SELECT d.*, s.position AS current_stage_position, s.name AS current_stage_name
-       FROM coexistence.deals d
-       JOIN coexistence.pipeline_stages s ON s.id=d.stage_id
-      WHERE d.pipeline_id=$1 AND d.contact_wa_number=$2 AND d.contact_number=$3
-      ORDER BY d.updated_at DESC NULLS LAST, d.id DESC
-      LIMIT 1`,
-    [pipelineId, record.wa_number, record.contact_number]
-  );
-
-  if (existingRows.length === 0) {
-    const title = `IA360 · ${contactName} · Quick win cartera`;
-    const { rows: posRows } = await pool.query(
-      `SELECT COALESCE(MAX(position),-1)+1 AS pos FROM coexistence.deals WHERE stage_id=$1`,
-      [targetStage.id]
-    );
-    const status = targetStage.stage_type === 'won' ? 'won' : targetStage.stage_type === 'lost' ? 'lost' : 'open';
-    const { rows } = await pool.query(
-      `INSERT INTO coexistence.deals
-         (pipeline_id, stage_id, title, value, currency, status, assigned_user_id,
-          contact_wa_number, contact_number, contact_name, notes, position, created_by,
-          won_at, lost_at)
-       VALUES ($1,$2,$3,0,'MXN',$4,$5,$6,$7,$8,$9,$10,$11,
-               ${status === 'won' ? 'NOW()' : 'NULL'}, ${status === 'lost' ? 'NOW()' : 'NULL'})
-       RETURNING id`,
-      [pipelineId, targetStage.id, title, status, createdBy, record.wa_number, record.contact_number, contactName, nextNote, posRows[0].pos, createdBy]
-    );
-    return { id: rows[0].id, created: true, stage: targetStage.name, title };
-  }
-
-  const existing = existingRows[0];
-  const shouldMove = Number(targetStage.position) >= Number(existing.current_stage_position);
-  const finalStageId = shouldMove ? targetStage.id : existing.stage_id;
-  const finalStatus = targetStage.stage_type === 'won' ? 'won' : targetStage.stage_type === 'lost' ? 'lost' : 'open';
-  const finalNotes = `${existing.notes || ''}${existing.notes ? '\n' : ''}${nextNote}`;
-  await pool.query(
-    `UPDATE coexistence.deals
-        SET stage_id = $1,
-            status = $2,
-            notes = $3,
-            updated_at = NOW(),
-            won_at = CASE WHEN $2='won' THEN COALESCE(won_at, NOW()) ELSE NULL END,
-            lost_at = CASE WHEN $2='lost' THEN COALESCE(lost_at, NOW()) ELSE NULL END
-      WHERE id = $4`,
-    [finalStageId, shouldMove ? finalStatus : existing.status, finalNotes, existing.id]
-  );
-  return { id: existing.id, moved: shouldMove, stage: shouldMove ? targetStage.name : existing.current_stage_name, title: existing.title };
-}
-
-// Media (imagen/documento) durante esperando_tabla → pedir la versión en texto.
-// El bot no descarga ni interpreta el archivo; solo guía al contacto.
-async function handleCarteraMediaInbound(record) {
-  try {
-    if (!record || record.direction !== 'incoming') return false;
-    if (record.message_type !== 'image' && record.message_type !== 'document') return false;
-    if (normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) return false;
-    const contact = await loadIa360ContactContext(record).catch(() => null);
-    if (!contact || !ia360IsClienteActivoCartera(contact)) return false;
-    if ((contact.custom_fields?.ia360_cartera_state || '') !== 'esperando_tabla') return false;
-    await enqueueIa360Text({ record, label: 'ia360_cartera_pide_texto', body: IA360_CARTERA_COPY.pideTexto });
-    return true;
-  } catch (err) {
-    console.error('[cartera] media handler error (no route):', err.message);
-    return false;
-  }
-}
-
-// Readout al owner tras entregar el mapa (PASO 2). ownerBudget=false: un quick
-// win entregado siempre se reporta.
-function buildCarteraOwnerReadout({ record, contactName, deal, mapa, rows }) {
-  return [
-    `IA360 · Quick win cartera — ${contactName || 'contacto'} (${maskIa360Number(record.contact_number)})`,
-    '',
-    `El contacto entregó su tabla de cartera (${rows.length} ${rows.length === 1 ? 'cuenta' : 'cuentas'}) y le devolví el mapa estructurado.`,
-    `- Cuentas con descuadre: ${mapa.cuentasConDescuadre} · Diferencia acumulada: ${carteraFormatoMonto(mapa.diferenciaTotal) || 'por calcular'}`,
-    deal ? `- Deal: «${deal.title || 'sin título'}» → ${deal.stage} (P7 Champions).` : '- Deal: no se encontró deal en P7 (revisar).',
-    '- Mapa encolado a ia360_docs_sync (destino AlekContenido).',
-    '',
-    'No envié pitch ni agenda; el flujo quedó en modo quick win.',
-  ].join('\n');
-}
-
-// PASO 1 + PASO 2 — texto libre. Va DESPUÉS de Revenue OS y ANTES del agente
-// genérico en el dispatch; devuelve true para CORTAR el embudo (guardrail: el
-// agente no debe responder encima ni empujar agenda).
-async function handleCarteraFreeText(record) {
-  try {
-    if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return false;
-    const body = String(record.message_body || '').trim();
-    if (!body) return false;
-    if (normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) return false;
-    const contact = await loadIa360ContactContext(record).catch(() => null);
-    if (!contact || !ia360IsClienteActivoCartera(contact)) return false;
-    const state = contact.custom_fields?.ia360_cartera_state || '';
-
-    // PASO 2 — esperando la tabla.
-    if (state === 'esperando_tabla') {
-      const rows = parseCarteraTabla(body);
-      if (rows.length > 0) {
-        const mapa = buildCarteraMapa(rows);
-        const deal = await syncCarteraChampionsDeal({
-          record,
-          targetStageName: CARTERA_STAGE_QUICKWIN,
-          notes: `PASO 2 mapa de cartera: tabla recibida (${rows.length} cuentas). Quick win entregado.\nTabla original:\n${body}\n\n${mapa.texto}`,
-        }).catch(e => { console.error('[cartera] deal quick win:', e.message); return null; });
-        await mergeContactIa360State({
-          waNumber: record.wa_number,
-          contactNumber: record.contact_number,
-          tags: ['cartera-quickwin-entregado'],
-          customFields: {
-            ia360_cartera_state: 'mapa_entregado',
-            ia360_cartera_mapa_at: new Date().toISOString(),
-            ia360_cartera_cuentas: rows.length,
-            ia360_cartera_tabla_raw: body,
-          },
-        }).catch(e => console.error('[cartera] estado mapa_entregado:', e.message));
-        await enqueueIa360Text({ record, label: 'ia360_cartera_mapa', body: mapa.texto });
-        await pool.query(
-          `INSERT INTO coexistence.ia360_docs_sync (idea_id, titulo, contenido, destino)
-           VALUES (NULL, $1, $2, 'AlekContenido')`,
-          [
-            `Mapa de cartera — ${contact.name || record.contact_number} (${new Date().toISOString().slice(0, 10)})`,
-            `${mapa.texto}\n\n---\nTabla original pegada por el contacto:\n${body}`,
-          ]
-        ).catch(e => console.error('[cartera] docs_sync:', e.message));
-        await sendIa360DirectText({
-          record,
-          toNumber: IA360_OWNER_NUMBER,
-          label: 'owner_cartera_readout',
-          body: buildCarteraOwnerReadout({ record, contactName: contact.name, deal, mapa, rows }),
-          targetContact: record.contact_number,
-        }).catch(e => console.error('[cartera] owner readout:', e.message));
-        return true;
-      }
-      // Sin tabla todavía: si insiste en el tema, recordamos el formato; si
-      // habla de otra cosa, el agente genérico responde (respuesta siempre útil).
-      if (ia360EsMensajeCartera(body)) {
-        await enqueueIa360Text({ record, label: 'ia360_cartera_formato', body: IA360_CARTERA_COPY.recordatorioFormato });
-        return true;
-      }
-      return false;
-    }
-
-    // PASO 1 — disparo del flujo (solo tema cartera; gate del goal).
-    if (state !== 'mapa_entregado' && ia360EsMensajeCartera(body)) {
-      await mergeContactIa360State({
-        waNumber: record.wa_number,
-        contactNumber: record.contact_number,
-        tags: ['cartera-quickwin'],
-        customFields: {
-          ia360_cartera_state: 'esperando_tabla',
-          ia360_cartera_dolor: body,
-          ia360_cartera_paso1_at: new Date().toISOString(),
-        },
-      });
-      await syncCarteraChampionsDeal({
-        record,
-        targetStageName: CARTERA_STAGE_VALIDACION,
-        notes: `PASO 1 mapa de cartera: el contacto reportó saldos que no cuadran. Mensaje: ${body}`,
-      }).catch(e => console.error('[cartera] deal paso 1:', e.message));
-      await enqueueIa360Text({ record, label: 'ia360_cartera_paso1', body: IA360_CARTERA_COPY.paso1 });
-      return true;
-    }
-    return false;
-  } catch (err) {
-    console.error('[cartera] free-text handler error (no route):', err.message);
-    return false;
-  }
-}
-
 async function resolveIa360Outbound(record, dedupSuffix = '') {
   // dedupSuffix permite mandar UN segundo mensaje al mismo contacto para el mismo inbound
   // sin que el dedup (por ia360_handler_for) lo descarte. Default '' = comportamiento idéntico.
@@ -2003,9 +1411,6 @@ async function enqueueIa360Interactive({ record, label, messageBody, interactive
     if (parts.length) auditBody = messageBody + ' — ' + parts.join(' — ');
   } catch (e) { /* keep label-only body on any parsing issue */ }
 
-  // G-BRAIN sandbox: interactivo al OWNER originado por inbound sintético del
-  // harness => fila 'qa_sandboxed' sin egress real.
-  const qaSandbox = normalizePhone(record.contact_number) === IA360_OWNER_NUMBER && isIa360SyntheticWamid(record.message_id);
   const localId = await insertPendingRow({
     account,
     toNumber: record.contact_number,
@@ -2016,16 +1421,9 @@ async function enqueueIa360Interactive({ record, label, messageBody, interactive
       label,
       ia360_handler_for: dedupSuffix ? record.message_id + dedupSuffix : record.message_id,
       source: 'webhook_interactive_reply',
-      ...(qaSandbox ? { qa_sandbox: true } : {}),
     },
     rawPayloadExtra: interactive,
-    ...(qaSandbox ? { status: 'qa_sandboxed' } : {}),
   });
-  if (!localId) return false; // dedupe atómico ON CONFLICT: otra ruta ya insertó este handler
-  if (qaSandbox) {
-    console.log('[ia360-qa-sandbox] interactivo al owner SIN egress real label=%s origen=%s', label, record.message_id);
-    return true;
-  }
   await enqueueSend({
     kind: 'interactive',
     accountId: account.id,
@@ -2098,17 +1496,11 @@ async function dispatchContextFlow(record) {
   });
 }
 
-async function enqueueIa360Text({ record, label, body, dedupSuffix = '' }) {
-  // dedupSuffix (deuda G-LIVE): permite un SEGUNDO texto legítimo al mismo contacto
-  // para el mismo inbound (p.ej. fallback del slot-confirm tras un prompt fallido)
-  // sin que el dedupe por ia360_handler_for lo descarte. Default '' = sin cambio.
-  const resolved = await resolveIa360Outbound(record, dedupSuffix);
+async function enqueueIa360Text({ record, label, body }) {
+  const resolved = await resolveIa360Outbound(record);
   if (resolved.duplicate || resolved.error) return false;
   const { account } = resolved;
 
-  // G-BRAIN sandbox: texto al OWNER originado por inbound sintético del harness
-  // => fila 'qa_sandboxed' sin egress real.
-  const qaSandbox = normalizePhone(record.contact_number) === IA360_OWNER_NUMBER && isIa360SyntheticWamid(record.message_id);
   const localId = await insertPendingRow({
     account,
     toNumber: record.contact_number,
@@ -2117,86 +1509,10 @@ async function enqueueIa360Text({ record, label, body, dedupSuffix = '' }) {
     templateMeta: {
       ux: 'ia360_100m',
       label,
-      ia360_handler_for: dedupSuffix ? record.message_id + dedupSuffix : record.message_id,
+      ia360_handler_for: record.message_id,
       source: 'webhook_terminal_handoff',
-      ...(qaSandbox ? { qa_sandbox: true } : {}),
     },
-    ...(qaSandbox ? { status: 'qa_sandboxed' } : {}),
   });
-  if (!localId) return false; // dedupe atómico ON CONFLICT: otra ruta ya insertó este handler
-  if (qaSandbox) {
-    console.log('[ia360-qa-sandbox] texto al owner SIN egress real label=%s origen=%s', label, record.message_id);
-    return true;
-  }
-  await enqueueSend({
-    kind: 'text',
-    accountId: account.id,
-    to: record.contact_number,
-    localMessageId: localId,
-    payload: { body, previewUrl: false },
-  });
-  return true;
-}
-
-// G-BRAIN: respuesta conversacional del AGENTE con candado anti-doble-ruta.
-// El incidente José Ramón (ids 1651/1653): dos inbound casi simultáneos del mismo
-// contacto (texto + botón) dispararon rutas paralelas — la seq_* contestó al
-// instante y el agente (latencia 5-30 s) contestó LO MISMO 14 s después. El candado:
-// dentro de UNA transacción con advisory lock por contacto, si ya existe una
-// respuesta conversacional INSERTADA DESPUÉS de este inbound (o.id > inbound.id,
-// ventana 120 s), el reply del agente se descarta. El INSERT de la fila pendiente
-// ocurre en la MISMA transacción (no SELECT-then-INSERT): dos agentes concurrentes
-// se serializan en el lock y el segundo ve la fila del primero.
-// Devuelve: true = enviado; 'superseded' (truthy) = otra ruta ya contestó, el
-// caller debe marcar responded sin alertar; false = error/dedupe duro.
-async function enqueueIa360AgentReply({ record, label, body }) {
-  const resolved = await resolveIa360Outbound(record);
-  if (resolved.duplicate || resolved.error) return false;
-  const { account } = resolved;
-  const client = await pool.connect();
-  let localId = null;
-  try {
-    await client.query('BEGIN');
-    await client.query('SELECT pg_advisory_xact_lock(73601, hashtext($1))', [String(record.contact_number || '')]);
-    const { rows } = await client.query(
-      `SELECT o.id FROM coexistence.chat_history o
-        WHERE o.direction = 'outgoing'
-          AND o.contact_number = $1
-          AND o.template_meta->>'source' IN ('webhook_terminal_handoff', 'webhook_interactive_reply')
-          AND COALESCE(o.status, '') NOT IN ('failed', 'error')
-          AND o.id > COALESCE((SELECT i.id FROM coexistence.chat_history i WHERE i.message_id = $2 LIMIT 1), 0)
-          AND o.created_at > NOW() - INTERVAL '120 seconds'
-        LIMIT 1`,
-      [record.contact_number, record.message_id || '~none~']
-    );
-    if (rows.length) {
-      await client.query('ROLLBACK');
-      console.log('[ia360-dedupe] reply del agente DESCARTADO: otra ruta ya contestó (contact=%s inbound=%s outgoing_id=%s)',
-        maskIa360Number(record.contact_number), record.message_id, rows[0].id);
-      return 'superseded';
-    }
-    localId = await insertPendingRow({
-      account,
-      toNumber: record.contact_number,
-      messageType: 'text',
-      messageBody: body,
-      templateMeta: {
-        ux: 'ia360_100m',
-        label,
-        ia360_handler_for: record.message_id,
-        source: 'webhook_terminal_handoff',
-      },
-      db: client,
-    });
-    await client.query(localId ? 'COMMIT' : 'ROLLBACK');
-  } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) { /* ya cerrada */ }
-    console.error('[ia360-dedupe] agent reply tx error:', err.message);
-    return false;
-  } finally {
-    client.release();
-  }
-  if (!localId) return false;
   await enqueueSend({
     kind: 'text',
     accountId: account.id,
@@ -2258,22 +1574,14 @@ async function resolveTemplateHeaderMediaId(tpl, account) {
 const { validateTemplateSend } = require('../integrations/templateValidator');
 
 // Render a template body to plain text using the same param logic as
-// buildIa360TemplateComponents ({{1}} = contact first name, {{n}} = vars[n] reales
-// del flujo si traen contenido, si no samples[n]). Mantenerlo en paridad con
-// buildIa360TemplateComponents: este render es lo que se persiste como
-// message_body para que la auditoría del owner vea EXACTAMENTE lo que recibió
-// el contacto, no el body crudo con {{1}} (gap de auditoría del id 1612).
-function renderIa360TemplateBody(tpl, record, vars = null) {
+// buildIa360TemplateComponents ({{1}} = contact first name, other {{n}} = sample).
+function renderIa360TemplateBody(tpl, record) {
   const samples = parseTemplateSamples(tpl.samples);
-  return String(tpl.body || '').replace(/\{\{\s*(\d+)\s*\}\}/g, (_, k) => {
-    if (k === '1') return firstNameForTemplate(record);
-    const v = vars?.[k];
-    const hasVar = v != null && String(v).trim() !== '';
-    return hasVar ? String(v) : String(samples[k] || ' ');
-  });
+  return String(tpl.body || '').replace(/\{\{\s*(\d+)\s*\}\}/g, (_, k) =>
+    k === '1' ? firstNameForTemplate(record) : String(samples[k] || ' '));
 }
 
-async function buildIa360TemplateComponents(tpl, account, record, vars = null) {
+async function buildIa360TemplateComponents(tpl, account, record) {
   const components = [];
   const headerType = String(tpl.header_type || 'NONE').toUpperCase();
   const headerMediaId = await resolveTemplateHeaderMediaId(tpl, account);
@@ -2287,15 +1595,10 @@ async function buildIa360TemplateComponents(tpl, account, record, vars = null) {
   if (indexes.length) {
     components.push({
       type: 'body',
-      // G-COLD: para índices distintos de '1', vars (valor real del flujo, p.ej.
-      // quien_intro) tiene prioridad SOLO si trae contenido; si no, se conserva
-      // el fallback samples[k] || ' ' de los flujos existentes.
-      parameters: indexes.map(k => {
-        if (k === '1') return { type: 'text', text: firstNameForTemplate(record) };
-        const v = vars?.[k];
-        const hasVar = v != null && String(v).trim() !== '';
-        return { type: 'text', text: hasVar ? String(v) : String(samples[k] || ' ') };
-      }),
+      parameters: indexes.map(k => ({
+        type: 'text',
+        text: k === '1' ? firstNameForTemplate(record) : String(samples[k] || ' '),
+      })),
     });
   }
   return components;
@@ -2321,7 +1624,7 @@ async function waitForIa360OutboundStatus(handlerFor, timeoutMs = 9000) {
   return last || { status: 'unknown' };
 }
 
-async function enqueueIa360Template({ record, label, templateName, templateId = null, vars = null, allowTextFallback = true }) {
+async function enqueueIa360Template({ record, label, templateName, templateId = null }) {
   const resolved = await resolveIa360Outbound(record, `:${label}`);
   if (resolved.duplicate || resolved.error) return { ok: false, status: resolved.duplicate ? 'duplicate' : 'error', error: resolved.error || null };
   const { account } = resolved;
@@ -2353,7 +1656,7 @@ async function enqueueIa360Template({ record, label, templateName, templateId = 
   }
   let components;
   try {
-    components = await buildIa360TemplateComponents(tpl, account, record, vars);
+    components = await buildIa360TemplateComponents(tpl, account, record);
   } catch (err) {
     console.error('[ia360-owner-pipe] template components error:', err.message);
     return { ok: false, status: 'template_components_error', error: err.message };
@@ -2368,15 +1671,8 @@ async function enqueueIa360Template({ record, label, templateName, templateId = 
   try {
     const v = await validateTemplateSend(account, tpl.name, tpl.language || 'es_MX', components);
     if (!v.valid) {
-      // G-COLD: fuera de ventana el fallback a texto libre está PROHIBIDO
-      // (allowTextFallback:false): Meta lo rechazaría y aquí se reportaría un
-      // éxito falso; además renderiza con samples, no con vars reales.
-      if (!allowTextFallback) {
-        console.error(`[ia360-owner-pipe] template "${tpl.name}" invalid vs Meta (${v.source}): ${v.errors.join('; ')} -> sin fallback (allowTextFallback=false)`);
-        return { ok: false, status: 'template_invalid', error: v.errors.join('; ') };
-      }
       console.error(`[ia360-owner-pipe] template "${tpl.name}" invalid vs Meta (${v.source}): ${v.errors.join('; ')} -> free-text fallback`);
-      const sent = await enqueueIa360Text({ record, label: `${label}_textfallback`, body: renderIa360TemplateBody(tpl, record, vars) });
+      const sent = await enqueueIa360Text({ record, label: `${label}_textfallback`, body: renderIa360TemplateBody(tpl, record) });
       return { ok: !!sent, status: sent ? 'text_fallback' : 'error', error: sent ? null : 'template invalid and text fallback failed' };
     }
   } catch (err) {
@@ -2387,10 +1683,7 @@ async function enqueueIa360Template({ record, label, templateName, templateId = 
     account,
     toNumber: record.contact_number,
     messageType: 'template',
-    // G-BRAIN: persistir el body RENDERIZADO (mismos parámetros que los components
-    // enviados a Graph), no el crudo con {{1}} — la fila de chat_history es la
-    // evidencia de auditoría de lo que el contacto recibió de verdad.
-    messageBody: renderIa360TemplateBody(tpl, record, vars) || tpl.name,
+    messageBody: tpl.body || tpl.name,
     templateMeta: {
       ux: 'ia360_owner_pipeline',
       label,
@@ -2402,7 +1695,6 @@ async function enqueueIa360Template({ record, label, templateName, templateId = 
       header_media_library_id: tpl.header_media_library_id || null,
     },
   });
-  if (!localId) return { ok: false, status: 'duplicate', error: null }; // dedupe atómico ON CONFLICT
   await enqueueSend({
     kind: 'template',
     accountId: account.id,
@@ -2534,10 +1826,21 @@ async function bookIa360Slot({ record, start, end }) {
   }
 }
 
-// Delega en el módulo puro ./ia360OpenerReply (mismo parse, sin DB) para que los
-// tests ejerciten exactamente la extracción que corre en producción.
 function getInteractiveReplyId(record) {
-  return extractInteractiveReplyId(record);
+  try {
+    const payload = typeof record.raw_payload === 'string' ? JSON.parse(record.raw_payload) : record.raw_payload;
+    const msg = payload?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const interactive = msg?.interactive;
+    if (interactive) {
+      if (interactive.button_reply?.id) return String(interactive.button_reply.id).trim().toLowerCase();
+      if (interactive.list_reply?.id) return String(interactive.list_reply.id).trim().toLowerCase();
+    }
+    if (msg?.button?.payload) return String(msg.button.payload).trim().toLowerCase();
+    if (msg?.button?.text) return String(msg.button.text).trim().toLowerCase();
+  } catch (_) {
+    // ignore malformed/non-JSON payloads; fallback to visible title
+  }
+  return '';
 }
 
 
@@ -2594,10 +1897,7 @@ async function getActiveNonTerminalIa360Deal(record) {
   // is the exception: it can learn/respond with delight guardrails, not sell.
   if (deal.stage_type === 'won' || deal.stage_type === 'lost' || deal.stage_name === 'Ganado' || deal.stage_name === 'Perdido / no fit') {
     const contact = await loadIa360ContactContext(record).catch(() => null);
-    // Deuda G-LIVE cerrada: la marca beta en contacts MANDA aunque el último deal
-    // sea lost — un cliente activo/beta con un deal viejo perdido seguía recibiendo
-    // solo el holding del watchdog en vez de respuesta real del agente.
-    if (isIa360ClienteActivoBetaContact(contact)) {
+    if (isIa360ClienteActivoBetaContact(contact) && (deal.stage_type === 'won' || deal.stage_name === 'Ganado')) {
       return {
         ...deal,
         stage_name: 'Cliente activo beta supervisado',
@@ -2653,7 +1953,7 @@ async function shadowIa360ContactIntelligence({ record, stageName, history }) {
   }
 }
 
-async function callIa360Agent({ record, stageName, roleHint = null, memory = null }) {
+async function callIa360Agent({ record, stageName }) {
   // Recent conversation for context (last 8 messages).
   const { rows: hist } = await pool.query(
     `SELECT direction AS dir, message_body AS body
@@ -2666,16 +1966,12 @@ async function callIa360Agent({ record, stageName, roleHint = null, memory = nul
 
   // EXPEDIENTE: memoria por contacto (facts+events) para que el agente responda
   // con contexto real del negocio del contacto, no en frio. Best-effort.
-  // G-BRAIN: el caller puede pasarla precargada (memory) para no duplicar la
-  // consulta cuando ya la usó para construir el roleHint.
-  let agentMemory = memory;
-  if (!agentMemory) {
-    try {
-      const memContact = await loadIa360ContactContext(record);
-      agentMemory = await lookupIa360MemoryContext({ record, contact: memContact, limit: 8 });
-    } catch (memErr) {
-      console.error('[ia360-agent] memory lookup failed:', memErr.message);
-    }
+  let agentMemory = null;
+  try {
+    const memContact = await loadIa360ContactContext(record);
+    agentMemory = await lookupIa360MemoryContext({ record, contact: memContact, limit: 8 });
+  } catch (memErr) {
+    console.error('[ia360-agent] memory lookup failed:', memErr.message);
   }
 
   const primaryIa360AgentUrl = process.env.N8N_IA360_AGENT_WEBHOOK_URL;
@@ -2702,9 +1998,6 @@ async function callIa360Agent({ record, stageName, roleHint = null, memory = nul
           source: 'forgechat-ia360-webhook',
         }),
         memory: agentMemory,
-        // G-LIVE: el Normalize del workflow mapea `role` a contact.role dentro del
-        // agent_input — perfil de comunicación visible para el modelo sin tocar n8n.
-        ...(roleHint ? { role: roleHint } : {}),
       }),
       signal: ia360AgentController.signal,
     });
@@ -2831,7 +2124,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_pregunta: 'Va la pregunta: si este mensaje te hubiera llegado sin conocer a Alek, ¿se entiende qué es IA360 y qué puedo y no puedo hacer como IA, o hay algo que te haría desconfiar? Dímelo con toda franqueza; para eso es esta prueba.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek está construyendo IA360, un sistema que conecta WhatsApp, CRM y memoria de clientes, y me pidió validarlo con gente de su confianza antes de usarlo con clientes reales. No te quiero vender nada: solo necesito tu ojo técnico. ¿Me dejas hacerte una pregunta corta?`,
-        metaTemplateName: 'ia360_beta_architectura', // G-COLD: template frío con los mismos botones del opener
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -2853,7 +2145,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_pregunta: 'Gracias. ¿Cómo se siente recibir un mensaje así de una IA: natural, raro o invasivo? Lo que me digas se lo paso a Alek tal cual, sin suavizarlo.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek está probando IA360 (su sistema de WhatsApp + CRM con memoria) con contactos de confianza y quiere críticas directas, no cumplidos. ¿Me dejas hacerte una pregunta breve sobre cómo se siente recibir mensajes de una IA como esta?`,
-        metaTemplateName: 'ia360_beta_feedback', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -2875,7 +2166,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_a_ver: 'Va. Pregúntame algo que Alek y tú hayan platicado o trabajado antes, y te digo qué tengo registrado. Tú pones la prueba.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Estoy aprendiendo a recordar el contexto de cada persona sin volverme invasiva, y Alek me pidió probarlo contigo porque te tiene confianza. ¿Me dejas hacerte una pregunta corta para poner a prueba mi memoria?`,
-        metaTemplateName: 'ia360_beta_memoria', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -2905,10 +2195,7 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         step2: {
           pregunta: '¿Qué te contó la persona que nos presentó sobre lo que hace Alek, y qué te llamó la atención para aceptar la introducción? Con eso evitamos mandarte algo fuera de lugar.',
         },
-        draft: ({ name, quienIntro }) => buildIa360ReferidoContextoDraft({ name, quienIntro }),
-        // G-COLD: el {{2}} del template es quien_intro; en frío se exige el dato
-        // antes de aprobar (ver handleIa360OwnerApproveSend).
-        metaTemplateName: 'ia360_referido_contexto',
+        draft: ({ name, quienIntro }) => `Hola ${name}, soy la IA de Alek. Te escribo porque nos presentó ${quienIntro || '{{quien_intro}}'} y, antes de mandarte cualquier propuesta, Alek quiere entender tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`,
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -2930,7 +2217,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_cuentame: 'Va la versión completa en corto: IA360 conecta WhatsApp, CRM, agenda y memoria de clientes para que el seguimiento no dependa de la memoria de nadie. ¿En tu operación dónde se cae más el seguimiento hoy: mensajes, CRM o agenda?',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Nos presentaron hace poco y Alek prefiere darte la versión corta antes que una llamada a ciegas: IA360 evita que el seguimiento se caiga entre WhatsApp, el CRM, la agenda y la gente. ¿Quieres explorar si aplica a tu caso?`,
-        metaTemplateName: 'ia360_referido_oneliner', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -2952,9 +2238,9 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           pregunta: 'Claro, pregunta con confianza: qué hace IA360, cómo trabaja Alek o qué implicaría la llamada. Te respondo aquí mismo.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Vienes de una introducción y Alek no quiere mandarte una agenda sin contexto. Si ordenar WhatsApp, CRM y seguimiento te suena útil, puedo proponerte una llamada corta con él. ¿Cómo lo ves?`,
-        metaTemplateName: 'ia360_referido_permiso_agenda_v2',
-        // G-COLD: el template v2 ya trae los mismos botones del opener; el alias
-        // mapea su afirmativo a la rama de horarios.
+        metaTemplateName: 'ia360_referido_apertura',
+        // El template de Meta trae botones de texto ("Sí, cuéntame"); su afirmativo
+        // mapea a la rama de horarios (el copy pide permiso para proponer llamada).
         templateAliasOption: 'horarios',
         openerOptions: {
           kind: 'buttons',
@@ -2986,7 +2272,7 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_pregunta: 'Gracias. ¿Qué tipo de clientes atiendes hoy y dónde los ves sufrir más: WhatsApp desordenado, CRM sin seguimiento o procesos repetidos a mano? Con eso mapeamos el fit.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió escribirte porque te ve como posible aliado, no como cliente: quiere explorar si IA360 les sirve a los clientes que tú ya atiendes cuando tienen fricción en WhatsApp, CRM o procesos repetidos. ¿Te hago una pregunta corta para mapear si hay fit?`,
-        metaTemplateName: 'ia360_aliado_mapa_colaboracion_v2', // G-COLD: v2 con botones QUICK_REPLY del opener
+        metaTemplateName: 'ia360_aliado_mapa_colaboracion',
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3008,7 +2294,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_pregunta: 'Va: cuando un cliente tuyo ya necesita ordenar WhatsApp, CRM o seguimiento, ¿qué señales lo delatan primero? Con eso definimos juntos a quién sí presentarle IA360.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek no quiere pedirte intros a ciegas: primero quiere definir contigo qué tipo de empresa sí tiene sentido para IA360. ¿Me dejas preguntarte qué señales ves cuando un cliente ya necesita ordenar su WhatsApp, CRM o seguimiento?`,
-        metaTemplateName: 'ia360_aliado_criterios_fit', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3030,7 +2315,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_comparte: 'Va el caso NDA-safe en corto: una empresa de servicios perdía seguimiento entre WhatsApp y su CRM; con IA360 cada conversación queda registrada, el pipeline se mueve solo y el dueño revisa su semana en un tablero. ¿Le haría sentido a alguno de tus clientes?',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek preparó un caso NDA-safe de IA360 (el problema, la operación antes y el resultado esperado) para que puedas explicárselo a tus clientes sin exponer datos de nadie. ¿Te lo comparto?`,
-        metaTemplateName: 'ia360_aliado_caso_reventa', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3062,7 +2346,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           todo_bien: 'Qué bueno. Le paso a Alek que todo va en orden. Cualquier cosa que surja, me escribes por aquí y se lo pongo enfrente.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Como ya estamos trabajando juntos, Alek me pidió darle seguimiento a tu proyecto sin esperar a la siguiente reunión. ¿Hay algún avance, fricción o pendiente que quieras que le ponga enfrente hoy?`,
-        metaTemplateName: 'ia360_cliente_readout', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3085,7 +2368,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           todo_orden: 'Perfecto, me da gusto. Le confirmo a Alek que no hay pendientes de su lado. Aquí sigo si surge algo.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de hablar de siguientes pasos en tu proyecto, Alek quiere asegurarse de que nada esté atorado de su lado. ¿Hay alguna fricción concreta que quieras que vea primero?`,
-        metaTemplateName: 'ia360_cliente_soporte', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3105,7 +2387,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         cta: 'identificar siguiente módulo con permiso',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Te escribo de su parte porque tú y Alek ya tienen un proyecto andando, y Alek quiere ubicar dónde estaría el siguiente paso con más impacto, sin empujarte nada fuera de tiempo. De estas áreas, ¿cuál te quita más tiempo hoy?`,
         requiresLiveDeal: true,
-        metaTemplateName: 'ia360_cliente_expansion', // G-COLD: en frío sale como QUICK_REPLY (la lista vive en el flujo caliente)
         openerOptions: {
           kind: 'list',
           button: 'Elegir área',
@@ -3137,7 +2418,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek decide si la pregunta va a operación, ventas, datos o seguimiento.',
         cta: 'detectar cuello ejecutivo',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió contactarte antes de mandarte una demo genérica: prefiere ubicar primero dónde habría valor real para tu operación. De estas áreas, ¿dónde sientes el cuello de botella que más mueve la aguja?`,
-        metaTemplateName: 'ia360_sponsor_diagnostico', // G-COLD
         openerOptions: {
           kind: 'list',
           button: 'Elegir área',
@@ -3159,7 +2439,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek prepara una lectura de impacto antes de sugerir solución.',
         cta: 'pedir síntoma de fuga de valor',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando IA360 sí aplica, se nota en cuatro fugas: tiempo perdido en tareas manuales, seguimiento que se cae, datos poco confiables y decisiones lentas. ¿Cuál de esas te preocupa más hoy?`,
-        metaTemplateName: 'ia360_sponsor_fuga_valor', // G-COLD
         openerOptions: {
           kind: 'list',
           button: 'Elegir fuga',
@@ -3184,7 +2463,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           si_manda: 'Va el caso en corto: una operación que dependía de WhatsApp y Excel perdía seguimiento y visibilidad; con IA360 los mensajes alimentan el CRM, el pipeline se mueve solo y la dirección revisa su semana en un tablero. Si quieres, Alek te aterriza el paralelo con tu operación en una llamada corta.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si prefieres ver evidencia antes de hablar de soluciones, Alek puede compartirte un caso NDA-safe de IA360: el problema, el enfoque y el resultado esperado, sin exponer datos de ningún cliente. ¿Te lo mando?`,
-        metaTemplateName: 'ia360_sponsor_caso_ndasafe', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3212,7 +2490,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek confirma si conviene hacer diagnóstico comercial antes de proponer.',
         cta: 'ubicar fuga principal del pipeline',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek trabaja ayudando a equipos comerciales y casi siempre el problema aparece en uno de tres lugares. En tu equipo, ¿cuál duele más hoy?`,
-        metaTemplateName: 'ia360_comercial_pipeline', // G-COLD
         openerOptions: {
           kind: 'list',
           button: 'Elegir',
@@ -3233,7 +2510,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek revisa si el caso pide orden operativo o motor de ventas.',
         cta: 'mapear seguimiento WhatsApp/CRM',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Muchas fugas comerciales no vienen del vendedor, sino de WhatsApp y el CRM trabajando sin contexto compartido. En tu operación, ¿qué se pierde más hoy?`,
-        metaTemplateName: 'ia360_comercial_wa_crm', // G-COLD
         openerOptions: {
           kind: 'list',
           button: 'Elegir',
@@ -3255,7 +2531,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek valida segmento y oferta antes de hablar de prospección.',
         cta: 'detectar si hay motor comercial repetible',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Para aplicar IA360 a prospección hacen falta tres piezas: un segmento claro, un mensaje repetible y un seguimiento medible. ¿Qué parte de ese motor está más débil en tu equipo hoy?`,
-        metaTemplateName: 'ia360_comercial_motor_prospeccion', // G-COLD
         openerOptions: {
           kind: 'list',
           button: 'Elegir',
@@ -3285,7 +2560,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek decide si el ángulo financiero es control, cartera o comisiones.',
         cta: 'detectar punto de control débil',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek trabaja con equipos de finanzas que terminan operando a mano porque no pueden confiar rápido en sus datos. En tu caso, ¿dónde está el mayor dolor hoy?`,
-        metaTemplateName: 'ia360_cfo_control', // G-COLD
         openerOptions: {
           kind: 'list',
           button: 'Elegir área',
@@ -3310,7 +2584,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           respondo: 'Te leo. Cuéntame qué información te cuesta más tener confiable y a tiempo (cartera, cobranza, reportes), y se la paso a Alek aterrizada.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Cuando la cartera o los datos viven dispersos, la decisión financiera llega tarde. ¿Qué información te cuesta más tener confiable y a tiempo?`,
-        metaTemplateName: 'ia360_cfo_cartera_datos', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3329,7 +2602,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek valida si el caso se puede convertir en diagnóstico de reglas y datos.',
         cta: 'detectar reglas financieras propensas a error',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. En comisiones y conciliación, el problema suele estar en reglas manuales, excepciones y datos que no cuadran. ¿Dónde se te va más tiempo revisando o corrigiendo?`,
-        metaTemplateName: 'ia360_cfo_comisiones', // G-COLD
         openerOptions: {
           kind: 'list',
           button: 'Elegir',
@@ -3362,7 +2634,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           mapa: 'Va el mapa corto: WhatsApp Cloud API → ForgeChat (bandeja y reglas) → n8n (orquestación) → CRM y memoria por contacto. Todo con permisos mínimos, trazabilidad de cada mensaje y aprobación humana antes de cualquier envío sensible. Si quieres el detalle técnico completo, Alek te lo manda directo.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Alek me pidió contactarte porque eres quien cuida la parte técnica, y una revisión seria de IA360 empieza por permisos, datos, trazabilidad y rollback. ¿Cómo prefieres revisarlo?`,
-        metaTemplateName: 'ia360_tecnico_arquitectura', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3381,7 +2652,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         nextAction: 'Alek define guardrails técnicos antes de proponer piloto.',
         cta: 'identificar riesgo técnico principal',
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Antes de hablar de funciones, Alek quiere entender qué riesgo técnico habría que controlar primero en una integración con IA360. ¿Cuál revisarías antes que nada?`,
-        metaTemplateName: 'ia360_tecnico_rollback', // G-COLD
         openerOptions: {
           kind: 'list',
           button: 'Elegir riesgo',
@@ -3407,7 +2677,6 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
           respondo: 'Te leo. Dime qué condición tendría que cumplirse para que la prueba te parezca segura (permisos, alcance, datos, reversibilidad) y la registro tal cual para Alek.',
         },
         draft: ({ name }) => `Hola ${name}, soy la IA de Alek. Si hacemos una prueba técnica de IA360, Alek la quiere limitada, trazable y reversible. ¿Qué condición tendría que cumplirse para que te parezca segura?`,
-        metaTemplateName: 'ia360_tecnico_integracion', // G-COLD
         openerOptions: {
           kind: 'buttons',
           options: [
@@ -3524,10 +2793,7 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
   const optionKey = m[2];
   const found = findIa360SequenceFlow(sequenceId);
   if (!found) return false;
-  const { flow, sequence } = found;
-  // G8: aliado_socio / referido_bni → pipeline "Partners / Aliados (BNI)" (id 6);
-  // el resto de personas (cliente, beta, sponsor, …) sigue en el Revenue genérico.
-  const dealPipelineName = ia360PipelineForRelationship(flow?.relationshipContext);
+  const { sequence } = found;
   const option = (sequence.openerOptions?.options || [])
     .find(o => String(o.id).toLowerCase() === `seq_${sequenceId}:${optionKey}`);
   if (!option) return false;
@@ -3599,7 +2865,6 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
         targetStageName: 'Requiere Alek',
         titleSuffix: sequence.label,
         notes: `Respuesta al opener ${sequence.id}: pidió hablar directo con Alek.`,
-        pipelineName: dealPipelineName,
       }).catch(e => console.error('[ia360-seq] deal alek_directo:', e.message));
       await notifyOwner('Pidió que le escribas TÚ directo. Deal en "Requiere Alek".');
       return true;
@@ -3623,7 +2888,6 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
         targetStageName: 'Nutrición',
         titleSuffix: sequence.label,
         notes: `Respuesta al opener ${sequence.id}: ahora no. Pasa a nutrición suave.`,
-        pipelineName: dealPipelineName,
       }).catch(e => console.error('[ia360-seq] deal ahora_no:', e.message));
       await notifyOwner('Respondió que ahora no; queda en nutrición suave.');
       return true;
@@ -3652,7 +2916,6 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
         targetStageName: 'Agenda en proceso',
         titleSuffix: sequence.label,
         notes: `Respuesta al opener ${sequence.id}: pidió horarios. Deal a "Agenda en proceso".`,
-        pipelineName: dealPipelineName,
       }).catch(e => console.error('[ia360-seq] deal horarios:', e.message));
       await notifyOwner('Pidió horarios para una llamada contigo. Deal en "Agenda en proceso".');
       return true;
@@ -3671,7 +2934,6 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
         targetStageName: 'Intención detectada',
         titleSuffix: sequence.label,
         notes: `Respuesta al opener ${sequence.id}: "${option.title}". Paso 2 de la secuencia enviado.`,
-        pipelineName: dealPipelineName,
       }).catch(e => console.error('[ia360-seq] deal step2:', e.message));
       await notifyOwner(`Le envié el paso 2 de la secuencia. Next action sugerida: ${sequence.nextAction}`);
       return true;
@@ -3689,7 +2951,6 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
       targetStageName: 'Intención detectada',
       titleSuffix: sequence.label,
       notes: `Respuesta al opener ${sequence.id}: "${option.title}". Acuse enviado; siguiente paso con Alek.`,
-      pipelineName: dealPipelineName,
     }).catch(e => console.error('[ia360-seq] deal ack:', e.message));
     await notifyOwner(`Next action sugerida: ${sequence.nextAction}`);
     return true;
@@ -3716,10 +2977,8 @@ async function handleIa360SequenceReply({ record, replyId, contact = null }) {
 const IA360_SEQ_ALIAS_NEGATIVE = new Set(['ahora no', 'por ahora no', 'no por ahora']);
 const IA360_SEQ_ALIAS_HANDOFF = new Set(['que me escriba alek', 'hablar con alek']);
 // Solo frases genuinamente afirmativas. Los títulos exactos del catálogo
-// ("Proponme horarios", "Te respondo aquí", "Hazme una pregunta", etc.) se
-// resuelven ANTES por match exacto de título (paso 1 del resolver), no por
-// semántica: ponerlos aquí fabricaría elecciones equivocadas. Estos sets solo
-// aplican cuando el texto del botón NO coincide con ningún título del opener.
+// ("Proponme horarios", "Te respondo aquí", etc.) se resuelven por match de
+// título, no por semántica: ponerlos aquí fabricaría elecciones equivocadas.
 const IA360_SEQ_ALIAS_AFFIRMATIVE = new Set([
   'sí, cuéntame', 'si, cuéntame', 'sí, cuentame', 'si, cuentame',
   'sí, cuéntame más', 'si, cuentame mas',
@@ -3735,24 +2994,20 @@ const IA360_SEQ_ALIAS_AFFIRMATIVE = new Set([
 function resolveIa360TemplateButtonAlias({ replyId, contact }) {
   const key = String(replyId || '').trim().toLowerCase();
   if (!key || key.startsWith('seq_')) return null;
+  const isNeg = IA360_SEQ_ALIAS_NEGATIVE.has(key);
+  const isHand = IA360_SEQ_ALIAS_HANDOFF.has(key);
+  const isAff = IA360_SEQ_ALIAS_AFFIRMATIVE.has(key);
+  if (!isNeg && !isHand && !isAff) return null;
   const pf = contact?.custom_fields?.ia360_persona_first;
   const seqId = pf?.sequence_candidate?.id;
   if (!seqId || !pf?.send?.sent_at) return null; // solo si su opener realmente salió
   const found = findIa360SequenceFlow(seqId);
   if (!found) return null;
   const opts = found.sequence.openerOptions?.options || [];
-  // 1) Match exacto por título visible del botón — ANTES del gate semántico:
-  // los botones legítimos de los templates fríos ("Hazme una pregunta",
-  // "Te respondo aquí", "Todo va bien", "Mándame el mapa", "Proponme
-  // horarios"...) rutean por su propio título aunque no estén en los sets.
+  // 1) Match exacto por título visible del botón.
   const byTitle = opts.find(o => String(o.title).trim().toLowerCase() === key);
   if (byTitle) return String(byTitle.id).toLowerCase();
-  // 2) Gate semántico, solo si no hubo match por título.
-  const isNeg = IA360_SEQ_ALIAS_NEGATIVE.has(key);
-  const isHand = IA360_SEQ_ALIAS_HANDOFF.has(key);
-  const isAff = IA360_SEQ_ALIAS_AFFIRMATIVE.has(key);
-  if (!isNeg && !isHand && !isAff) return null;
-  // 3) Por semántica: negativo → ahora_no; handoff → alek_directo; afirmativo →
+  // 2) Por semántica: negativo → ahora_no; handoff → alek_directo; afirmativo →
   // la primera opción que no sea ninguna de las dos (el camino afirmativo).
   const bySuffix = (suffix) => opts.find(o => String(o.id).toLowerCase().endsWith(`:${suffix}`));
   if (isNeg) { const o = bySuffix('ahora_no'); return o ? String(o.id).toLowerCase() : null; }
@@ -4013,227 +3268,6 @@ async function persistIa360PersonaPayload({ record, targetContact, flow, sequenc
   });
 }
 
-// G-D: pipelines donde un deal vivo habilita la jugada de expansión (D7).
-const IA360_EXPANSION_PIPELINES = ['IA360 WhatsApp Revenue Pipeline', 'Champions — Adopción y expansión'];
-
-// G-COLD: status real en Meta de los templates fríos, en UNA sola consulta.
-// Si un nombre tiene varias filas gana APPROVED si alguna lo está (mismo
-// criterio que enqueueIa360Template); si no, la más reciente por updated_at.
-// En error de DB devuelve NULL (no {}): un {} significaría "template
-// inexistente" y daría diagnóstico falso. Cada call site decide: la UX sale
-// sin marcas (fail-open) y el envío se bloquea con aviso honesto (fail-closed).
-async function loadIa360ColdTemplateStatuses(names) {
-  const list = [...new Set((names || []).filter(Boolean).map(String))];
-  if (!list.length) return {};
-  try {
-    const { rows } = await pool.query(
-      `SELECT name, status
-         FROM coexistence.message_templates
-        WHERE name = ANY($1)
-        ORDER BY updated_at DESC NULLS LAST, id DESC`,
-      [list]
-    );
-    const out = {};
-    for (const row of rows) {
-      if (String(out[row.name] || '').toUpperCase() === 'APPROVED') continue;
-      if (String(row.status || '').toUpperCase() === 'APPROVED') { out[row.name] = row.status; continue; }
-      if (!(row.name in out)) out[row.name] = row.status; // primera fila = más reciente
-    }
-    return out;
-  } catch (e) {
-    console.error('[ia360-cold] template statuses lookup:', e.message);
-    return null;
-  }
-}
-
-// G-COLD: traduce el status de Meta a disponibilidad para envío en frío.
-function ia360ColdAvailability(status) {
-  const s = String(status || '').toUpperCase();
-  if (s === 'APPROVED') return { sendable: true, label: '✓ lista para frío' };
-  if (['PENDING', 'SUBMITTED', 'IN_REVIEW'].includes(s)) return { sendable: false, label: 'template en revisión Meta' };
-  if (s === 'REJECTED') return { sendable: false, label: 'template rechazado por Meta' };
-  return { sendable: false, label: 'sin template frío' };
-}
-
-// G-COLD: ¿el contacto está fuera de la ventana de servicio de 24h? Mismo
-// umbral 23.5h que approve-send. Error o cuenta sin resolver → {known:false}
-// (fail-open: la UX del selector nunca debe romperse por esta verificación).
-async function ia360OutsideWindow24h({ record, targetContact }) {
-  try {
-    const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
-    if (error || !account) return { known: false, outside: false };
-    const secs = await secondsSinceLastIncoming({ accountPhoneNumberId: account.phoneNumberId, contactNumber: targetContact });
-    return { known: true, outside: !(secs != null && secs < 23.5 * 3600) };
-  } catch (e) {
-    console.error('[ia360-cold] window check:', e.message);
-    return { known: false, outside: false };
-  }
-}
-
-// G-D: señales reales del contacto para el ranker del selector de secuencias.
-// Cada consulta tiene su propio try/catch (fail-open): si la DB falla, esa señal
-// queda en null y el selector sale con el orden default — nunca mudo.
-// OJO: ia360_memory_* tiene doble keying en contact_wa_number (a veces la línea
-// del bot, a veces el número del contacto); la llave confiable es contact_number.
-async function gatherIa360ContactSignals({ waNumber, contactNumber }) {
-  const signals = { liveDeal: null, quienIntro: null, lastFact: null, lastEvent: null, lastIncomingAt: null };
-  try {
-    const { rows } = await pool.query(
-      `SELECT d.title, p.name AS pipeline_name, s.name AS stage_name
-         FROM coexistence.deals d
-         JOIN coexistence.pipelines p ON p.id = d.pipeline_id
-         JOIN coexistence.pipeline_stages s ON s.id = d.stage_id
-        WHERE d.contact_wa_number = $1 AND d.contact_number = $2 AND d.status = 'open'
-        ORDER BY d.updated_at DESC NULLS LAST, d.id DESC
-        LIMIT 1`,
-      [waNumber, contactNumber]
-    );
-    if (rows.length) signals.liveDeal = { title: rows[0].title, pipelineName: rows[0].pipeline_name, stageName: rows[0].stage_name };
-  } catch (e) { console.error('[ia360-rank] deal lookup:', e.message); }
-  try {
-    const { rows } = await pool.query(
-      `SELECT custom_fields->>'quien_intro' AS quien_intro, custom_fields->>'referido_por' AS referido_por
-         FROM coexistence.contacts
-        WHERE wa_number = $1 AND contact_number = $2
-        LIMIT 1`,
-      [waNumber, contactNumber]
-    );
-    const quienIntro = String(rows[0]?.quien_intro || '').trim();
-    if (quienIntro) {
-      signals.quienIntro = quienIntro;
-    } else {
-      // referido_por guarda el NÚMERO de quien compartió el vCard. Solo cuenta
-      // como introductor si NO es el owner, ni el bot, ni el propio contacto;
-      // y solo con un nombre presentable (no citamos números pelones).
-      const referidoPor = normalizePhone(String(rows[0]?.referido_por || '').trim());
-      if (referidoPor && referidoPor !== IA360_OWNER_NUMBER && referidoPor !== normalizePhone(waNumber) && referidoPor !== normalizePhone(contactNumber)) {
-        const { rows: introRows } = await pool.query(
-          `SELECT name, profile_name FROM coexistence.contacts WHERE wa_number = $1 AND contact_number = $2 LIMIT 1`,
-          [waNumber, referidoPor]
-        );
-        const introName = String(introRows[0]?.name || introRows[0]?.profile_name || '').trim();
-        if (introName) signals.quienIntro = introName;
-      }
-    }
-  } catch (e) { console.error('[ia360-rank] quien_intro lookup:', e.message); }
-  try {
-    const { rows } = await pool.query(
-      `SELECT COALESCE(recurring_pain, preference, objection, role) AS texto, last_seen_at
-         FROM coexistence.ia360_memory_facts
-        WHERE contact_number = $1
-          AND COALESCE(recurring_pain, preference, objection, role) IS NOT NULL
-        ORDER BY last_seen_at DESC
-        LIMIT 1`,
-      [contactNumber]
-    );
-    if (rows.length) signals.lastFact = { text: rows[0].texto, lastSeenAt: rows[0].last_seen_at };
-  } catch (e) { console.error('[ia360-rank] facts lookup:', e.message); }
-  try {
-    const { rows } = await pool.query(
-      `SELECT summary, created_at
-         FROM coexistence.ia360_memory_events
-        WHERE contact_number = $1
-        ORDER BY created_at DESC
-        LIMIT 1`,
-      [contactNumber]
-    );
-    if (rows.length) signals.lastEvent = { summary: rows[0].summary, createdAt: rows[0].created_at };
-  } catch (e) { console.error('[ia360-rank] events lookup:', e.message); }
-  try {
-    const { rows } = await pool.query(
-      `SELECT MAX(created_at) AS last_in
-         FROM coexistence.chat_history
-        WHERE wa_number = $1 AND contact_number = $2 AND direction = 'incoming'`,
-      [waNumber, contactNumber]
-    );
-    if (rows[0]?.last_in) signals.lastIncomingAt = rows[0].last_in;
-  } catch (e) { console.error('[ia360-rank] chat_history lookup:', e.message); }
-  return signals;
-}
-
-// G-D: ranker rule-based (SIN LLM). Solo REORDENA las secuencias de la persona
-// elegida; cada razón cita una señal que existe en la base. Sin señales que
-// matcheen secuencias de esta persona → orden de catálogo y cero razones
-// inventadas (honestidad del ranker).
-function rankIa360Sequences({ flow, signals }) {
-  const scores = new Map();
-  const reasons = new Map();
-  const bump = (id, pts, reason) => {
-    scores.set(id, (scores.get(id) || 0) + pts);
-    if (reason && !reasons.has(id)) reasons.set(id, reason);
-  };
-  const s = signals || {};
-  if (s.liveDeal) {
-    const dealReason = `Deal vivo «${s.liveDeal.title}» en ${s.liveDeal.pipelineName}`;
-    if (IA360_EXPANSION_PIPELINES.includes(s.liveDeal.pipelineName)) {
-      bump('cliente_expansion', 35, dealReason);
-      bump('cliente_readout', 20, dealReason);
-      bump('cliente_soporte', 10, dealReason);
-    } else {
-      bump('cliente_readout', 30, dealReason);
-      bump('cliente_soporte', 20, dealReason);
-    }
-  }
-  if (s.quienIntro) {
-    const introReason = `Te lo presentó ${s.quienIntro}`;
-    bump('referido_contexto', 30, introReason);
-    bump('referido_permiso_agenda', 15, introReason);
-    bump('referido_oneliner', 10, introReason);
-  }
-  const memorySignal = s.lastEvent || s.lastFact;
-  if (memorySignal) {
-    // 40 y no más: "Sugerida: Memoria registrada: " + frag debe caber en los
-    // 72 chars de la description de Meta sin perder el final de la razón.
-    const frag = compactForWhatsApp(s.lastEvent ? s.lastEvent.summary : s.lastFact.text, 40);
-    const memReason = `Memoria registrada: ${frag}`;
-    bump('beta_memoria', 15, memReason);
-    bump('cliente_readout', 10, memReason);
-  }
-  const ordered = (flow.sequences || [])
-    .map((seq, idx) => ({ seq, idx, score: scores.get(seq.id) || 0 }))
-    .sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
-  const ranked = ordered.length > 0 && ordered[0].score > 0;
-  return {
-    ordered: ordered.map(o => o.seq),
-    suggestedId: ranked ? ordered[0].seq.id : null,
-    reasonFor: (id) => reasons.get(id) || null,
-    ranked,
-  };
-}
-
-// G-D: resumen de 2 líneas del contacto para el cuerpo de la tarjeta. Solo
-// afirma lo que existe; sin señales devuelve una sola línea honesta.
-function buildIa360ContactSummaryLines(signals) {
-  const s = signals || {};
-  const fmtDate = (d) => {
-    try { return new Date(d).toISOString().slice(0, 10); } catch { return ''; }
-  };
-  if (!s.liveDeal && !s.quienIntro && !s.lastFact && !s.lastEvent) {
-    return ['Aún no tengo señales registradas de este contacto (sin deal, sin memoria, sin introductor).'];
-  }
-  // Tope de 180: título/pipeline/etapa vienen de la base sin límite y el body
-  // del interactive de Meta admite 1024 como máximo — si se excede, la tarjeta
-  // se vuelve muda. Acotado aquí, el body completo queda siempre < 1024.
-  const line1 = s.liveDeal
-    ? compactForWhatsApp(`Deal vivo: «${s.liveDeal.title}» — ${s.liveDeal.pipelineName}${s.liveDeal.stageName ? ` / ${s.liveDeal.stageName}` : ''}.`, 180)
-    : 'Sin deal vivo registrado.';
-  let line2;
-  if (s.lastEvent) {
-    const fecha = fmtDate(s.lastEvent.createdAt);
-    line2 = `Último evento${fecha ? ` (${fecha})` : ''}: ${compactForWhatsApp(s.lastEvent.summary, 120)}`;
-  } else if (s.lastFact) {
-    const fecha = fmtDate(s.lastFact.lastSeenAt);
-    line2 = `Memoria${fecha ? ` (${fecha})` : ''}: ${compactForWhatsApp(s.lastFact.text, 120)}`;
-  } else if (s.quienIntro) {
-    line2 = `Lo presentó: ${s.quienIntro}.`;
-  } else if (s.lastIncomingAt) {
-    line2 = `Última interacción: ${fmtDate(s.lastIncomingAt)}.`;
-  } else {
-    line2 = 'Sin memoria registrada todavía.';
-  }
-  return [line1, line2];
-}
-
 async function sendIa360SequenceSelector({ record, targetContact, contact, flowKey, flow }) {
   const name = contact?.name || targetContact;
   const payload = buildIa360PersonaPayload({
@@ -4261,108 +3295,28 @@ async function sendIa360SequenceSelector({ record, targetContact, contact, flowK
     payload,
     tags: [`persona-choice:${flowKey}`],
   });
-  // G-D: ranker rule-based sobre señales reales — la sugerida primero con el
-  // porqué en su descripción; sin señales → orden de catálogo sin razones.
-  const signals = await gatherIa360ContactSignals({ waNumber: record.wa_number, contactNumber: targetContact });
-  const ranking = rankIa360Sequences({ flow, signals });
-  const summaryLines = buildIa360ContactSummaryLines(signals);
-  // G-COLD: si el contacto está fuera de la ventana de 24h, cada fila antepone
-  // la disponibilidad real del template frío (status en coexistence.message_templates).
-  // Fail-open con try/catch: si algo falla, el selector sale como hoy y se loggea.
-  let coldInfo = null;
-  try {
-    const win = await ia360OutsideWindow24h({ record, targetContact });
-    if (win.known && win.outside) {
-      const statuses = await loadIa360ColdTemplateStatuses(
-        (flow.sequences || []).map(s => s.metaTemplateName).filter(Boolean)
-      );
-      // null = falló el lookup (≠ inexistente): selector sin marcas, como hoy.
-      if (statuses === null) {
-        console.error('[ia360-cold] selector: lookup de statuses falló; selector sin marcas frías');
-      } else {
-        coldInfo = { outsideWindow: true, statuses };
-      }
-    }
-  } catch (e) { console.error('[ia360-cold] selector availability:', e.message); }
-  const bodyText = [
-    `Alek, ${name} quedó como ${flow.personaContext}.`,
-    ...summaryLines,
-    ...(coldInfo ? ['Fuera de ventana de 24h: solo las secuencias marcadas «lista para frío» pueden salir hoy (como template de Meta).'] : []),
-    'Elige una secuencia. Sigo en dry-run: no enviaré nada al contacto.',
-  ].join('\n');
-  const suggestedReason = ranking.suggestedId ? ranking.reasonFor(ranking.suggestedId) : null;
-  // G-COLD: las filas se calculan una sola vez — se renderizan en la tarjeta y
-  // se persisten tal cual en ia360_selector_ranking.rows (auditoría 1:1).
-  const selectorRows = ranking.ordered.map(seq => {
-    const reason = ranking.suggestedId === seq.id ? ranking.reasonFor(seq.id) : null;
-    let description;
-    if (coldInfo) {
-      const avail = ia360ColdAvailability(seq.metaTemplateName ? coldInfo.statuses[seq.metaTemplateName] : undefined);
-      description = compactForWhatsApp(`${avail.label} · ${reason ? `Sugerida: ${reason}` : seq.goal}`, 72);
-    } else {
-      description = compactForWhatsApp(reason ? `Sugerida: ${reason}` : seq.goal, 72);
-    }
-    return {
-      id: `owner_seq:${targetContact}:${seq.id}`,
-      title: compactForWhatsApp(seq.uiTitle || seq.label, 24),
-      description,
-    };
-  });
-  // G-D: el ranking queda auditable en custom_fields (orden, sugerida, razón,
-  // resumen) — best-effort, no bloquea el envío de la tarjeta.
-  await mergeContactIa360State({
-    waNumber: record.wa_number,
-    contactNumber: targetContact,
-    customFields: {
-      ia360_selector_ranking: {
-        at: new Date().toISOString(),
-        persona: flowKey,
-        ranked: ranking.ranked,
-        suggested: ranking.suggestedId,
-        reason: suggestedReason,
-        order: ranking.ordered.map(seq => seq.id),
-        summary: summaryLines,
-        // G-COLD: filas tal como se renderizaron en la tarjeta.
-        rows: selectorRows,
-        ...(coldInfo ? {
-          cold: {
-            outside_window: true,
-            availability: Object.fromEntries(
-              (flow.sequences || [])
-                .filter(seq => seq.metaTemplateName)
-                .map(seq => {
-                  const status = coldInfo.statuses[seq.metaTemplateName] || null;
-                  return [seq.id, { template: seq.metaTemplateName, status, label: ia360ColdAvailability(status).label }];
-                })
-            ),
-          },
-        } : {}),
-      },
-    },
-  }).catch(e => console.error('[ia360-rank] persist ranking:', e.message));
   return sendOwnerInteractive({
     record,
     label: `owner_sequence_selector_${targetContact}_${flowKey}`,
-    messageBody: ranking.ranked
-      ? `IA360: secuencias ${name} — sugerida: ${ranking.suggestedId} (${suggestedReason})`
-      : `IA360: secuencias ${name}`,
+    messageBody: `IA360: secuencias ${name}`,
     targetContact,
     ownerBudget: true,
     interactive: {
       type: 'list',
       header: { type: 'text', text: 'Elegir secuencia' },
-      body: { text: bodyText },
-      footer: {
-        text: ranking.ranked
-          ? 'Sugerida primero por señales; aprobación antes de envío'
-          : 'Persona antes de secuencia; aprobación antes de envío',
+      body: {
+        text: `Alek, ${name} quedó como ${flow.personaContext}. Elige una secuencia lógica. Sigo en dry-run: no enviaré nada al contacto.`,
       },
+      footer: { text: 'Persona antes de secuencia; aprobación antes de envío' },
       action: {
         button: 'Elegir secuencia',
         sections: [{
           title: compactForWhatsApp(flow.personaContext, 24),
-          // G-COLD: mismas filas que quedaron persistidas en el ranking.
-          rows: selectorRows,
+          rows: flow.sequences.map(seq => ({
+            id: `owner_seq:${targetContact}:${seq.id}`,
+            title: compactForWhatsApp(seq.uiTitle || seq.label, 24),
+            description: compactForWhatsApp(seq.goal, 72),
+          })),
         }],
       },
     },
@@ -4424,78 +3378,12 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
     return;
   }
   const payload = buildIa360PersonaPayload({ record, contact, targetContact, flow, sequence, ownerAction: 'sequence_selected' });
-  let readout = buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload });
+  const readout = buildIa360SequenceReadout({ name, targetContact, flow, sequence, payload });
   if (hasUnresolvedIa360Placeholder(readout)) {
     payload.sequence_candidate.copy_status = 'blocked';
     payload.approval.reason = 'Borrador bloqueado por placeholder sin resolver.';
   }
   await persistIa360PersonaPayload({ record, targetContact, flow, sequence, payload, tags: ['owner-sequence-selected'] });
-  // G10 (P2): "Fit identificado" (pos 0 del pipeline Partners). Este es el momento
-  // PRE-ENVÍO: el owner eligió secuencia para un partner y se generó su readout/
-  // draft, pero el opener AÚN no sale (eso ocurre en handleIa360OwnerApproveSend →
-  // "Introducción enviada", pos 1). Poblar pos 0 aquí deja el journey medible desde
-  // el inicio. No añade egress (syncIa360Deal es solo DB; el readout ya va al owner)
-  // y NO mueve el deal hacia atrás: "Fit identificado" no está en forceMoveStages y
-  // su position 0 nunca supera la de un deal ya avanzado (guard shouldMove de
-  // syncIa360Deal), así que un deal en "Introducción enviada"/posterior solo recibe
-  // una nota, no regresa de stage.
-  if (IA360_PARTNER_RELATIONSHIPS.has(String(flow?.relationshipContext || ''))) {
-    // BUGFIX G10: el deal es del CONTACTO partner, no del owner. Este handler corre
-    // sobre el inbound del owner (record.contact_number = owner), así que hay que
-    // re-scopear el record al targetContact (mismo patrón que targetRecord en
-    // handleIa360OwnerApproveSend/Manual). Sin esto, syncIa360Deal crea el deal
-    // bajo el número del owner en el pipeline Partners.
-    await syncIa360Deal({
-      record: { ...record, contact_number: targetContact, contact_name: name },
-      targetStageName: 'Fit identificado',
-      titleSuffix: 'Fit (secuencia elegida)',
-      notes: `Partner identificado como fit: owner eligió secuencia ${sequence.id} (pre-envío).`,
-      pipelineName: ia360PipelineForRelationship(flow?.relationshipContext),
-    }).catch(e => console.error('[ia360-fit] syncIa360Deal:', e.message));
-  }
-  // G-COLD: aviso pre-aprobación. Si el contacto está fuera de la ventana de 24h,
-  // el owner debe saber ANTES de aprobar si el opener saldrá como template de
-  // Meta (mismo copy, con botones) o si no puede salir nada todavía.
-  // Fail-open: si la verificación falla, el readout sale como hoy.
-  let coldBlocked = false;
-  let coldNotice = null;
-  try {
-    const win = await ia360OutsideWindow24h({ record, targetContact });
-    if (win.known && win.outside) {
-      const tplName = sequence.metaTemplateName || null;
-      if (!tplName) {
-        // Defensivo: hoy las 24 secuencias tienen template mapeado, pero si una
-        // nueva llega sin él, el aviso no debe imprimir «null».
-        coldBlocked = true;
-        readout += `\n\nAVISO: ${name} está fuera de la ventana de 24h y esta secuencia no tiene template frío mapeado. Si apruebas ahora NO puede salir nada.`;
-        coldNotice = 'Fuera de ventana de 24h y sin template frío mapeado: hoy no puede salir nada.';
-      } else {
-        const statuses = await loadIa360ColdTemplateStatuses([tplName]);
-        if (statuses === null) {
-          // null = falló el lookup (≠ inexistente): sin aviso ni coldBlocked,
-          // comportamiento previo; el cinturón del approve-send re-verifica.
-          console.error('[ia360-cold] readout: lookup de statuses falló; readout sin aviso frío');
-        } else {
-          const avail = ia360ColdAvailability(statuses[tplName]);
-          if (avail.sendable) {
-            readout += `\n\nFuera de ventana de 24h: si apruebas, el opener saldrá como template aprobado de Meta «${tplName}» (mismo copy, con sus botones), no como texto libre.`;
-            coldNotice = `Fuera de ventana de 24h: el opener saldrá como template «${tplName}».`;
-          } else {
-            coldBlocked = true;
-            readout += `\n\nAVISO: ${name} está fuera de la ventana de 24h y el template «${tplName}» de esta secuencia aún no está aprobado por Meta (${avail.label}). Si apruebas ahora NO puede salir nada. Opciones: espera la aprobación de Meta, elige una secuencia marcada «lista para frío» o toma el contacto manual.`;
-            coldNotice = `Fuera de ventana de 24h y sin template aprobado (${avail.label}): hoy no puede salir nada.`;
-          }
-        }
-      }
-    }
-  } catch (e) { console.error('[ia360-cold] readout availability:', e.message); }
-  // G-COLD: best-effort, solo auditoría/QA — el cinturón del approve-send
-  // re-consulta el status en vivo; nadie lee este campo en runtime.
-  await mergeContactIa360State({
-    waNumber: record.wa_number,
-    contactNumber: targetContact,
-    customFields: { ia360_approve_card_cold_blocked: coldBlocked },
-  }).catch(e => console.error('[ia360-cold] persist cold_blocked:', e.message));
   await sendIa360DirectText({
     record,
     toNumber: IA360_OWNER_NUMBER,
@@ -4508,7 +3396,7 @@ async function handleIa360OwnerSequenceChoice({ record, targetContact, sequenceI
   // que la tarjeta de cancelación). Solo si el payload realmente requiere
   // aprobación humana (no para solo_guardar / no_contactar / copy bloqueado).
   if (payload.approval.status === 'requires_alek' && payload.sequence_candidate.copy_status !== 'blocked') {
-    await sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked, coldNotice });
+    await sendIa360ApproveCard({ record, targetContact, name, flow, sequence });
   }
 }
 
@@ -4526,20 +3414,7 @@ function ia360ApproveSendAllowlist() {
     .filter(Boolean);
 }
 
-async function sendIa360ApproveCard({ record, targetContact, name, flow, sequence, coldBlocked = false, coldNotice = null }) {
-  // G-COLD: con coldNotice el owner ve en la tarjeta cómo saldría el opener (o
-  // por qué no puede salir); con coldBlocked se RETIRA la fila "Aprobar y
-  // enviar" — el owner jamás debe poder aprobar algo imposible.
-  let bodyText = `Alek, el borrador para ${name} (${flow.personaContext}, secuencia ${sequence.label}) está arriba en el readout. ¿Qué hago?`;
-  if (coldNotice) bodyText += `\n${coldNotice}`;
-  if (bodyText.length > 1024) bodyText = compactForWhatsApp(bodyText, 1024);
-  const rows = [
-    ...(coldBlocked ? [] : [{ id: `owner_approve_send:${targetContact}:${sequence.id}`, title: 'Aprobar y enviar', description: 'Envío el opener al contacto y avanzo el pipeline' }]),
-    { id: `owner_approve_edit:${targetContact}:${sequence.id}`, title: 'Editar copy', description: 'Queda en borrador; lo editas antes de enviar' },
-    { id: `owner_approve_keep:${targetContact}:${sequence.id}`, title: 'Solo guardar', description: 'Captura sin envío ni secuencia' },
-    { id: `owner_approve_dnc:${targetContact}:${sequence.id}`, title: 'No contactar', description: 'Exclusión operativa, sin envío' },
-    { id: `owner_approve_manual:${targetContact}:${sequence.id}`, title: 'Tomar manual', description: 'Tú le escribes; muevo el deal a Requiere Alek' },
-  ];
+async function sendIa360ApproveCard({ record, targetContact, name, flow, sequence }) {
   return sendOwnerInteractive({
     record,
     label: `owner_approve_card_${targetContact}_${sequence.id}`,
@@ -4549,13 +3424,21 @@ async function sendIa360ApproveCard({ record, targetContact, name, flow, sequenc
     interactive: {
       type: 'list',
       header: { type: 'text', text: 'Aprobar envío' },
-      body: { text: bodyText },
+      body: {
+        text: `Alek, el borrador para ${name} (${flow.personaContext}, secuencia ${sequence.label}) está arriba en el readout. ¿Qué hago?`,
+      },
       footer: { text: 'Solo envío con tu aprobación explícita' },
       action: {
         button: 'Decidir',
         sections: [{
           title: 'Acciones',
-          rows,
+          rows: [
+            { id: `owner_approve_send:${targetContact}:${sequence.id}`, title: 'Aprobar y enviar', description: 'Envío el opener al contacto y avanzo el pipeline' },
+            { id: `owner_approve_edit:${targetContact}:${sequence.id}`, title: 'Editar copy', description: 'Queda en borrador; lo editas antes de enviar' },
+            { id: `owner_approve_keep:${targetContact}:${sequence.id}`, title: 'Solo guardar', description: 'Captura sin envío ni secuencia' },
+            { id: `owner_approve_dnc:${targetContact}:${sequence.id}`, title: 'No contactar', description: 'Exclusión operativa, sin envío' },
+            { id: `owner_approve_manual:${targetContact}:${sequence.id}`, title: 'Tomar manual', description: 'Tú le escribes; muevo el deal a Requiere Alek' },
+          ],
         }],
       },
     },
@@ -4689,14 +3572,6 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     }
   }
 
-  // G-BRAIN: un tap de aprobación SINTÉTICO (harness E2E) solo puede disparar
-  // envíos a números QA o al owner. Un harness con un vCard de contacto REAL
-  // (clase incidente José Ramón) se detiene aquí, en el último metro.
-  if (isIa360SyntheticWamid(record.message_id)
-      && !(IA360_QA_NUMBER_RE.test(normalizePhone(targetContact)) || normalizePhone(targetContact) === IA360_OWNER_NUMBER)) {
-    return deny('synthetic_approve_real_contact', `Gate QA: la aprobación vino de un payload sintético del harness y ${name} (${targetContact}) es un contacto real. No envié nada.`);
-  }
-
   // GATE DE SEGURIDAD: allowlist de prueba. Sin allowlist o fuera de ella → NO envía.
   // '*' = la aprobación explícita del owner autoriza a cualquier contacto.
   const allowRaw = String(process.env.IA360_APPROVE_SEND_ALLOWLIST || '').trim();
@@ -4706,9 +3581,8 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
   }
 
   // Ventana de servicio 24h: dentro → texto libre (el draft). Fuera → se requiere
-  // template aprobado por Meta (validado vía templateValidator en enqueueIa360Template).
-  // G-COLD: las 24 secuencias persona-first ya tienen metaTemplateName mapeado;
-  // el deny outside_window_no_template queda solo como red de seguridad.
+  // template aprobado por Meta (validado vía templateValidator en enqueueIa360Template);
+  // las secuencias persona-first aún no tienen template mapeado → bloquear con aviso.
   const { account, error: accErr } = await resolveAccount({ fromPhoneNumber: record.wa_number });
   if (accErr || !account) return deny('account_resolve_failed', 'No pude resolver la cuenta de WhatsApp. No envié nada.');
   const secs = await secondsSinceLastIncoming({ accountPhoneNumberId: account.phoneNumberId, contactNumber: targetContact });
@@ -4738,46 +3612,13 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
         label: openerLabel,
         body: pf.sequence_candidate.draft,
       });
-      // Paridad con el nuevo formato de sendIa360DirectText (incluye label).
-      handlerFor = `${record.message_id}:direct:${targetContact}:${openerLabel}`;
+      handlerFor = `${record.message_id}:direct:${targetContact}`;
     }
     if (!sent) return deny('enqueue_failed', `No pude encolar el opener para ${name}. No se envió.`);
     const status = await waitForIa360OutboundStatus(handlerFor);
     sendResult = { ok: String(status?.status || '').toLowerCase() === 'sent', status: status?.status || 'unknown', error: status?.error_message || null, message_id: status?.message_id || null };
   } else if (sequence.metaTemplateName) {
-    // G-COLD: cinturón contra tarjetas viejas o races. La tarjeta sin la fila
-    // "Aprobar y enviar" protege la UX, pero un tap sobre una tarjeta emitida
-    // antes (o un cambio de status en Meta entre tarjeta y tap) llegaría hasta
-    // aquí: se consulta el status REAL del template antes de encolar nada.
-    const coldStatuses = await loadIa360ColdTemplateStatuses([sequence.metaTemplateName]);
-    if (coldStatuses === null) {
-      // null = falló la consulta (≠ template inexistente): fail-closed en el
-      // envío, pero con diagnóstico honesto para el owner.
-      return deny('cold_template_status_check_failed', `No pude verificar el status del template «${sequence.metaTemplateName}» en la base (error de consulta). Por seguridad no envié nada; reintenta en un momento.`);
-    }
-    const coldStatus = coldStatuses[sequence.metaTemplateName] || null;
-    if (String(coldStatus || '').toUpperCase() !== 'APPROVED') {
-      return deny('outside_window_template_not_approved', `${name} está fuera de la ventana de 24h y el template «${sequence.metaTemplateName}» de la secuencia ${sequence.id} aún no está aprobado por Meta (${coldStatus || 'inexistente'}). No envié nada.`);
-    }
-    // G-COLD: referido_contexto en frío necesita el {{2}} (quien_intro), igual
-    // que el draft caliente lo calcula buildIa360PersonaPayload. Sin el dato,
-    // el template saldría con un hueco — mejor avisar con honestidad.
-    // Sanitizado vía compactForWhatsApp (colapsa espacios/saltos y topa a 60):
-    // Meta rechaza parámetros con saltos de línea o 4+ espacios consecutivos.
-    let templateVars = null;
-    if (sequence.id === 'referido_contexto') {
-      // G9: el quien_intro tecleado por el owner ("intro <contacto>: <quien>")
-      // alimenta este mismo {{2}}. compactQuienIntroPure colapsa/topa y devuelve
-      // null si falta el dato -> seguimos avisando con cold_send_missing_quien_intro.
-      const quienIntro = compactQuienIntroPure(contact.custom_fields?.quien_intro || '', 60);
-      if (!quienIntro) {
-        return deny('cold_send_missing_quien_intro', `El template de ${sequence.id} necesita saber quién hizo la introducción y ${name} no tiene quien_intro registrado. Captura ese dato con "intro ${name}: <quién presenta>" (o elige otra secuencia) y vuelve a intentar. No envié nada.`);
-      }
-      templateVars = { '2': quienIntro };
-    }
-    // allowTextFallback:false — en frío un fallback a texto libre sería
-    // rechazado por Meta y reportaría éxito falso (ver enqueueIa360Template).
-    const res = await enqueueIa360Template({ record: targetRecord, label: openerLabel, templateName: sequence.metaTemplateName, vars: templateVars, allowTextFallback: false });
+    const res = await enqueueIa360Template({ record: targetRecord, label: openerLabel, templateName: sequence.metaTemplateName });
     sendResult = { ok: res.ok, status: res.status, error: res.error || null, message_id: null };
   } else {
     return deny('outside_window_no_template', `${name} está fuera de la ventana de 24h y la secuencia ${sequence.id} no tiene template aprobado por Meta. No envié nada.`);
@@ -4828,14 +3669,12 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     return;
   }
 
-  // Avance del pipeline: el opener salió → "Diagnóstico enviado" (genérico) o, para
-  // aliado/referido BNI, "Introducción enviada" del pipeline Partners (id 6).
+  // Avance del pipeline: el opener salió → "Diagnóstico enviado".
   await syncIa360Deal({
     record: targetRecord,
     targetStageName: 'Diagnóstico enviado',
     titleSuffix: 'Opener aprobado',
     notes: `Opener de secuencia ${sequence.id} aprobado por Alek y enviado (${insideWindow ? 'texto, ventana abierta' : 'template'}). Stage → Diagnóstico enviado.`,
-    pipelineName: ia360PipelineForRelationship(flow?.relationshipContext),
   }).catch(e => console.error('[ia360-approve] syncIa360Deal:', e.message));
 
   await sendIa360DirectText({
@@ -4862,9 +3701,6 @@ async function handleIa360OwnerApproveManual({ record, targetContact }) {
     targetStageName: 'Requiere Alek',
     titleSuffix: 'Tomado manual',
     notes: 'Alek tomó el contacto manualmente desde la tarjeta de aprobación. Sin envío del bot.',
-    // G8: si el contacto es aliado/referido BNI, el takeover manual también cae en
-    // el pipeline Partners (id 6); si no hay relación partner, queda en el genérico.
-    pipelineName: ia360PipelineForRelationship(contact?.custom_fields?.relationship_context),
   }).catch(e => console.error('[ia360-approve] manual deal:', e.message));
   await sendIa360DirectText({
     record,
@@ -4966,14 +3802,6 @@ async function handleIa360SharedContacts(record) {
         body: 'Recibí una tarjeta de contacto, pero no pude extraer un número de WhatsApp. Revísala manualmente.',
         ownerBudget: true,
       });
-      // G-LIVE: el remitente tampoco debe quedar mudo cuando la tarjeta no se pudo leer.
-      if (!isIa360OwnerNumber(record.contact_number)) {
-        await enqueueIa360Text({
-          record,
-          label: 'ia360_vcard_ack',
-          body: 'Recibí la tarjeta, pero no pude leer bien el número. Se la paso a Alek para revisarla y te confirmo por aquí.',
-        }).catch(e => console.error('[ia360-vcard] parse-fail ack error:', e.message));
-      }
       return true;
     }
 
@@ -5006,15 +3834,6 @@ async function handleIa360SharedContacts(record) {
         },
       }).catch(e => console.error('[ia360-vcard] crm reflect:', e.message));
       await notifyOwnerVcardCaptured({ record, shared });
-    }
-    // G-LIVE (auditoría 06-11): un CONTACTO (no owner) que comparte una tarjeta
-    // merece acuse — antes solo se notificaba al owner y el remitente quedaba mudo.
-    if (!isIa360OwnerNumber(record.contact_number)) {
-      await enqueueIa360Text({
-        record,
-        label: 'ia360_vcard_ack',
-        body: 'Recibí la tarjeta, gracias. La registro y le digo a Alek; cualquier siguiente paso te lo confirmo por aquí.',
-      }).catch(e => console.error('[ia360-vcard] contact ack error:', e.message));
     }
     return true;
   } catch (err) {
@@ -5277,48 +4096,13 @@ async function canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerB
   return false;
 }
 
-// G-BRAIN sandbox QA (incidente 06-11: el harness inundó el WhatsApp real de Alek
-// con tarjetas/readouts de contactos QA). Una tarjeta/texto al OWNER cuyo origen es
-// un inbound SINTÉTICO (wamid.e2e.* / qa-*) NO egresa al WhatsApp real: queda como
-// evidencia verificable en coexistence.ia360_qa_evidence (los harness E2E leen esa
-// tabla). Devuelve true si el egress quedó sandboxeado (el caller sigue su flujo
-// normal creyendo que envió, que es exactamente la semántica del sandbox).
-async function recordIa360QaEvidence({ record, toNumber, kind, label, messageBody, payload = null }) {
-  try {
-    await pool.query(
-      `INSERT INTO coexistence.ia360_qa_evidence
-         (origin_wamid, contact_number, to_number, kind, label, message_body, payload)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        record?.message_id || null,
-        record?.contact_number || null,
-        String(toNumber || ''),
-        kind,
-        label || null,
-        messageBody || null,
-        payload ? JSON.stringify(payload) : null,
-      ]
-    );
-    console.log('[ia360-qa-sandbox] egress al owner OMITIDO (origen sintético) label=%s origen=%s', label, record?.message_id);
-    return true;
-  } catch (err) {
-    console.error('[ia360-qa-sandbox] evidence insert error:', err.message);
-    return true; // sandbox fail-closed: aunque falle la evidencia, NO egresar al owner real
-  }
-}
-
 // Envia un interactivo al OWNER (Alek), no al record.contact_number. Construye la
 // fila + encola apuntando a IA360_OWNER_NUMBER. NO pasa por resolveIa360Outbound
 // (su dedup es por contact_number+ia360_handler_for; aqui el destino es otro
 // numero, no colisiona). try/catch propio: nunca tumba el webhook.
 async function sendOwnerInteractive({ record, interactive, label, messageBody, targetContact = null, ownerBudget = false }) {
   try {
-    // G-BRAIN sandbox: origen sintético (harness E2E) => la tarjeta se persiste en
-    // chat_history con status='qa_sandboxed' (los harness la correlacionan por
-    // message_id como contexto de taps) pero JAMÁS se encola hacia Meta: cero
-    // tarjetas de QA en el WhatsApp real de Alek.
-    const qaSandbox = isIa360SyntheticWamid(record?.message_id);
-    if (!qaSandbox && !(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }))) return false;
+    if (!(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }))) return false;
     const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
     if (error || !account) { console.error('[ia360-owner] account resolve failed:', error || 'unknown'); return false; }
     const localId = await insertPendingRow({
@@ -5326,14 +4110,8 @@ async function sendOwnerInteractive({ record, interactive, label, messageBody, t
       toNumber: IA360_OWNER_NUMBER,
       messageType: 'interactive',
       messageBody: messageBody || 'IA360 owner',
-      templateMeta: { ux: 'ia360_owner', label, ia360_handler_for: `${record.message_id}:owner:${label}`, source: 'webhook_owner_notify', ...(qaSandbox ? { qa_sandbox: true } : {}) },
-      ...(qaSandbox ? { status: 'qa_sandboxed' } : {}),
+      templateMeta: { ux: 'ia360_owner', label, ia360_handler_for: `${record.message_id}:owner:${label}`, source: 'webhook_owner_notify' },
     });
-    if (!localId) return false; // dedupe atómico ON CONFLICT (p.ej. doble tarjeta del mismo wamid)
-    if (qaSandbox) {
-      console.log('[ia360-qa-sandbox] tarjeta al owner SIN egress real label=%s origen=%s', label, record?.message_id);
-      return true;
-    }
     await enqueueSend({ kind: 'interactive', accountId: account.id, to: IA360_OWNER_NUMBER, localMessageId: localId, payload: { interactive } });
     return true;
   } catch (err) {
@@ -5346,10 +4124,7 @@ async function sendOwnerInteractive({ record, interactive, label, messageBody, t
 // desde la rama owner, donde record.contact_number es Alek, no el prospecto).
 async function sendIa360DirectText({ record, toNumber, body, label, targetContact = null, ownerBudget = false }) {
   try {
-    // G-BRAIN sandbox: texto al OWNER real con origen sintético => fila
-    // 'qa_sandboxed' (visible para los harness), sin egress a Meta.
-    const qaSandbox = normalizePhone(toNumber) === IA360_OWNER_NUMBER && isIa360SyntheticWamid(record?.message_id);
-    if (!qaSandbox && normalizePhone(toNumber) === IA360_OWNER_NUMBER &&
+    if (normalizePhone(toNumber) === IA360_OWNER_NUMBER &&
         !(await canEnqueueIa360OwnerNotify({ record, label, targetContact, ownerBudget }))) return false;
     const { account, error } = await resolveAccount({ fromPhoneNumber: record.wa_number });
     if (error || !account) { console.error('[ia360-owner] direct text account resolve failed:', error || 'unknown'); return false; }
@@ -5358,72 +4133,14 @@ async function sendIa360DirectText({ record, toNumber, body, label, targetContac
       toNumber,
       messageType: 'text',
       messageBody: body,
-      // G-BRAIN: el label forma parte del handler — dos textos DISTINTOS al mismo
-      // destino para el mismo inbound (p.ej. readout + "listo, enviado") son
-      // legítimos y el índice único no debe colapsarlos.
-      templateMeta: { ux: 'ia360_owner', label, ia360_handler_for: `${record.message_id}:direct:${toNumber}:${label}`, source: 'webhook_owner_direct', ...(qaSandbox ? { qa_sandbox: true } : {}) },
-      ...(qaSandbox ? { status: 'qa_sandboxed' } : {}),
+      templateMeta: { ux: 'ia360_owner', label, ia360_handler_for: `${record.message_id}:direct:${toNumber}`, source: 'webhook_owner_direct' },
     });
-    if (!localId) return false; // dedupe atómico ON CONFLICT
-    if (qaSandbox) {
-      console.log('[ia360-qa-sandbox] texto al owner SIN egress real label=%s origen=%s', label, record?.message_id);
-      return true;
-    }
     await enqueueSend({ kind: 'text', accountId: account.id, to: toNumber, localMessageId: localId, payload: { body, previewUrl: false } });
     return true;
   } catch (err) {
     console.error('[ia360-owner] sendIa360DirectText error:', err.message);
     return false;
   }
-}
-
-// ─── G5: Circuit breaker de PAGO / elegibilidad de Meta ─────────────────────
-// Engancha en el procesamiento de webhooks de STATUS. El 131042 NO llega como
-// excepción en el envío síncrono (Meta devuelve accepted+wamid); llega DESPUÉS
-// como status "failed" con errors[].code=131042. Por eso el breaker vive aquí,
-// no sólo en el envío. La LÓGICA (clasificación, flag por cuenta, anti-spam) está
-// en services/paymentCircuitBreaker.js; esta función sólo traduce la decisión en
-// una alerta al owner vía sendIa360DirectText (UNA vez por bloqueo/día/código).
-async function handleIa360PaymentCircuitBreaker(record) {
-  const decision = evaluatePaymentStatus(record);
-  if (decision.action === 'none') return;
-
-  if (decision.action === 'recover') {
-    console.log('[ia360-payment-cb] cuenta %s RECUPERADA (status=%s, facturable entregado) — flag limpiado',
-      decision.accountKey, record.status);
-    // Aviso de recuperación: también es un mensaje de sesión al owner (entrega
-    // aunque la cuenta estuviera bloqueada para templates).
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'owner_payment_recovered',
-      body: '✅ WhatsApp volvió a entregar templates: el bloqueo por pago/elegibilidad de Meta quedó resuelto. Reanudo envíos normales.',
-    }).catch(e => console.error('[ia360-payment-cb] aviso recuperación falló:', e.message));
-    return;
-  }
-
-  // action === 'block'
-  if (!decision.shouldAlert) {
-    console.log('[ia360-payment-cb] cuenta %s ya bloqueada code=%s — alerta suprimida (anti-spam)',
-      decision.accountKey, decision.code);
-    return;
-  }
-
-  const cuenta = record.wa_number || decision.accountKey;
-  const body =
-    `🚨 *WhatsApp bloqueó tus envíos* (cuenta ${cuenta}).\n\n` +
-    `Meta marcó un mensaje como *failed* por *${decision.title}* (código ${decision.code}).\n\n` +
-    `Esto bloquea los *templates* (mensajes iniciados por el negocio). Los mensajes de sesión (respuestas dentro de 24 h) siguen funcionando.\n\n` +
-    (decision.href ? `Resuélvelo aquí:\n${decision.href}` : 'Revisa el Billing Hub de Meta para liquidar el saldo pendiente.');
-
-  const sent = await sendIa360DirectText({
-    record,
-    toNumber: IA360_OWNER_NUMBER,
-    label: `owner_payment_block_${decision.code}`,
-    body,
-  }).catch(e => { console.error('[ia360-payment-cb] alerta owner falló:', e.message); return false; });
-  console.log('[ia360-payment-cb] ALERTA owner cuenta=%s code=%s alerta#%d enviada=%s',
-    decision.accountKey, decision.code, decision.alertCount, sent);
 }
 
 // ─── Expediente del owner: "qué sabes de <nombre|número>" ──────────────────
@@ -5571,645 +4288,6 @@ async function handleIa360OwnerMemoryQuery({ record, query }) {
     body = `No pude leer el expediente de "${query}" ahora mismo (error interno). Inténtalo de nuevo en un momento.`;
   }
   await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'owner_memory_dossier', body });
-}
-
-// ─── G-RAG: puente seguro AlekContenido ↔ RAG IA360 (2026-06-11) ────────────
-// El vault de Obsidian se indexa desde el HOST (scripts/vault-bridge.js: el
-// contenedor backend NO monta el vault); el backend solo lee ia360_vault_notes
-// y administra los vínculos contacto↔nota en ia360_vault_links. Reglas duras:
-// auto-match SOLO por teléfono (el nombre JAMÁS auto-matchea: homónimos), el
-// owner confirma por tarjeta los candidatos por nombre, y los facts destilados
-// caen en ia360_memory_facts con source='alekcontenido' (provenance reversible
-// vía fact_key y payload.note_path).
-
-let ia360VaultTablesReady = null;
-
-async function ensureIa360VaultTables() {
-  if (!ia360VaultTablesReady) {
-    ia360VaultTablesReady = (async () => {
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS coexistence.ia360_vault_notes (
-          note_id BIGSERIAL UNIQUE,
-          note_path TEXT PRIMARY KEY,
-          nombre TEXT,
-          nombre_normalizado TEXT,
-          telefono_wa TEXT,
-          project_name TEXT,
-          rol TEXT,
-          empresa TEXT,
-          frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
-          contenido TEXT,
-          file_mtime TIMESTAMPTZ,
-          indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          missing_since TIMESTAMPTZ
-        )
-      `);
-      await pool.query(`
-        CREATE INDEX IF NOT EXISTS ia360_vault_notes_tel_idx
-          ON coexistence.ia360_vault_notes (telefono_wa) WHERE telefono_wa IS NOT NULL
-      `);
-      await pool.query(`
-        CREATE INDEX IF NOT EXISTS ia360_vault_notes_nombre_idx
-          ON coexistence.ia360_vault_notes (nombre_normalizado)
-      `);
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS coexistence.ia360_vault_links (
-          id BIGSERIAL PRIMARY KEY,
-          forgechat_contact_id BIGINT NOT NULL,
-          contact_number TEXT NOT NULL,
-          note_path TEXT NOT NULL,
-          project_name TEXT,
-          estado TEXT NOT NULL CHECK (estado IN ('vinculado','rechazado')),
-          matched_by TEXT NOT NULL CHECK (matched_by IN ('telefono','owner_tap','owner_reject')),
-          confirmado_at TIMESTAMPTZ,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          UNIQUE (forgechat_contact_id, note_path)
-        )
-      `);
-      await pool.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS ia360_vault_links_note_vinculado_uidx
-          ON coexistence.ia360_vault_links (note_path) WHERE estado = 'vinculado'
-      `);
-      await pool.query(`
-        CREATE INDEX IF NOT EXISTS ia360_vault_links_contact_idx
-          ON coexistence.ia360_vault_links (contact_number, estado)
-      `);
-    })().catch(err => {
-      ia360VaultTablesReady = null;
-      throw err;
-    });
-  }
-  return ia360VaultTablesReady;
-}
-
-// Blocklist del puente: bot, owner y TODO número QA/sintético 521999*.
-function ia360VaultBlocklisted(num) {
-  const n = String(num || '');
-  return n === IA360_BOT_WA_NUMBER || n === IA360_OWNER_NUMBER || /^521999/.test(n);
-}
-
-// Levenshtein chico para el fuzzy de candidatos (Antúnez/Antunes ⇒ distancia 1
-// tras normalizar). Tokens cortos, sin librería.
-function ia360Levenshtein(a, b) {
-  if (a === b) return 0;
-  const m = a.length;
-  const n = b.length;
-  if (!m) return n;
-  if (!n) return m;
-  let prev = Array.from({ length: n + 1 }, (_, j) => j);
-  for (let i = 1; i <= m; i++) {
-    const cur = [i];
-    for (let j = 1; j <= n; j++) {
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    prev = cur;
-  }
-  return prev[n];
-}
-
-// Carga la ficha de contacto por número; si el mismo número vive bajo varias
-// cuentas WA, gana la del bot (la conversación IA360 real).
-async function loadIa360VaultContactByNumber(contactNumber) {
-  const num = normalizePhone(contactNumber);
-  if (!num) return null;
-  const { rows } = await pool.query(
-    `SELECT id, wa_number, contact_number, name, profile_name, custom_fields
-       FROM coexistence.contacts
-      WHERE contact_number = $1
-      ORDER BY (wa_number = $2) DESC
-      LIMIT 1`,
-    [num, IA360_BOT_WA_NUMBER]
-  );
-  return rows[0] || null;
-}
-
-// Auto-match SOLO por teléfono. El COUNT(DISTINCT)=1 garantiza que un teléfono
-// jamás apunte a 2 contactos; el NOT EXISTS respeta vínculos de otros contactos
-// y rechazos sellados de este contacto. El nombre JAMÁS auto-matchea.
-async function ensureIa360VaultAutoLinks({ contact }) {
-  if (!contact || ia360VaultBlocklisted(contact.contact_number)) return [];
-  await ensureIa360VaultTables();
-  const { rows } = await pool.query(
-    `INSERT INTO coexistence.ia360_vault_links
-       (forgechat_contact_id, contact_number, note_path, project_name, estado, matched_by, confirmado_at)
-     SELECT $1, $2, n.note_path, n.project_name, 'vinculado', 'telefono', NOW()
-       FROM coexistence.ia360_vault_notes n
-      WHERE n.telefono_wa = $2 AND n.missing_since IS NULL
-        AND (SELECT COUNT(DISTINCT c2.id) FROM coexistence.contacts c2 WHERE c2.contact_number = $2) = 1
-        AND NOT EXISTS (SELECT 1 FROM coexistence.ia360_vault_links l
-                         WHERE l.note_path = n.note_path
-                           AND (l.estado = 'vinculado' OR l.forgechat_contact_id = $1))
-     ON CONFLICT (forgechat_contact_id, note_path) DO NOTHING
-     RETURNING note_path`,
-    [contact.id, contact.contact_number]
-  );
-  return rows.map(r => r.note_path);
-}
-
-// Limpieza de valores del vault: [[wikilinks]] → texto interno, sin markdown
-// de negritas, espacios colapsados, tope 300 chars.
-function ia360CleanVaultValue(v) {
-  return String(v == null ? '' : v)
-    .replace(/\[\[([^\]]+)\]\]/g, '$1')
-    .replace(/\*\*/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 300);
-}
-
-// Destilación DETERMINISTA de una nota del vault (sin LLM): frontmatter a
-// slots de ia360_memory_facts + hasta 3 dolores de la tabla del cuerpo.
-function distillIa360VaultNote(note) {
-  const fm = note?.frontmatter || {};
-  const facts = [];
-  const push = (slot, valor, sufijo) => {
-    const v = ia360CleanVaultValue(valor);
-    if (v) facts.push({ slot, valor: v, sufijo });
-  };
-  const pick = (...keys) => {
-    for (const k of keys) {
-      if (fm[k] != null && String(fm[k]).trim() !== '') return fm[k];
-    }
-    return null;
-  };
-  push('role', pick('rol', 'cargo', 'rol_principal', 'rol_en_meta'), 'rol');
-  push('account_name', pick('empresa', 'organizacion', 'organización'), 'empresa');
-  push('persona', pick('tipo', 'tipo_referencia', 'nivel_decision'), 'tipo');
-  const canal = pick('canal_preferido');
-  if (canal) push('preference', `Canal preferido: ${ia360CleanVaultValue(canal)}`, 'canal');
-  // Filas de la tabla de dolores del cuerpo: "| 1 | **dolor** | ...".
-  const re = /^\|\s*\d+\s*\|\s*\*\*(.+?)\*\*/gm;
-  let m;
-  let i = 0;
-  while ((m = re.exec(String(note?.contenido || ''))) && i < 3) {
-    i += 1;
-    push('recurring_pain', m[1], `pain${i}`);
-  }
-  return facts;
-}
-
-const IA360_VAULT_SLOT_COLUMNS = {
-  role: 'role',
-  account_name: 'account_name',
-  persona: 'persona',
-  preference: 'preference',
-  recurring_pain: 'recurring_pain',
-};
-
-// Vuelca a ia360_memory_facts lo destilado de las notas VINCULADAS del
-// contacto. fact_key = 'alekcontenido:<note_path>#<sufijo>' (dedupe natural);
-// project_name = el de la NOTA (jaula correcta; notas de Areas/CRM traen NULL
-// = fact general de persona). Devuelve { notas, facts, proyectos }.
-async function enrichIa360ContactFromVault({ record, contact }) {
-  await ensureIa360VaultTables();
-  const { rows: notes } = await pool.query(
-    `SELECT n.note_path, n.project_name, n.frontmatter, n.contenido
-       FROM coexistence.ia360_vault_links l
-       JOIN coexistence.ia360_vault_notes n ON n.note_path = l.note_path
-      WHERE l.forgechat_contact_id = $1 AND l.estado = 'vinculado'
-        AND n.missing_since IS NULL
-      ORDER BY l.confirmado_at DESC NULLS LAST`,
-    [contact.id]
-  );
-  const result = { notas: [], facts: 0, proyectos: [] };
-  if (!notes.length) return result;
-  for (const note of notes) {
-    result.notas.push({ note_path: note.note_path, project_name: note.project_name || null });
-    if (note.project_name && !result.proyectos.includes(note.project_name)) result.proyectos.push(note.project_name);
-    for (const f of distillIa360VaultNote(note)) {
-      const col = IA360_VAULT_SLOT_COLUMNS[f.slot];
-      if (!col) continue;
-      const factKey = `alekcontenido:${note.note_path}#${f.sufijo}`;
-      const payload = { note_path: note.note_path, origen: 'vault', valor: f.valor };
-      await pool.query(
-        `INSERT INTO coexistence.ia360_memory_facts
-           (fact_key, source, contact_wa_number, contact_number, forgechat_contact_id,
-            project_name, ${col}, confidence, owner_review_status, status, payload)
-         VALUES ($1,'alekcontenido',$2,$3,$4,$5,$6,0.950,'owner_curated','confirmed',$7::jsonb)
-         ON CONFLICT (fact_key) DO UPDATE SET
-           ${col} = EXCLUDED.${col},
-           project_name = EXCLUDED.project_name,
-           payload = EXCLUDED.payload,
-           evidence_count = coexistence.ia360_memory_facts.evidence_count + 1,
-           last_seen_at = NOW(), updated_at = NOW()`,
-        [
-          factKey,
-          contact.wa_number,
-          contact.contact_number,
-          contact.id,
-          note.project_name || null,
-          f.valor,
-          JSON.stringify(payload),
-        ]
-      );
-      result.facts += 1;
-    }
-  }
-  await mergeContactIa360State({
-    waNumber: contact.wa_number,
-    contactNumber: contact.contact_number,
-    customFields: { rag_enriched_at: new Date().toISOString() },
-  });
-  console.log('[ia360-vault] enriquecido contacto=%s notas=%d facts=%d origen=%s',
-    contact.contact_number, result.notas.length, result.facts, record?.message_id || '-');
-  return result;
-}
-
-// Candidatos por NOMBRE: notas vivas no vinculadas a NADIE y sin fila sellada
-// para ESTE contacto. Cada token (≥3 chars) del nombre del contacto debe
-// aparecer en el nombre de la nota o estar a Levenshtein ≤ 1 de algún token.
-async function buildIa360VaultCandidates(contact) {
-  await ensureIa360VaultTables();
-  const display = contact?.name || contact?.profile_name || '';
-  const tokens = ia360NormalizeNameForMatch(display).split(' ').filter(t => t.length >= 3);
-  if (!tokens.length) return [];
-  const { rows } = await pool.query(
-    `SELECT n.note_id, n.note_path, n.nombre, n.nombre_normalizado, n.project_name, n.rol, n.empresa
-       FROM coexistence.ia360_vault_notes n
-      WHERE n.missing_since IS NULL
-        AND NOT EXISTS (SELECT 1 FROM coexistence.ia360_vault_links l
-                         WHERE l.note_path = n.note_path AND l.estado = 'vinculado')
-        AND NOT EXISTS (SELECT 1 FROM coexistence.ia360_vault_links l2
-                         WHERE l2.note_path = n.note_path AND l2.forgechat_contact_id = $1)`,
-    [contact.id]
-  );
-  const scored = [];
-  for (const n of rows) {
-    const noteName = String(n.nombre_normalizado || '');
-    if (!noteName) continue;
-    const noteTokens = noteName.split(' ').filter(Boolean);
-    let score = 0;
-    let all = true;
-    for (const t of tokens) {
-      if (noteName.includes(t) || noteTokens.some(nt => ia360Levenshtein(t, nt) <= 1)) score += 1;
-      else all = false;
-    }
-    if (all && score > 0) scored.push({ ...n, score });
-  }
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, 3);
-}
-
-// Tarjeta de candidatos al owner (mismo patrón list del approve-send). Sin tap
-// del owner = cero sync: el nombre solo PROPONE, nunca vincula.
-async function sendIa360VaultCandidateCard({ record, contact, candidates = null }) {
-  const list = candidates || await buildIa360VaultCandidates(contact);
-  const display = contact.name || contact.profile_name || contact.contact_number;
-  if (!list.length) {
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'ia360_vault_no_candidates',
-      body: `Sin notas candidatas en el vault para ${display}. Si existe la nota, captúrale telefono_wa y vuelve a pedir "sincroniza a ...".`,
-      targetContact: contact.contact_number,
-      ownerBudget: true,
-    });
-    return false;
-  }
-  await mergeContactIa360State({
-    waNumber: contact.wa_number,
-    contactNumber: contact.contact_number,
-    customFields: { ia360_vault_offered: list.map(c => c.note_id).join(',') },
-  });
-  const rows = list.map(c => ({
-    id: `owner_vlink:${contact.contact_number}:${c.note_id}`,
-    title: String(c.nombre || c.note_path).slice(0, 24),
-    description: `${c.project_name || 'CRM general'} · ${c.rol || c.empresa || 'nota'}`.slice(0, 72),
-  }));
-  rows.push({
-    id: `owner_vnone:${contact.contact_number}`,
-    title: 'Ninguno, crear nuevo',
-    description: 'No vincular; nota nueva en Areas/CRM/contactos/ cuando haya docs',
-  });
-  return sendOwnerInteractive({
-    record,
-    label: 'ia360_vault_candidates',
-    messageBody: `Candidatos vault para ${contact.contact_number}: ${list.map(c => `${c.nombre} (${c.project_name || 'CRM general'})`).join(', ')}`,
-    targetContact: contact.contact_number,
-    ownerBudget: true,
-    interactive: {
-      type: 'list',
-      body: { text: `Sin match por teléfono para ${display} (${contact.contact_number}). ¿Vinculo alguna nota del vault?` },
-      action: {
-        button: 'Elegir nota',
-        sections: [{
-          title: 'Notas del vault',
-          rows,
-        }],
-      },
-    },
-  });
-}
-
-// Tap owner_vlink: vínculo sellado por decisión EXPLÍCITA del owner. Un tap SÍ
-// puede revertir un rechazo previo (decisión nueva, no re-pregunta).
-async function handleIa360OwnerVaultLink({ record, targetContact, noteId }) {
-  try {
-    await ensureIa360VaultTables();
-    const contact = await loadIa360VaultContactByNumber(targetContact);
-    const { rows: noteRows } = await pool.query(
-      `SELECT note_id, note_path, project_name, nombre
-         FROM coexistence.ia360_vault_notes
-        WHERE note_id = $1
-        LIMIT 1`,
-      [noteId]
-    );
-    const note = noteRows[0];
-    if (!contact || !note) {
-      await sendIa360DirectText({
-        record,
-        toNumber: IA360_OWNER_NUMBER,
-        label: 'ia360_vault_link_conflict',
-        body: `No pude vincular: ${!contact ? `no hay ficha de contacto para ${targetContact}` : `la nota ${noteId} ya no existe en el índice del vault`}. Corre el indexador y vuelve a pedir "sincroniza a ...".`,
-        targetContact,
-        ownerBudget: true,
-      });
-      return;
-    }
-    try {
-      await pool.query(
-        `INSERT INTO coexistence.ia360_vault_links
-           (forgechat_contact_id, contact_number, note_path, project_name, estado, matched_by, confirmado_at)
-         VALUES ($1,$2,$3,$4,'vinculado','owner_tap',NOW())
-         ON CONFLICT (forgechat_contact_id, note_path) DO UPDATE SET
-           estado='vinculado', matched_by='owner_tap', confirmado_at=NOW(), updated_at=NOW()`,
-        [contact.id, contact.contact_number, note.note_path, note.project_name || null]
-      );
-    } catch (linkErr) {
-      // Solo la violación del índice parcial único (23505) significa "la nota
-      // ya pertenece a OTRO contacto"; lo demás es error interno y lo maneja
-      // el catch externo sin diagnósticos falsos.
-      if (linkErr.code !== '23505') throw linkErr;
-      console.warn('[ia360-vault] vínculo en conflicto note=%s contacto=%s: %s', note.note_path, targetContact, linkErr.message);
-      await sendIa360DirectText({
-        record,
-        toNumber: IA360_OWNER_NUMBER,
-        label: 'ia360_vault_link_conflict',
-        body: `No vinculé ${note.note_path}: esa nota ya está vinculada a OTRO contacto (una nota apunta a una sola persona). Si el vínculo actual está mal, dime y lo revisamos.`,
-        targetContact,
-        ownerBudget: true,
-      });
-      return;
-    }
-    const enriched = await enrichIa360ContactFromVault({ record, contact });
-    const display = contact.name || contact.profile_name || targetContact;
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'ia360_vault_linked',
-      body: `Vinculé ${note.note_path} a ${display} (${targetContact}). Facts: ${enriched.facts} (proyecto: ${note.project_name || 'general'}). Si quieres vincular otra nota: "sincroniza a ${display}".`,
-      targetContact,
-      ownerBudget: true,
-    });
-  } catch (err) {
-    console.error('[ia360-vault] owner_vlink error:', err.message);
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'ia360_vault_link_conflict',
-      body: `No pude completar el vínculo para ${targetContact} (error interno). Inténtalo de nuevo en un momento.`,
-      targetContact,
-      ownerBudget: true,
-    }).catch(() => {});
-  }
-}
-
-// Tap owner_vnone: sella como rechazados TODOS los candidatos ofrecidos en la
-// tarjeta (no se vuelve a preguntar). Jamás degrada un vínculo ya sellado.
-async function handleIa360OwnerVaultNone({ record, targetContact }) {
-  try {
-    await ensureIa360VaultTables();
-    const contact = await loadIa360VaultContactByNumber(targetContact);
-    if (!contact) {
-      await sendIa360DirectText({
-        record,
-        toNumber: IA360_OWNER_NUMBER,
-        label: 'ia360_vault_none_ack',
-        body: `No hay ficha de contacto para ${targetContact}; no había nada que sellar.`,
-        targetContact,
-        ownerBudget: true,
-      });
-      return;
-    }
-    const offered = String(contact.custom_fields?.ia360_vault_offered || '')
-      .split(',')
-      .map(s => s.replace(/\D/g, ''))
-      .filter(Boolean);
-    for (const nid of offered) {
-      const { rows } = await pool.query(
-        `SELECT note_path, project_name FROM coexistence.ia360_vault_notes WHERE note_id = $1 LIMIT 1`,
-        [nid]
-      );
-      const note = rows[0];
-      if (!note) continue;
-      await pool.query(
-        `INSERT INTO coexistence.ia360_vault_links
-           (forgechat_contact_id, contact_number, note_path, project_name, estado, matched_by, confirmado_at)
-         VALUES ($1,$2,$3,$4,'rechazado','owner_reject',NOW())
-         ON CONFLICT (forgechat_contact_id, note_path) DO UPDATE SET
-           estado='rechazado', matched_by='owner_reject', confirmado_at=NOW(), updated_at=NOW()
-           WHERE coexistence.ia360_vault_links.estado <> 'vinculado'`,
-        [contact.id, contact.contact_number, note.note_path, note.project_name || null]
-      );
-    }
-    await mergeContactIa360State({
-      waNumber: contact.wa_number,
-      contactNumber: contact.contact_number,
-      customFields: { ia360_vault_offered: '', ia360_vault_none: '1' },
-    });
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'ia360_vault_none_ack',
-      body: `Listo, no vinculé nada para ${targetContact}. Los candidatos quedan sellados como rechazados (no vuelvo a preguntar) y cuando haya documentos crearé nota nueva en Areas/CRM/contactos/.`,
-      targetContact,
-      ownerBudget: true,
-    });
-  } catch (err) {
-    console.error('[ia360-vault] owner_vnone error:', err.message);
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'ia360_vault_none_ack',
-      body: `No pude sellar los rechazos para ${targetContact} (error interno). Vuelve a tocar "Ninguno, crear nuevo" en un momento.`,
-      targetContact,
-      ownerBudget: true,
-    }).catch(() => {});
-  }
-}
-
-// Comando del owner: "sincroniza a <nombre|número>". Resuelve el contacto con
-// la misma tolerancia a typos del expediente, fuerza el auto-match por
-// teléfono y, si no hay vínculo, propone candidatos por nombre con tarjeta.
-// try/catch total: NUNCA queda mudo.
-async function handleIa360OwnerVaultSync({ record, query }) {
-  const ownerText = (label, body) => sendIa360DirectText({
-    record, toNumber: IA360_OWNER_NUMBER, label, body, ownerBudget: true,
-  });
-  try {
-    await ensureIa360VaultTables();
-    const target = await resolveIa360MemoryTarget(query);
-    if (target.kind === 'none') {
-      await ownerText('ia360_vault_sync_none', `No encontré a "${query}" ni como nombre ni como número.`);
-      return;
-    }
-    if (target.kind === 'ambiguous') {
-      const list = target.candidates.slice(0, 8)
-        .map(c => `- ${c.contact_name || 'sin nombre'} (${c.contact_number})`).join('\n');
-      await ownerText('ia360_vault_sync_ambiguous',
-        `Encontré varios contactos que coinciden con "${query}". ¿A cuál sincronizo?\n${list}\n\nMándame "sincroniza a <número>" para elegirlo.`);
-      return;
-    }
-    const num = normalizePhone(target.candidates[0].contact_number);
-    const contact = await loadIa360VaultContactByNumber(num);
-    if (!contact) {
-      await ownerText('ia360_vault_sync_none', `No hay ficha de ${num} en contacts de ForgeChat; sin ficha no puedo vincular notas del vault.`);
-      return;
-    }
-    if (ia360VaultBlocklisted(contact.contact_number)) {
-      await ownerText('ia360_vault_sync_blocked', 'Ese número está en la blocklist del puente (bot/owner/QA); no se sincroniza.');
-      return;
-    }
-    await ensureIa360VaultAutoLinks({ contact });
-    const enriched = await enrichIa360ContactFromVault({ record, contact });
-    if (enriched.notas.length) {
-      const display = contact.name || contact.profile_name || num;
-      const lines = [
-        `Sincronizado ${display} (${num}): ${enriched.notas.length} nota(s) vinculada(s), ${enriched.facts} facts.`,
-        ...enriched.notas.map(n => `- ${n.note_path} → proyecto ${n.project_name || 'general'}`),
-      ];
-      await sendIa360DirectText({
-        record,
-        toNumber: IA360_OWNER_NUMBER,
-        label: 'ia360_vault_synced',
-        body: lines.join('\n'),
-        targetContact: num,
-        ownerBudget: true,
-      });
-      // "Si quieres vincular otra nota: sincroniza a <nombre>" (ack del tap):
-      // si todavía quedan candidatos por nombre sin sellar, se ofrecen aquí
-      // mismo — sin esto el repeat-sync sería un callejón sin salida.
-      const remaining = await buildIa360VaultCandidates(contact);
-      if (remaining.length) await sendIa360VaultCandidateCard({ record, contact, candidates: remaining });
-      return;
-    }
-    await sendIa360VaultCandidateCard({ record, contact });
-  } catch (err) {
-    console.error('[ia360-vault] sync error:', err.message);
-    await ownerText('ia360_vault_sync_error', `No pude sincronizar "${query}" ahora mismo (error interno). Inténtalo de nuevo en un momento.`).catch(() => {});
-  }
-}
-
-// G9 — Comando del owner: "intro <contacto>: <quien presenta>" (o el atajo
-// "referido <contacto> de <quien>"). Reanima la INTRO del referido BNI: persiste
-// quien_intro en el contacto referido para que la secuencia referido_contexto
-// arme la intro real en lugar de bloquearse (cold_send_missing_quien_intro /
-// placeholder caliente). Resuelve el contacto con la misma tolerancia del
-// expediente; intenta resolver al aliado real a un numero para referido_por
-// (nunca el owner). try/catch total: NUNCA queda mudo.
-async function handleIa360OwnerIntroCommand({ record, target, introducer }) {
-  const ownerText = (label, body) => sendIa360DirectText({
-    record, toNumber: IA360_OWNER_NUMBER, label, body, ownerBudget: true,
-  });
-  try {
-    const quienIntroName = sanitizeIa360IntroNamePure(introducer);
-    if (!quienIntroName) {
-      await ownerText('ia360_intro_bad_name',
-        `No leí un nombre válido de quién presenta en "${introducer}". Usa: intro <contacto>: <quién presenta>.`);
-      return;
-    }
-    const resolved = await resolveIa360MemoryTarget(target);
-    if (resolved.kind === 'none') {
-      await ownerText('ia360_intro_target_none',
-        `No encontré a "${target}" ni como nombre ni como número. Revisa el nombre o usa el número: intro <número>: ${quienIntroName}.`);
-      return;
-    }
-    if (resolved.kind === 'ambiguous') {
-      const list = resolved.candidates.slice(0, 8)
-        .map(c => `- ${c.contact_name || 'sin nombre'} (${c.contact_number})`).join('\n');
-      await ownerText('ia360_intro_target_ambiguous',
-        `Hay varios contactos que coinciden con "${target}". ¿A cuál le pongo la intro de ${quienIntroName}?\n${list}\n\nMándame "intro <número>: ${quienIntroName}".`);
-      return;
-    }
-    const contactNumber = normalizePhone(resolved.candidates[0].contact_number);
-    // Intenta resolver al aliado real a un número para referido_por. Solo cuenta
-    // un match directo (nombre único o número); si es ambiguo o no existe ficha,
-    // no tocamos referido_por (quien_intro tecleado ya es la señal primaria).
-    let introducerNumber = null;
-    try {
-      const introResolved = await resolveIa360MemoryTarget(introducer);
-      if (introResolved.kind === 'name' || introResolved.kind === 'number') {
-        introducerNumber = normalizePhone(introResolved.candidates[0].contact_number);
-      }
-    } catch (e) {
-      console.error('[ia360-intro] introducer resolve:', e.message);
-    }
-    const customFields = buildIa360IntroCustomFields({
-      quienIntroName,
-      introducerNumber,
-      ownerNumber: IA360_OWNER_NUMBER,
-      contactNumber,
-      botNumber: IA360_BOT_WA_NUMBER,
-      nowIso: new Date().toISOString(),
-    });
-    await mergeContactIa360State({
-      waNumber: record.wa_number,
-      contactNumber,
-      customFields,
-    });
-    const display = resolved.candidates[0].contact_name || contactNumber;
-    const refLine = customFields.referido_por
-      ? ` Aliado vinculado: ${customFields.referido_por}.`
-      : ' (No reconocí un número del aliado; quedó solo el nombre, suficiente para la intro.)';
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'ia360_intro_saved',
-      body: `Listo. ${display} (${contactNumber}) ahora figura presentado por ${quienIntroName}.${refLine} La secuencia de referido ya arma la intro real sin pedirte el dato.`,
-      targetContact: contactNumber,
-      ownerBudget: true,
-    });
-  } catch (err) {
-    console.error('[ia360-intro] owner command error:', err.message);
-    await ownerText('ia360_intro_error',
-      `No pude registrar la intro de "${target}" ahora mismo (error interno). Inténtalo de nuevo en un momento.`).catch(() => {});
-  }
-}
-
-// Hook al alta de contacto: el primer mensaje real de un número nuevo dispara
-// UNA sola vez (flag ia360_vault_checked) el auto-match por teléfono y, si no
-// hay vínculo pero sí candidatos por nombre, la tarjeta al owner. Sin tap del
-// owner = cero sync. Fire-and-forget: jamás bloquea el inbound.
-async function maybeIa360VaultIntake(record) {
-  await ensureIa360VaultTables();
-  const { rows } = await pool.query(
-    `SELECT id, wa_number, contact_number, name, profile_name, custom_fields
-       FROM coexistence.contacts
-      WHERE wa_number = $1 AND contact_number = $2
-      LIMIT 1`,
-    [record.wa_number, record.contact_number]
-  );
-  const contact = rows[0];
-  if (!contact) return;
-  if (String(contact.custom_fields?.ia360_vault_checked || '') === '1') return;
-  await mergeContactIa360State({
-    waNumber: contact.wa_number,
-    contactNumber: contact.contact_number,
-    customFields: { ia360_vault_checked: '1' },
-  });
-  await ensureIa360VaultAutoLinks({ contact });
-  const { rows: linked } = await pool.query(
-    `SELECT COUNT(*)::int AS n FROM coexistence.ia360_vault_links
-      WHERE forgechat_contact_id = $1 AND estado = 'vinculado'`,
-    [contact.id]
-  );
-  if (linked[0].n > 0) {
-    await enrichIa360ContactFromVault({ record, contact });
-    return;
-  }
-  const candidates = await buildIa360VaultCandidates(contact);
-  if (candidates.length) await sendIa360VaultCandidateCard({ record, contact, candidates });
 }
 
 // ─── Bandeja de ideas del owner ─────────────────────────────────────────────
@@ -6618,7 +4696,7 @@ function isIa360PassiveMessage(body) {
 // `reason` = 'no-manejado' (accionable sin resolver) o 'error: <msg>' (excepción).
 // `alreadyResponded` evita doble-texto si el flujo ya le dijo algo al contacto.
 async function handleIa360BotFailure({ record, reason, alreadyResponded = false }) {
-  const fallbackBody = 'Recibí tu pregunta. Para responderte bien y no darte una respuesta incompleta, voy a revisar el contexto con Alek y te confirmo por aquí en breve.';
+  const fallbackBody = 'Recibí tu mensaje. Déjame revisarlo con Alek y te contacto en breve.';
   let failureId = null;
   try {
     const { rows } = await pool.query(
@@ -6641,22 +4719,6 @@ async function handleIa360BotFailure({ record, reason, alreadyResponded = false 
     }
   }
   // 3) Alerta al owner con botones para cerrar el loop (solo si tenemos id).
-  // G-BRAIN: los contactos QA (rango exacto 52199900XXXXX) NUNCA alertan al
-  // WhatsApp real del owner — el failure queda registrado en ia360_bot_failures +
-  // evidencia QA, y se acabó. (Las 4 tarjetas "el bot no resolvió un mensaje de
-  // 5219990000950" del 06-11 eran ruido de harness en el teléfono de Alek.)
-  // OJO (hallazgo de review): patrón QA exacto, NO ^521999 — 999 es la lada de
-  // Mérida y un cliente real de ahí debe seguir alertando al owner.
-  if (failureId != null && IA360_QA_NUMBER_RE.test(String(record.contact_number || ''))) {
-    await recordIa360QaEvidence({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      kind: 'owner_bot_failure_suppressed',
-      label: 'owner_bot_failure',
-      messageBody: `IA360: el bot no resolvió un mensaje de ${record.contact_number} (${String(reason || 'no-manejado').slice(0, 80)})`,
-    }).catch(() => {});
-    return failureId;
-  }
   if (failureId != null) {
     try {
       const reasonShort = String(reason || 'no-manejado').slice(0, 80);
@@ -6683,125 +4745,6 @@ async function handleIa360BotFailure({ record, reason, alreadyResponded = false 
   return failureId;
 }
 
-// ── G-LIVE: invariante estructural no-silencio (watchdog por inbound) ────────────
-// La clase del incidente Andrés (38 min mudo): una rama "marca como manejado" sin
-// egress real. La verdad no es ningún flag en memoria: es la fila outgoing en
-// chat_history (insertPendingRow la escribe al encolar, así que es visible de
-// inmediato). 75 s después del inbound de un cliente activo/beta (o con deal
-// ganado), si no existe NINGÚN outgoing hacia ese contacto desde el inbound =>
-// holding + alerta al owner + failure registrado. Cubre toda rama presente o
-// futura (texto, botones, audio, vCard) sin parchar rama por rama. El dedupe de
-// resolveIa360Outbound (ia360_handler_for = message_id) lo hace idempotente.
-const IA360_NO_SILENCE_WATCHDOG_MS = 75000;
-
-async function ia360HasOutgoingForInbound(record) {
-  // Escape de comodines LIKE: los wamid del harness pueden traer '_' o '%'.
-  const wamidLike = String(record.message_id || '~none~').replace(/[\\%_]/g, '\\$&');
-  const { rows } = await pool.query(
-    `SELECT 1
-       FROM coexistence.chat_history o
-      WHERE o.direction = 'outgoing'
-        AND o.contact_number = $1
-        AND COALESCE(o.status, '') NOT IN ('failed', 'error')
-        AND (o.template_meta->>'ia360_handler_for' LIKE $2 || '%'
-             OR o.timestamp >= (SELECT i.timestamp FROM coexistence.chat_history i
-                                 WHERE i.message_id = $3 LIMIT 1))
-      LIMIT 1`,
-    [record.contact_number, wamidLike, record.message_id || '~none~']
-  );
-  return rows.length > 0;
-}
-
-async function ia360IsWatchedActiveContact(record) {
-  const contact = await loadIa360ContactContext(record).catch(() => null);
-  if (isIa360ClienteActivoBetaContact(contact)) return true;
-  // Cliente con deal GANADO sin marca beta en contacts: también es cliente real
-  // activo que jamás debe quedar en silencio (hallazgo alta de la auditoría 06-11).
-  try {
-    const { rows } = await pool.query(
-      `SELECT 1 FROM coexistence.deals d
-         JOIN coexistence.pipeline_stages s ON s.id = d.stage_id
-        WHERE d.contact_wa_number = $1 AND d.contact_number = $2
-          AND (s.stage_type = 'won' OR s.name = 'Ganado')
-        LIMIT 1`,
-      [record.wa_number, record.contact_number]
-    );
-    return rows.length > 0;
-  } catch (e) {
-    console.error('[ia360-no-silence] won-deal check error:', e.message);
-    return false;
-  }
-}
-
-async function ia360NoSilenceWatchdogCheck(record) {
-  if (!(await ia360IsWatchedActiveContact(record))) return;
-  if (await ia360HasOutgoingForInbound(record)) return;
-  console.error('[ia360-no-silence] INVARIANTE DISPARADO contact=%s message=%s type=%s',
-    maskIa360Number(record.contact_number), record.message_id, record.message_type);
-  await handleIa360BotFailure({
-    record,
-    reason: `invariante no-silencio: sin fila outgoing en chat_history ${Math.round(IA360_NO_SILENCE_WATCHDOG_MS / 1000)}s después del inbound de cliente activo/beta`,
-    alreadyResponded: false,
-  });
-}
-
-function scheduleIa360NoSilenceWatchdog(record) {
-  try {
-    if (!record || record.direction !== 'incoming') return;
-    if (record.message_type === 'status' || record.message_type === 'reaction' || record.message_type === 'sticker') return;
-    if (!record.message_id) return; // sin wamid no hay forma confiable de verificar el egress
-    const n = normalizePhone(record.contact_number);
-    if (!n || n === IA360_OWNER_NUMBER) return;
-    // Texto pasivo ("gracias", "ok") no exige respuesta (diseño deliberado Gap#1).
-    if (record.message_type === 'text' && isIa360PassiveMessage(record.message_body)) return;
-    // Subset del record: no retener raw_payload (batches n8n) en memoria 75 s.
-    const slim = {
-      wa_number: record.wa_number,
-      contact_number: record.contact_number,
-      contact_name: record.contact_name || null,
-      message_id: record.message_id,
-      message_type: record.message_type,
-      message_body: record.message_body || null,
-      direction: record.direction,
-    };
-    const t = setTimeout(() => {
-      ia360NoSilenceWatchdogCheck(slim).catch(e =>
-        console.error('[ia360-no-silence] watchdog error:', e.message));
-    }, IA360_NO_SILENCE_WATCHDOG_MS);
-    if (typeof t.unref === 'function') t.unref();
-  } catch (e) {
-    console.error('[ia360-no-silence] schedule error:', e.message);
-  }
-}
-
-// G-LIVE: un deploy/restart dentro de la ventana del watchdog perdería los timers en
-// memoria — y el deploy es justo el momento de mayor riesgo de egress roto. Al boot,
-// re-escanear los inbounds recientes (15 min) de no-owner y re-correr el check.
-const ia360BootRescanTimer = setTimeout(async () => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT message_id, wa_number, contact_number, message_type, message_body
-         FROM coexistence.chat_history
-        WHERE direction = 'incoming'
-          AND message_type NOT IN ('status', 'reaction', 'sticker')
-          AND timestamp > NOW() - INTERVAL '15 minutes'`
-    );
-    let checked = 0;
-    for (const r of rows) {
-      if (!r.message_id) continue;
-      if (normalizePhone(r.contact_number) === IA360_OWNER_NUMBER) continue;
-      if (r.message_type === 'text' && isIa360PassiveMessage(r.message_body)) continue;
-      checked += 1;
-      await ia360NoSilenceWatchdogCheck({ ...r, direction: 'incoming' })
-        .catch(e => console.error('[ia360-no-silence] boot rescan check:', e.message));
-    }
-    if (checked) console.log('[ia360-no-silence] boot rescan: %d inbound(s) recientes revisados', checked);
-  } catch (e) {
-    console.error('[ia360-no-silence] boot rescan error:', e.message);
-  }
-}, 90000);
-if (typeof ia360BootRescanTimer.unref === 'function') ia360BootRescanTimer.unref();
-
 async function handleIa360FreeText(record) {
   // PRODUCTION-HARDENING (fallback universal — cero silencio): estos dos flags viven a
   // nivel de FUNCION (no del try) para que el catch terminal pueda verlos.
@@ -6820,131 +4763,14 @@ async function handleIa360FreeText(record) {
     dealFound = true;
     const contactContext = deal.contact_context || await loadIa360ContactContext(record).catch(() => null);
     if (deal.memory_mode === 'cliente_activo_beta_supervisado' || isIa360ClienteActivoBetaContact(contactContext)) {
-      // G-LIVE (P0 producción): cliente activo/beta SIEMPRE recibe respuesta real.
-      // 1) Captura de memoria: aprendizaje en segundo plano REAL (fire-and-forget,
-      //    no suma latencia al camino caliente) y NUNCA cuenta como respuesta (la
-      //    clase del bug de Andrés: dry-run devolvía true y el padre creía que ya
-      //    había respondido).
-      handleIa360ClienteActivoBetaLearning({ record, deal, contact: contactContext, captureOnly: true })
-        .catch(e => console.error('[ia360-memory] capture error:', e.message));
-
-      // 2) Datos vivos del portal del cliente: WhatsApp no tiene acceso => handoff
-      //    explícito y honesto. NUNCA inventar listas ni cifras.
-      if (isIa360PortalLiveDataQuestion(record.message_body)) {
-        const sentHandoff = await enqueueIa360Text({
-          record,
-          label: 'ia360_cliente_activo_portal_handoff',
-          body: 'Ese dato vive en el portal y prefiero confirmarte la cifra exacta antes que darte una aproximación. Lo reviso con Alek y te confirmo por aquí en breve.',
-        });
-        if (sentHandoff) responded = true;
-        await handleIa360BotFailure({
-          record,
-          reason: 'handoff: pregunta de datos vivos del portal del cliente (sin acceso desde WhatsApp)',
-          alreadyResponded: sentHandoff === true,
-        }).catch(e => console.error('[ia360-failure] portal handoff alert error:', e.message));
-        return;
-      }
-
-      // 3) Respuesta REAL del agente IA (memoria incluida vía memory-lookup del
-      //    workflow). UNA sola respuesta; prohibidas cadenas de "corrijo".
-      //    [qa-force-agent-down] simula agente caído SOLO para números QA (E2E).
-      const qaForceDown = IA360_QA_NUMBER_RE.test(String(record.contact_number || ''))
-        && /\[qa-force-agent-down\]/i.test(String(record.message_body || ''));
-      // G-BRAIN: estado conversacional + memoria precargada también para beta —
-      // mismo presupuesto de preguntas, cierre con opciones y no-repetir.
-      const betaConvState = loadIa360ConvState(contactContext);
-      let betaMemory = null;
-      try {
-        betaMemory = await lookupIa360MemoryContext({ record, contact: contactContext, limit: 8 });
-      } catch (e) {
-        console.error('[ia360-agent] beta memory lookup failed:', e.message);
-      }
-      const agentBeta = qaForceDown
-        ? null
-        : await callIa360Agent({
-            record,
-            stageName: deal.stage_name,
-            roleHint: [
-              buildIa360ClienteActivoBetaRoleHint(contactContext),
-              buildIa360ConversationRoleHint({ contact: contactContext, stageName: deal.stage_name, convState: betaConvState, memory: betaMemory, messageBody: record.message_body }),
-            ].join(' | '),
-            memory: betaMemory,
-          });
-      let betaReply = agentBeta && typeof agentBeta.reply === 'string' ? agentBeta.reply.trim() : '';
-      // Deuda G-LIVE cerrada: post-filtro de pitch en código. Si el contacto es
-      // do_not_pitch y el reply huele a venta, NO sale: respuesta segura + aviso.
-      if (betaReply && isIa360DoNotPitchContact(contactContext) && ia360ReplySmellsLikePitch(betaReply)) {
-        console.error('[ia360-agent] post-filtro pitch: reply bloqueado para do_not_pitch contact=%s', maskIa360Number(record.contact_number));
-        sendIa360DirectText({
-          record,
-          toNumber: IA360_OWNER_NUMBER,
-          label: 'owner_beta_pitch_blocked',
-          body: `IA360: bloqueé un reply con tono de venta para ${record.contact_name || record.contact_number} (do_not_pitch). Reply original: "${betaReply.slice(0, 200)}"`,
-          targetContact: record.contact_number,
-          ownerBudget: true,
-        }).catch(e => console.error('[ia360-agent] pitch-block alert error:', e.message));
-        betaReply = 'Tomo nota de esto y lo dejo registrado para Alek. Si te sirve, en el siguiente paso te confirmo cómo queda y seguimos por aquí.';
-      }
-      if (betaReply) {
-        const sentBeta = await enqueueIa360AgentReply({ record, label: 'ia360_cliente_activo_beta_agent_reply', body: betaReply });
-        if (sentBeta === 'superseded') {
-          // Otra ruta (botón/secuencia) ya contestó este intercambio: no alertar.
-          responded = true;
-          return;
-        }
-        if (sentBeta) {
-          updateIa360ConvState({ record, contact: contactContext, agent: agentBeta, replyBody: betaReply, convState: betaConvState })
-            .catch(e => console.error('[ia360-conv-state] beta update error:', e.message));
-          // Gestión de citas detectada por el agente: la acción de calendario del
-          // embudo no aplica al pseudo-deal beta, así que el loop lo cierra Alek.
-          const betaAction = String(agentBeta.action || agentBeta.intent || '');
-          if (['list_bookings', 'cancel', 'reschedule', 'offer_slots', 'book'].includes(betaAction)) {
-            sendIa360DirectText({
-              record,
-              toNumber: IA360_OWNER_NUMBER,
-              label: 'owner_beta_meeting_intent',
-              body: `IA360: el cliente activo/beta ${record.contact_name || record.contact_number} pidió gestión de cita (${betaAction}): "${String(record.message_body || '').slice(0, 140)}". Ya le respondí, pero la acción de calendario requiere tu confirmación.`,
-              targetContact: record.contact_number,
-              ownerBudget: true,
-            }).catch(e => console.error('[ia360-agent] beta meeting alert error:', e.message));
-          }
-          responded = true;
-          return;
-        }
-      }
-
-      // 4) Holding SOLO si el agente falló o no devolvió respuesta utilizable:
-      //    holding al contacto + alerta al owner + failure registrado.
-      await handleIa360BotFailure({
-        record,
-        reason: 'cliente activo/beta: agente IA sin respuesta utilizable (caído, timeout o reply vacío)',
-        alreadyResponded: false,
-      }).catch(e => console.error('[ia360-failure] cliente-activo fallback error:', e.message));
-      responded = true;
+      const handled = await handleIa360ClienteActivoBetaLearning({ record, deal, contact: contactContext });
+      if (handled) responded = true;
       return;
     }
-    // G-BRAIN: la conversación del embudo también lleva estado (presupuesto de
-    // preguntas, no-repetir, cierre con opciones, modo por etapa) + memoria del
-    // contacto inyectada vía roleHint — el caso José Ramón: 8 preguntas seguidas
-    // sin propuesta con el deal YA en "Dolor calificado".
-    const convContact = await loadIa360ContactContext(record).catch(() => null);
-    const convState = loadIa360ConvState(convContact);
-    let convMemory = null;
-    try {
-      convMemory = await lookupIa360MemoryContext({ record, contact: convContact, limit: 8 });
-    } catch (e) {
-      console.error('[ia360-agent] conv memory lookup failed:', e.message);
-    }
-    const agent = await callIa360Agent({
-      record,
-      stageName: deal.stage_name,
-      roleHint: buildIa360ConversationRoleHint({ contact: convContact, stageName: deal.stage_name, convState, memory: convMemory, messageBody: record.message_body }),
-      memory: convMemory,
-    });
+    const agent = await callIa360Agent({ record, stageName: deal.stage_name });
     if (!agent || !agent.reply) {
       // Agent unavailable (n8n down / webhook unregistered) → holding reply, never silence.
-      // G-BRAIN: vía enqueueIa360AgentReply — si otra ruta ya contestó, ni holding.
-      await enqueueIa360AgentReply({ record, label: 'ia360_ai_holding', body: 'Déjame revisar esto y te confirmo en un momento.' }).catch(() => {});
+      await enqueueIa360Text({ record, label: 'ia360_ai_holding', body: 'Déjame revisar esto y te confirmo en un momento.' }).catch(() => {});
       responded = true;
       // D) ALERTA AL OWNER si el cerebro del bot (n8n) está caído/timeout. Además del
       //    holding-reply de arriba (el contacto ya quedó atendido → alreadyResponded:true),
@@ -7241,17 +5067,8 @@ async function handleIa360FreeText(record) {
     if (agent.action === 'advance_pain' || agent.intent === 'ask_pain') {
       await syncIa360Deal({ record, targetStageName: 'Dolor calificado', titleSuffix: 'Dolor (texto libre)', notes: `Dolor por texto libre: ${record.message_body}${agent.extracted && agent.extracted.area_operacion ? ' (área: ' + agent.extracted.area_operacion + ')' : ''}` });
     }
-    // G-BRAIN: candado anti-doble-ruta (incidente 1651/1653) + estado conversacional.
-    const sentReply = await enqueueIa360AgentReply({ record, label: 'ia360_ai_reply', body: agent.reply });
-    if (sentReply === 'superseded') {
-      responded = true; // otra ruta (botón seq_*) ya contestó este intercambio
-      return;
-    }
-    if (sentReply) {
-      responded = true;
-      updateIa360ConvState({ record, contact: convContact, agent, replyBody: agent.reply, convState })
-        .catch(e => console.error('[ia360-conv-state] update error:', e.message));
-    }
+    const sentReply = await enqueueIa360Text({ record, label: 'ia360_ai_reply', body: agent.reply });
+    if (sentReply) responded = true;
   } catch (err) {
     console.error('[ia360-agent] handleIa360FreeText error:', err.message);
     // FALLBACK UNIVERSAL (catch): un error NUNCA debe dejar al contacto en silencio.
@@ -7586,15 +5403,6 @@ async function handleIa360LiteInteractive(record) {
       // BANDEJA DE IDEAS: ruteo de la tarjeta (Producción/Documentar/CRM/Rechazar).
       if (ownerAction && ownerAction.startsWith('owner_idea_')) {
         await handleIa360OwnerIdeaRoute({ record, ownerAction, ideaId: ownerArg });
-        return;
-      }
-      // G-RAG: tarjeta de candidatos del vault — vincular nota o sellar rechazo.
-      if (ownerAction === 'owner_vlink') {
-        await handleIa360OwnerVaultLink({ record, targetContact, noteId: String(ownerPipe || '').replace(/\D/g, '') });
-        return;
-      }
-      if (ownerAction === 'owner_vnone') {
-        await handleIa360OwnerVaultNone({ record, targetContact });
         return;
       }
       if (ownerAction === 'owner_pipe') {
@@ -8511,19 +6319,6 @@ async function handleIa360LiteInteractive(record) {
       });
     } catch (e) {
       console.error('[ia360-calendar] slot confirm prompt error:', e.message);
-      // G-LIVE (auditoría 06-11): el prospecto ELIGIÓ hora; si el prompt de
-      // confirmación falla, no puede quedar mudo en el paso más caliente del
-      // booking — y Alek debe enterarse para cerrar la cita manualmente.
-      await enqueueIa360Text({
-        record,
-        label: 'ia360_lite_slot_confirm_fallback',
-        body: 'Vi que elegiste un horario. Déjame confirmarlo con Calendar y te escribo en un momento para cerrarlo.',
-      }).catch(() => {});
-      await handleIa360BotFailure({
-        record,
-        reason: 'booking: falló el prompt de confirmación de horario (' + String(e.message || '').slice(0, 80) + ')',
-        alreadyResponded: true,
-      }).catch(err2 => console.error('[ia360-failure] slot confirm alert error:', err2.message));
     }
     return;
   }
@@ -8909,67 +6704,6 @@ async function handleIa360LiteInteractive(record) {
     return;
   }
 
-  // ── G6: ÚLTIMO RECURSO PARA BOTONES DE OPENER (quick-reply sin payload) ─────
-  // Los quick-reply de los templates fríos del opener llegan con id = el TÍTULO
-  // visible ("Sí, cuéntame" / "Ahora no") y SIN payload estable. handleRevenueOsButton
-  // y el resolver de alias seq_* los rutean SOLO cuando el contacto está en el
-  // estado correcto (apertura_sent / persona-first enviado). Si su proceso no
-  // calza ese estado, declinaban y el botón moría en [ia360-fallback]
-  // (log: "unhandled interactive reply id=si, cuentame"). Aquí, ya que todos los
-  // handlers gateados declinaron, clasificamos el id normalizado (minúsculas, sin
-  // acentos, sin puntuación, trim) y damos un siguiente paso COHERENTE en vez del
-  // fallback genérico. Reusamos el copy de Revenue OS (demo/onboarding).
-  // TODO(G6+): buildIa360OpenerInteractive (~L3474) debe emitir payload ESTABLE
-  // (p.ej. `opener:<seq>:si` / `opener:<seq>:no`) en vez de depender del título;
-  // cuando lo haga, este clasificador por texto queda solo como red de seguridad
-  // para los templates fríos viejos ya enviados.
-  const openerKind = classifyOpenerReply(replyId || answer);
-  if (openerKind) {
-    try {
-      const safeName = record.contact_name || record.contact_number;
-      if (openerKind === 'affirmative') {
-        // "Sí, cuéntame" → abre la conversación de demo/onboarding con la pregunta
-        // de calificación (PASO 2 de Revenue OS) y deja estado para que su texto
-        // libre siguiente llegue al agente. NO es el fallback genérico.
-        await mergeContactIa360State({
-          waNumber: record.wa_number,
-          contactNumber: record.contact_number,
-          tags: ['revenue-os-interesado'],
-          customFields: { ia360_revenue_state: 'calificacion', ultimo_cta_enviado: 'ia360_opener_si_recovery' },
-        }).catch(e => console.error('[ia360-opener] state affirmative:', e.message));
-        await enqueueIa360Text({ record, label: 'ia360_opener_si_recovery', body: REVENUE_OS_COPY.paso2 });
-        await sendIa360DirectText({
-          record,
-          toNumber: IA360_OWNER_NUMBER,
-          label: 'owner_opener_si_recovery',
-          body: `Alek, ${safeName} (${record.contact_number}) tocó "Sí, cuéntame" de un opener (id: ${replyId || answer || '-'}) sin estado activo. Le respondí con la pregunta de calificación para abrir la demo; quedó en "calificación".`,
-          targetContact: record.contact_number,
-          ownerBudget: true,
-        }).catch(e => console.error('[ia360-opener] owner notice si:', e.message));
-      } else {
-        // "Ahora no" → cierre cortés (mismo copy que Revenue OS) + nutrición suave.
-        await mergeContactIa360State({
-          waNumber: record.wa_number,
-          contactNumber: record.contact_number,
-          tags: ['nutricion-suave'],
-          customFields: { ia360_revenue_state: 'nutricion', ultimo_cta_enviado: 'ia360_opener_ahora_no_recovery' },
-        }).catch(e => console.error('[ia360-opener] state negative:', e.message));
-        await enqueueIa360Text({ record, label: 'ia360_opener_ahora_no_recovery', body: REVENUE_OS_COPY.ahoraNo });
-        await sendIa360DirectText({
-          record,
-          toNumber: IA360_OWNER_NUMBER,
-          label: 'owner_opener_ahora_no_recovery',
-          body: `Alek, ${safeName} (${record.contact_number}) tocó "Ahora no" de un opener (id: ${replyId || answer || '-'}). Cerré cortés y lo dejé en nutrición suave.`,
-          targetContact: record.contact_number,
-          ownerBudget: true,
-        }).catch(e => console.error('[ia360-opener] owner notice no:', e.message));
-      }
-    } catch (openerErr) {
-      console.error('[ia360-opener] recovery handler error:', openerErr.message);
-    }
-    return;
-  }
-
   // ── FALLBACK GLOBAL DE INTERACTIVE (openers v2) ────────────────────────────
   // Si llegamos aquí, NINGÚN handler reconoció el button/list reply (id viejo o
   // malformado). Los ids seq_* del catálogo y los quick replies de template con
@@ -9041,17 +6775,7 @@ function ia360BrainV2CanaryEligible(record) {
   if (!IA360_BRAIN_V2_CANARY_ON) return false;
   if (!record || record.direction !== 'incoming' || record.message_type !== 'text') return false;
   if (!String(record.message_body || '').trim()) return false;
-  if (!IA360_BRAIN_V2_ALLOWLIST.has(normalizePhone(record.contact_number))) return false;
-  // G-LIVE (auditoría 06-11): el canary es un arnés del OWNER — todo su egress va
-  // hard-coded al owner. Un contacto real allowlisted por error quedaría 100% mudo
-  // (el route hace continue y el monolito nunca ve el mensaje). El invariante
-  // owner-only vive en código, no solo en el .env: un no-owner cae al monolito.
-  if (normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER) {
-    console.error('[brain-v2-canary] allowlist contiene un no-owner %s — cayendo al monolito',
-      maskIa360Number(record.contact_number));
-    return false;
-  }
-  return true;
+  return IA360_BRAIN_V2_ALLOWLIST.has(normalizePhone(record.contact_number));
 }
 
 async function callBrainV2({ contactWaNumber, message, forceActor }) {
@@ -9091,29 +6815,10 @@ async function handleBrainV2Canary(record) {
       return;
     }
   }
-  const isOwnerDirect = normalizePhone(record.contact_number) === IA360_OWNER_NUMBER && !forceActor;
-  if (isOwnerDirect) {
-    await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'brainv2_owner_operator_local',
-      body: [
-        'Te leo como owner. Brain v2 sigue en canary, pero ya no te voy a mandar el error genérico.',
-        '',
-        'Comandos útiles:',
-        '- `/sim <mensaje>` para probar cómo respondería a un contacto.',
-        '- `idea: <texto>` para mandar algo a la bandeja de ideas.',
-        '- `qué sabes de <nombre|número>` para consultar memoria.',
-        '- `sincroniza a <nombre|número>` para vincular notas del vault.',
-        '- `intro <contacto>: <quién presenta>` para teclear la intro de un referido.'
-      ].join('\n')
-    });
-    return;
-  }
   console.log('[brain-v2-canary] routing contact=%s force_actor=%s msg=%j', record.contact_number, forceActor || '-', message.slice(0, 80));
   const out = await callBrainV2({ contactWaNumber: record.contact_number, message, forceActor });
   if (!out) {
-    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'brainv2_holding', body: 'Brain v2 no devolvió respuesta para la simulación. La ruta owner directa sigue disponible; reviso el workflow antes de otro intento.' });
+    await sendIa360DirectText({ record, toNumber: IA360_OWNER_NUMBER, label: 'brainv2_holding', body: 'Brain v2: no pude generar respuesta en este momento. Reintenta en un momento.' });
     return;
   }
   const branch = out.branch || out.route || 'fallback';
@@ -9132,30 +6837,8 @@ async function handleBrainV2Canary(record) {
     await handleIa360FreeText(handbackRecord).catch(e => console.error('[brain-v2-canary] handback error:', e.message));
     return;
   }
-  await sendIa360DirectText({
-    record,
-    toNumber: IA360_OWNER_NUMBER,
-    label: 'brainv2_no_route',
-    body: `Brain v2 devolvió la rama "${branch}" sin respuesta final. No te dejo mudo; usa /sim <mensaje> para probar como contacto o dime qué flujo quieres revisar.`
-  });
-}
-
-// G-LIVE QA-GUARD (incidente José Ramón): detecta payloads SINTÉTICOS del harness
-// QA/E2E por su wamid (wamid.e2e.*, wamid.qa-harness.*, e2e.*, *harness*). Los wamid
-// reales de Meta son 'wamid.' + base64 (sin más puntos), así que nunca matchean.
-function isIa360SyntheticWamid(messageId) {
-  // Solo el patrón con puntos: el cuerpo base64 de un wamid real no contiene puntos,
-  // así que el falso positivo (descartar un mensaje real) es estructuralmente imposible.
-  return /(^|\.)(e2e|qa[-_a-z0-9]*|harness)\./i.test(String(messageId || ''));
-}
-
-// Un payload sintético SOLO puede procesarse para números QA (52199900*) o el owner.
-// Cualquier otro destino (contactos reales) se descarta completo: sin insert en
-// chat_history, sin handlers, sin egress derivado.
-function isIa360BlockedSyntheticInbound(record) {
-  if (!record || !isIa360SyntheticWamid(record.message_id)) return false;
-  const n = String(record.contact_number || '');
-  return !(IA360_QA_NUMBER_RE.test(n) || n === IA360_OWNER_NUMBER);
+  // owner_operator / system_excluded / fallback => SIN reply (por diseno).
+  console.log('[brain-v2-canary] sin reply (branch=%s)', branch);
 }
 
 router.post('/webhook/whatsapp', async (req, res) => {
@@ -9185,22 +6868,6 @@ router.post('/webhook/whatsapp', async (req, res) => {
       allRecords.push(...records);
     }
 
-    // G-LIVE QA-GUARD: descartar payloads sintéticos dirigidos a números reales
-    // ANTES de insertar o despachar nada (cierra el incidente José Ramón).
-    let blockedSynthetic = 0;
-    for (let i = allRecords.length - 1; i >= 0; i--) {
-      if (isIa360BlockedSyntheticInbound(allRecords[i])) {
-        const r = allRecords[i];
-        console.warn('[qa-guard] payload sintético bloqueado: wamid=%s contact=%s type=%s',
-          r.message_id, maskIa360Number(r.contact_number), r.message_type);
-        allRecords.splice(i, 1);
-        blockedSynthetic += 1;
-      }
-    }
-    if (blockedSynthetic > 0 && allRecords.length === 0) {
-      return res.status(200).json({ ok: true, stored: 0, blocked_synthetic: blockedSynthetic });
-    }
-
     if (allRecords.length === 0) {
       // Acknowledge non-message webhooks (e.g. verification, errors)
       return res.status(200).json({ ok: true, stored: 0 });
@@ -9216,20 +6883,9 @@ router.post('/webhook/whatsapp', async (req, res) => {
         // produced phantom "Status: delivered" bubbles. If no matching message
         // exists (e.g. an app-sent message we don't track), this is a no-op.
         if (r.message_type === 'status') {
-          const statusErrors = Array.isArray(r.errors) && r.errors.length > 0
-            ? r.errors.map((e) => e?.message || e?.title || e?.code || JSON.stringify(e)).filter(Boolean).join('; ')
-            : null;
           await client.query(
-            `UPDATE coexistence.chat_history
-                SET status = $1,
-                    raw_payload = COALESCE($3::jsonb, raw_payload),
-                    error_message = CASE
-                      WHEN $1 IN ('failed', 'error') THEN COALESCE($4, error_message)
-                      WHEN $1 IN ('sent', 'delivered', 'read') THEN NULL
-                      ELSE error_message
-                    END
-              WHERE message_id = $2`,
-            [r.status, r.message_id, r.raw_payload || null, statusErrors]
+            `UPDATE coexistence.chat_history SET status = $1 WHERE message_id = $2`,
+            [r.status, r.message_id]
           );
           continue;
         }
@@ -9311,9 +6967,6 @@ router.post('/webhook/whatsapp', async (req, res) => {
     if (incomingRecords.length > 0) {
       for (const record of incomingRecords) {
         try {
-          // G-LIVE: invariante no-silencio. Se programa ANTES de cualquier handler
-          // para que cubra continues, throws y ramas fire-and-forget por igual.
-          scheduleIa360NoSilenceWatchdog(record);
           // ── BANDEJA DE IDEAS: comando del owner "idea: <texto>" ─────
           // Va ANTES del canary Brain v2 (el owner está en la allowlist y el
           // canary haría continue). Captura, persiste y manda tarjeta de ruteo.
@@ -9336,32 +6989,6 @@ router.post('/webhook/whatsapp', async (req, res) => {
             if (memQuery) {
               await handleIa360OwnerMemoryQuery({ record, query: memQuery })
                 .catch(e => console.error('[ia360-expediente] owner command error:', e.message));
-              continue; // no procesar como mensaje normal
-            }
-          }
-          // ── G-RAG: comando del owner "sincroniza a <nombre|número>" ──
-          // Mismo patrón que el expediente: va ANTES del canary Brain v2 (el
-          // owner está en la allowlist y el canary haría continue). Vincula
-          // notas del vault al contacto y vuelca facts; nunca queda mudo.
-          if (record.message_type === 'text'
-              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
-            const syncMatch = String(record.message_body || '').trim().match(/^sincroniza(?:me)?\s+(?:a|al|con)\s+(.+)$/i);
-            if (syncMatch && syncMatch[1].trim()) {
-              await handleIa360OwnerVaultSync({ record, query: syncMatch[1].trim() })
-                .catch(e => console.error('[ia360-vault] owner command error:', e.message));
-              continue; // no procesar como mensaje normal
-            }
-          }
-          // ── G9: comando del owner "intro <contacto>: <quien presenta>" ──
-          // Reanima la intro del referido BNI: persiste quien_intro para que la
-          // secuencia referido_contexto deje de bloquearse. Mismo patrón que los
-          // demás comandos del owner: va ANTES del canary Brain v2 y corta el flujo.
-          if (record.message_type === 'text'
-              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
-            const introCmd = parseIa360OwnerIntroCommand(record.message_body);
-            if (introCmd) {
-              await handleIa360OwnerIntroCommand({ record, target: introCmd.target, introducer: introCmd.introducer })
-                .catch(e => console.error('[ia360-intro] owner command error:', e.message));
               continue; // no procesar como mensaje normal
             }
           }
@@ -9416,24 +7043,8 @@ router.post('/webhook/whatsapp', async (req, res) => {
             }
           }
 
-          // ── G-RAG: intake del vault al alta del contacto ─────────────────
-          // Fire-and-forget (sin continue): el auto-match con el vault corre
-          // UNA vez por contacto y no bloquea el flujo normal del mensaje.
-          if (record.direction === 'incoming'
-              && ['text', 'interactive', 'button'].includes(record.message_type)
-              && !ia360VaultBlocklisted(normalizePhone(record.contact_number))) {
-            maybeIa360VaultIntake(record).catch(e => console.error('[ia360-vault] intake error:', e.message));
-          }
-
           if (await handleIa360SharedContacts(record)) {
             continue; // B-29: vCard capturada y owner-gated; no cae al embudo normal
-          }
-
-          // G-WIN cartera: el bot no lee imágenes. Si el contacto está a media
-          // captura de tabla (esperando_tabla) y manda foto/archivo, pedimos la
-          // versión en texto y no seguimos el embudo para este record.
-          if (await handleCarteraMediaInbound(record)) {
-            continue;
           }
 
           const { rows: pausedRows } = await pool.query(
@@ -9460,33 +7071,11 @@ router.post('/webhook/whatsapp', async (req, res) => {
           // el agente no responda el mismo texto ni empuje agenda (guardrail). El owner
           // tiene deal vivo en P2, así que sin este gate el agente respondería en paralelo.
           const revHandled = await handleRevenueOsFreeText(record).catch(e => { console.error('[revenue-os] dispatch:', e.message); return false; });
-          // G-WIN "Mapa de cartera" (P7 Champions) — mismo contrato que Revenue OS:
-          // gateado por persona+tema+estado; si actúa, CORTA el embudo para que el
-          // agente genérico no responda encima (guardrail: sin pitch, sin agenda).
-          const carteraHandled = revHandled
-            ? false
-            : await handleCarteraFreeText(record).catch(e => { console.error('[cartera] dispatch:', e.message); return false; });
           // Free text (no button) inside an active funnel → AI agent (fire-and-forget; never blocks the Meta ack).
-          if (!revHandled && !carteraHandled) handleIa360FreeText(record).catch(e => console.error('[ia360-agent] fire-and-forget:', e.message));
+          if (!revHandled) handleIa360FreeText(record).catch(e => console.error('[ia360-agent] fire-and-forget:', e.message));
           await evaluateTriggers(record);
         } catch (triggerErr) {
           console.error('[webhook] Trigger evaluation error:', triggerErr.message);
-          // G-LIVE (auditoría 06-11): un throw en el dispatch no debe dejar mudo al
-          // contacto. Verificamos la VERDAD en chat_history (no flags) antes del
-          // fallback; ante error del check, no doble-texteamos.
-          if (record.direction === 'incoming'
-              && ['text', 'interactive', 'button'].includes(record.message_type)
-              && normalizePhone(record.contact_number) !== IA360_OWNER_NUMBER
-              && !(record.message_type === 'text' && isIa360PassiveMessage(record.message_body))) {
-            const hasOut = await ia360HasOutgoingForInbound(record).catch(() => true);
-            if (!hasOut) {
-              await handleIa360BotFailure({
-                record,
-                reason: 'error en dispatch: ' + String(triggerErr.message || 'desconocido').slice(0, 120),
-                alreadyResponded: false,
-              }).catch(e => console.error('[ia360-failure] dispatch fallback error:', e.message));
-            }
-          }
         }
       }
     }
@@ -9500,13 +7089,6 @@ router.post('/webhook/whatsapp', async (req, res) => {
         } catch (triggerErr) {
           console.error('[webhook] Status trigger evaluation error:', triggerErr.message);
         }
-        // G5: circuit breaker de pago/elegibilidad (131042 y familia). Va fuera
-        // de la transacción de inserción para no enviar dentro del BEGIN/COMMIT.
-        try {
-          await handleIa360PaymentCircuitBreaker(record);
-        } catch (cbErr) {
-          console.error('[ia360-payment-cb] error:', cbErr.message);
-        }
       }
     }
 
@@ -9519,11 +7101,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
     }
 
     console.log(`[webhook] Stored ${allRecords.length} record(s)`);
-    res.status(200).json({
-      ok: true,
-      stored: allRecords.length,
-      ...(blockedSynthetic > 0 ? { blocked_synthetic: blockedSynthetic } : {}),
-    });
+    res.status(200).json({ ok: true, stored: allRecords.length });
   } catch (err) {
     console.error('[webhook] Error:', err.message);
     // Always return 200 to n8n so it doesn't retry infinitely. Use a static
@@ -9651,65 +7229,6 @@ router.post('/internal/ia360-revenue/opener', async (req, res) => {
   } catch (err) {
     console.error('[revenue-os] opener endpoint error:', err.message);
     return res.status(500).json({ ok: false, error: 'opener_failed' });
-  }
-});
-
-// G-WIN cartera — vista previa del flujo completo al WhatsApp del OWNER (nunca
-// a un contacto): los mensajes de los 3 pasos con datos de ejemplo, en UN solo
-// texto, para aprobación de copy. Egress único: sendIa360DirectText →
-// messageSender. Auth = X-IA360-Directive-Secret (patrón de los endpoints
-// internos). Idempotencia: el caller decide cuándo (una sola vez por sesión).
-router.post('/internal/ia360-cartera/preview', async (req, res) => {
-  if (!isIa360InternalAuthorized(req)) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
-  try {
-    const ejemploRows = [
-      { cuenta: 'Transportes del Bajío', saldo_portal: '$1,250,000.00', saldo_correcto: '$980,000.00', fecha_corte: '31/05/2026', responsable: 'Laura' },
-      { cuenta: 'Logística Occidente', saldo_portal: '$430,500.00', saldo_correcto: '$512,300.00', fecha_corte: '31/05/2026', responsable: 'Marco' },
-    ];
-    const mapaEjemplo = buildCarteraMapa(ejemploRows);
-    const preview = [
-      'IA360 · PREVIEW flujo "Mapa de cartera" (P7 Champions) — para tu aprobación. Nada de esto se envió a Andrés.',
-      '',
-      '── PASO 1 · El contacto reporta saldos que no cuadran. El bot responde: ──',
-      '',
-      IA360_CARTERA_COPY.paso1,
-      '',
-      '── Si manda foto o archivo en lugar de texto: ──',
-      '',
-      IA360_CARTERA_COPY.pideTexto,
-      '',
-      '── PASO 2 · El contacto pega la tabla. El bot responde (datos de ejemplo): ──',
-      '',
-      mapaEjemplo.texto,
-      '',
-      '── PASO 3 · Tú recibes este readout y el deal avanza a "Quick win entregado": ──',
-      '',
-      'IA360 · Quick win cartera — (contacto) (521***XX)',
-      '',
-      'El contacto entregó su tabla de cartera (2 cuentas) y le devolví el mapa estructurado.',
-      `- Cuentas con descuadre: ${mapaEjemplo.cuentasConDescuadre} · Diferencia acumulada: ${carteraFormatoMonto(mapaEjemplo.diferenciaTotal)}`,
-      '- Deal: «IA360 · (contacto) · Quick win cartera» → Quick win entregado (P7 Champions).',
-      '- Mapa encolado a ia360_docs_sync (destino AlekContenido).',
-    ].join('\n');
-    const record = {
-      wa_number: normalizePhone(req.body?.wa_number || process.env.IA360_WA_NUMBER || '5213321594582'),
-      contact_number: IA360_OWNER_NUMBER,
-      message_id: `cartera_preview:${Date.now()}`,
-      message_type: 'cartera_preview',
-      message_body: '',
-    };
-    const sent = await sendIa360DirectText({
-      record,
-      toNumber: IA360_OWNER_NUMBER,
-      label: 'ia360_cartera_preview_owner',
-      body: preview,
-    });
-    return res.status(sent ? 200 : 502).json({ ok: !!sent, schema: 'ia360_cartera_preview.v1', chars: preview.length });
-  } catch (err) {
-    console.error('[cartera] preview endpoint error:', err.message);
-    return res.status(500).json({ ok: false, error: 'preview_failed' });
   }
 });
 

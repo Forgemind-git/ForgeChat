@@ -1,0 +1,58 @@
+id,pipeline_id,stage_id,title,value,currency,status,assigned_user_id,contact_wa_number,contact_number,contact_name,expected_close_date,notes,position,won_at,lost_at,created_by,created_at,updated_at
+2,2,18,IA360 · Soy Alek AI · Reunión confirmada,0.00,MXN,open,1,5213321594582,5213322638033,Soy Alek AI,,"[2026-06-01T20:53:16.617Z] Input: Diagnóstico; intención inicial detectada
+[2026-06-01T20:53:17.423Z] Área de dolor seleccionada: ERP / CRM
+[2026-06-01T20:53:17.974Z] Solicitó diagnóstico ligero de 5 preguntas
+[2026-06-01T20:53:18.554Z] Solicitó agendar: requiere intervención de Alek
+[2026-06-01T20:53:19.192Z] Solicitó ejemplo IA360
+[2026-06-01T20:53:19.823Z] Pregunta 1/5: trabajo manual o doble captura en WhatsApp
+[2026-06-01T20:53:20.306Z] Preferencia de agenda seleccionada: Hoy; falta crear evento real
+[2026-06-01T20:53:20.834Z] Solicitó ejemplo ERP → BI
+[2026-06-01T20:53:21.535Z] Solicitó Ver flujo del ejemplo WhatsApp → CRM
+[2026-06-01T20:54:48.133Z] Área de dolor seleccionada: Ventas
+[2026-06-01T20:55:01.474Z] Solicitó ejemplo IA360
+[2026-06-01T20:55:10.702Z] Solicitó ejemplo WhatsApp → CRM; listo para propuesta/siguiente paso
+[2026-06-01T20:55:15.782Z] Solicitó Ver flujo del ejemplo WhatsApp → CRM
+[2026-06-01T20:58:09.366Z] Solicitó Ver flujo del ejemplo WhatsApp → CRM
+[2026-06-01T20:58:15.912Z] Solicitó detalle: Arquitectura
+[2026-06-01T20:58:17.249Z] Solicitó Aplicarlo del ejemplo WhatsApp → CRM
+[2026-06-01T20:58:26.065Z] Solicitó agendar: requiere intervención de Alek
+[2026-06-01T20:58:30.901Z] Preferencia de agenda seleccionada: Hoy; falta crear evento real
+[2026-06-01T20:58:35.928Z] Solicitó detalle: Costo
+[2026-06-01T20:58:40.620Z] Solicitó Aplicarlo del ejemplo WhatsApp → CRM
+[2026-06-01T20:58:49.287Z] Solicitó detalle: Costo
+[2026-06-01T20:58:59.188Z] Solicitó detalle: Alcance
+[2026-06-01T21:00:29.112Z] Preferencia de agenda seleccionada: Hoy; falta crear evento real
+[2026-06-01T21:01:20.546Z] Solicitó Aplicarlo del ejemplo WhatsApp → CRM
+[2026-06-01T21:01:21.867Z] Solicitó detalle: Alcance
+[2026-06-01T21:01:26.869Z] Solicitó agendar: requiere intervención de Alek
+[2026-06-01T21:01:28.292Z] Solicitó detalle: Alcance
+[2026-06-01T21:03:25.516Z] Solicitó detalle: Alcance
+[2026-06-01T21:03:35.058Z] Solicitó agendar: requiere intervención de Alek
+[2026-06-01T21:05:16.506Z] Preferencia de agenda seleccionada: Hoy; falta crear evento real
+[2026-06-01T21:27:10.193Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-01T21:30:18.486Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-01T21:30:24.771Z] 100M flow: Captura manual → Dolor calificado
+[2026-06-01T21:30:28.660Z] 100M flow: WhatsApp → CRM → Propuesta / siguiente paso
+[2026-06-01T21:30:34.232Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-01T21:30:39.816Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-01T21:30:44.294Z] Preferencia de agenda seleccionada: Hoy; falta crear evento real
+[2026-06-01T21:30:48.626Z] Solicitó detalle: Alcance
+[2026-06-01T21:30:52.503Z] Solicitó Aplicarlo del ejemplo WhatsApp → CRM
+[2026-06-01T21:30:59.702Z] Solicitó detalle: Costo
+[2026-06-01T21:31:04.317Z] Solicitó Aplicarlo del ejemplo WhatsApp → CRM
+[2026-06-01T21:31:09.407Z] Solicitó detalle: Alcance
+[2026-06-01T21:33:33.368Z] Solicitó detalle: Alcance
+[2026-06-01T21:34:18.962Z] Solicitó detalle: Alcance
+[2026-06-01T21:34:40.556Z] Solicitó agendar: requiere intervención de Alek
+[2026-06-01T21:34:46.485Z] Preferencia de agenda seleccionada: Mañana; falta crear evento real
+[2026-06-01T21:42:04.310Z] Solicitó detalle: Alcance
+[2026-06-01T22:23:07.937Z] Preferencia de agenda seleccionada: Mañana; falta crear evento real
+[2026-06-01T22:24:38.188Z] Solicitó detalle: Alcance
+[2026-06-01T22:24:43.996Z] Solicitó agendar: requiere intervención de Alek
+[2026-06-01T22:24:48.366Z] Preferencia de agenda seleccionada: Hoy; falta crear evento real
+[2026-06-02T00:18:19.045Z] Preferencia de agenda seleccionada: Mañana; falta crear evento real
+[2026-06-02T02:00:57.325Z] Reunión confirmada. Calendar event: duk3hiv3tecn3vkco5bb9v5ae0; Zoom meeting: 83902405403; inicio: 2026-06-02T21:00:00.000Z",0,,,1,2026-06-01 20:53:16.663193+00,2026-06-02 02:00:57.345113+00
+3,2,18,IA360 · Soy Alek AI · Agenda Mañana,0.00,MXN,open,1,5210000000000,5213322638033,Soy Alek AI,,"[2026-06-02T01:58:19.620Z] Preferencia de agenda seleccionada: Mañana; falta crear evento real
+[2026-06-02T01:59:08.404Z] Preferencia de día seleccionada: Mañana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-02T02:00:40.472Z] Preferencia de día seleccionada: Mañana; se consultó disponibilidad real de Calendar para ofrecer horas libres",1,,,1,2026-06-02 01:58:19.633703+00,2026-06-02 02:00:40.489624+00
+4,2,18,IA360 · IA360 TEST SLOT CLEANUP · Reunión confirmada,0.00,MXN,open,1,5210000000000,521000000001,IA360 TEST SLOT CLEANUP,,[2026-06-02T02:01:36.533Z] Reunión confirmada. Calendar event: cp2ml66l8712mknh8sb22nvhgo; Zoom meeting: 86913742590; inicio: 2026-06-02T16:00:00.000Z,2,,,1,2026-06-02 02:01:36.544226+00,2026-06-02 02:01:36.544226+00

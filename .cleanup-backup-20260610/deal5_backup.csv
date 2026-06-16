@@ -1,0 +1,178 @@
+id,pipeline_id,stage_id,title,value,currency,status,assigned_user_id,contact_wa_number,contact_number,contact_name,expected_close_date,notes,position,won_at,lost_at,created_by,created_at,updated_at
+5,2,13,IA360 · Alejandro Orozco Flores · Pre-call (Flow),0.00,MXN,open,1,5213321594582,5213322638033,Alejandro Orozco Flores,,"[2026-06-02T22:24:21.925Z] 100M flow: Quiero el mapa → Diagnóstico enviado
+[2026-06-02T22:24:30.398Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-02T22:24:38.902Z] Preferencia de día seleccionada: Hoy; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-02T22:37:55.406Z] Reunión confirmada (recovery). Calendar event b39f2mth7ma0ea2m0e1f4rk6fc; Zoom 86573547533; inicio 2026-06-03T16:00:00.000Z.
+[2026-06-03T01:21:16.147Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-03T01:21:22.641Z] 100M flow: Seguimiento ventas → Dolor calificado
+[2026-06-03T01:21:27.974Z] 100M flow: WhatsApp → CRM → Propuesta / siguiente paso
+[2026-06-03T01:21:32.687Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-03T01:21:36.807Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-03T01:21:43.605Z] Preferencia de día seleccionada: Esta semana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-03T01:21:58.334Z] Reunión confirmada. Calendar event: rnuib89hgvn6lvtnpagrc0517k; Zoom meeting: 89753098594; inicio: 2026-06-04T20:00:00.000Z
+[2026-06-03T01:47:11.255Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-03T01:47:17.955Z] 100M flow: Captura manual → Dolor calificado
+[2026-06-03T01:47:53.904Z] 100M flow: Agente follow-up → Propuesta / siguiente paso
+[2026-06-03T01:47:57.991Z] Solicitó agendar; se mueve a agenda en proceso hasta confirmar Calendar/Zoom
+[2026-06-03T01:48:03.094Z] Preferencia de día seleccionada: Esta semana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-03T01:48:14.239Z] Reunión confirmada. Calendar event: 7ebaqd2ndutl07shu9klrgt39s; Zoom meeting: 88524154774; inicio: 2026-06-04T23:00:00.000Z
+[2026-06-03T01:48:48.640Z] 100M flow: Seguimiento ventas → Dolor calificado
+[2026-06-03T01:48:50.071Z] 100M flow: Agente follow-up → Propuesta / siguiente paso
+[2026-06-03T01:48:54.636Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-03T01:48:59.192Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-03T01:49:47.419Z] Preferencia de día seleccionada: Hoy; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-03T01:50:11.072Z] Solicitó agenda por texto libre (¿El viernes por la mañana?); fecha interpretada 2026-06-05; se consulta Calendar real
+[2026-06-03T01:50:56.491Z] Solicitó agenda por texto libre (El próximo lunes por favor); fecha interpretada 2026-06-05; se consulta Calendar real
+[2026-06-03T18:47:37.542Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-03T18:48:21.253Z] 100M flow: Ver ejemplo → Propuesta / siguiente paso
+[2026-06-03T18:54:41.265Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-03T18:54:47.150Z] 100M flow: Seguimiento ventas → Dolor calificado
+[2026-06-03T18:54:52.930Z] 100M flow: WhatsApp → CRM → Propuesta / siguiente paso
+[2026-06-03T19:28:44.494Z] Dolor por texto libre: Por favor dime que no le dejaste fijo las palabras flow x/x (área: ventas)
+[2026-06-03T19:51:46.521Z] Dolor por texto libre: Mira, no me llegó nada
+[2026-06-03T19:53:42.599Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-03T19:54:28.408Z] diagnostic_answered: ventas / esta_semana
+[2026-06-03T19:54:39.015Z] 100M flow: Primero el mapa → Diagnóstico enviado
+[2026-06-03T19:54:46.927Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-03T19:54:57.810Z] Preferencia de día seleccionada: Mañana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-03T19:55:09.041Z] Solicitó agenda por texto libre (El lunes); fecha interpretada 2026-06-05; se consulta Calendar real
+[2026-06-03T19:55:37.532Z] Dolor por texto libre: Cuando si hay?
+[2026-06-03T20:34:01.416Z] Solicitó agenda por texto libre (Que opciones hay la siguiente semana?); fecha interpretada 2026-06-06; se consulta Calendar real
+[2026-06-03T20:39:20.451Z] Solicitó agenda por texto libre (Que días de la próxima semana?); fecha interpretada 2026-06-06; se consulta Calendar real
+[2026-06-03T20:39:37.682Z] Reunión confirmada. Calendar event: n1smr1j121bc85tcu8v1krggq4; Zoom meeting: 83689523277; inicio: 2026-06-06T18:00:00.000Z
+[2026-06-03T22:25:22.168Z] Solicitó agenda por texto libre (necesito una reunión para mañana"" — o — ""opciones la siguiente semana); fecha interpretada 2026-06-04; se consulta Calendar real
+[2026-06-03T22:26:49.457Z] Solicitó agenda por texto libre (y otra cita para el miercoles de la siguiente semana); fecha interpretada 2026-06-10; se consulta Calendar real
+[2026-06-03T22:26:52.074Z] Reunión confirmada. Calendar event: auqlqltf5cqs168fa5hd0dpq0g; Zoom meeting: 84289927932; inicio: 2026-06-04T23:00:00.000Z
+[2026-06-03T22:27:10.033Z] Reunión confirmada. Calendar event: 4sgjfe40o6tloob858dveh5vlk; Zoom meeting: 83384387213; inicio: 2026-06-10T19:00:00.000Z
+[2026-06-03T22:57:23.427Z] Solicitó agenda por texto libre (necesito una reunión para mañana); fecha interpretada <hoy+1>; se consulta Calendar real
+[2026-06-03T22:57:50.059Z] Reunión confirmada. Calendar event: dthqvi0bjf43l1d9iqmrj8set8; Zoom meeting: 86599063900; inicio: 2026-06-09T16:00:00.000Z
+[2026-06-03T23:14:13.067Z] Solicitó agenda por texto libre (y otra para el miércoles de la siguiente semana); fecha interpretada 2026-06-12; se consulta Calendar real
+[2026-06-03T23:14:47.088Z] Reunión confirmada. Calendar event: 0pnnq7ejpjnl792hrh4p6lrn14; Zoom meeting: 83972299789; inicio: 2026-06-12T20:00:00.000Z
+[2026-06-04T00:18:12.941Z] Solicitó agenda por texto libre (necesito una para mañana); fecha interpretada 2026-06-04; se consulta Calendar real
+[2026-06-04T00:19:32.101Z] Reunión confirmada. Calendar event: 67r6ifjtlri9faclgq38s3one4; Zoom meeting: 85049741697; inicio: 2026-06-09T17:00:00.000Z
+[2026-06-04T00:36:10.102Z] Reunión cancelada (aprobada por Alek). Event 67r6ifjtlri9faclgq38s3one4. Sin reuniones activas → vuelve a Requiere Alek.
+[2026-06-04T00:36:41.588Z] Solicitó agenda por texto libre (agenda una reunion para el viernes y otra para el siguiente jueves); fecha interpretada 2026-06-05; se consulta Calendar real
+[2026-06-04T00:36:53.986Z] Reunión confirmada. Calendar event: 9mke9q3sofbdcavo6bu8jjg2gk; Zoom meeting: 89391541105; inicio: 2026-06-05T17:00:00.000Z
+[2026-06-04T00:38:58.866Z] Solicitó agenda por texto libre (agenda una sesion para el proximo jueves de la proxima semana); fecha interpretada 2026-06-11; se consulta Calendar real
+[2026-06-04T00:39:14.903Z] Reunión confirmada. Calendar event: k6q54vhnqge9bbv0gjoce62ad0; Zoom meeting: 89342884641; inicio: 2026-06-11T22:00:00.000Z
+[2026-06-04T00:43:58.161Z] Reunión cancelada (aprobada por Alek). Event 9mke9q3sofbdcavo6bu8jjg2gk. Sin reuniones activas → vuelve a Requiere Alek.
+[2026-06-04T01:49:57.829Z] Dolor por texto libre: ventas y prospeccion de empresarios de alto nivel (área: ventas)
+[2026-06-04T01:50:16.098Z] Dolor por texto libre: pues la prospeccion sobre todo (área: ventas)
+[2026-06-04T01:50:44.477Z] Dolor por texto libre: ninguno (área: ventas)
+[2026-06-04T01:51:00.297Z] Dolor por texto libre: pues me caen referencias por BNI (área: ventas)
+[2026-06-04T01:51:28.943Z] Dolor por texto libre: no, mas bien como automatizar la obtencion de prospectos de alto nivel y automatizar la conversion en frio (área: prospección)
+[2026-06-04T01:51:44.179Z] Dolor por texto libre: que ninguna saaabeee (área: prospección)
+[2026-06-04T01:52:05.318Z] Dolor por texto libre: empresarios de alto nivel, y quiero saber como obtenerlos (área: prospección)
+[2026-06-04T01:52:18.503Z] Dolor por texto libre: ninguno saaabeeee (área: prospectos de alto nivel)
+[2026-06-04T01:52:33.817Z] Solicitó agenda por texto libre (si por favor); fecha interpretada sin fecha → próximos días; se consulta Calendar real
+[2026-06-04T01:52:54.523Z] Reunión confirmada. Calendar event: hgaehtv9l66urie2ff2hnbfops; Zoom meeting: 89255453923; inicio: 2026-06-09T19:00:00.000Z
+[2026-06-04T02:03:06.938Z] 100M flow: Más adelante → Nutrición
+[2026-06-04T02:03:31.760Z] nurture_selected: interes_especifico
+[2026-06-04T02:03:39.028Z] 100M flow: Ver ejemplo → Propuesta / siguiente paso
+[2026-06-04T02:03:46.340Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-04T02:03:53.239Z] Preferencia de día seleccionada: Esta semana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-04T02:04:12.421Z] Reunión confirmada. Calendar event: v2ttluo7o3b6jeh0e09uqk2ai4; Zoom meeting: 83163603280; inicio: 2026-06-05T23:00:00.000Z
+[2026-06-04T02:05:06.349Z] pre_call_intake_submitted: Geek studio Developers / CDO
+[2026-06-04T02:05:11.338Z] 100M flow: Sí, agendar → Requiere Alek
+[2026-06-04T02:05:18.091Z] Preferencia de día seleccionada: Esta semana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-04T02:05:47.796Z] Reunión confirmada. Calendar event: sr3qmh14589d7k2e7480hbgmd4; Zoom meeting: 89702175897; inicio: 2026-06-05T22:00:00.000Z
+[2026-06-04T02:08:36.069Z] Input: Diagnóstico; intención inicial detectada
+[2026-06-04T02:08:45.938Z] Área de dolor seleccionada: ERP / CRM
+[2026-06-04T02:22:49.240Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-04T02:23:25.787Z] offer_router_answered: menos_5m / mas_1m → Premium
+[2026-06-04T02:23:34.093Z] Solicitó agendar; se mueve a agenda en proceso hasta confirmar Calendar/Zoom
+[2026-06-04T02:26:45.771Z] Preferencia de día seleccionada: Mañana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-04T02:27:01.536Z] Reunión confirmada. Calendar event: coaiacflo3hift38uqgghiikv8; Zoom meeting: 85678542949; inicio: 2026-06-04T22:00:00.000Z
+[2026-06-04T02:27:38.540Z] pre_call_intake_submitted: TransformIA / CDO (con reunión ya agendada)
+[2026-06-04T02:30:15.873Z] 100M flow: Más adelante → Nutrición
+[2026-06-04T02:30:36.265Z] nurture_selected: contactar_mas_adelante
+[2026-06-05T00:46:47.610Z] Dolor por texto libre: que puedes hacer por mi?
+[2026-06-05T00:47:09.002Z] Dolor por texto libre: que tools tienes?
+[2026-06-05T02:01:02.645Z] Dolor por texto libre: Quiero automatizar la prospeccion (área: ventas y CRM por WhatsApp)
+[2026-06-05T02:01:57.474Z] Dolor por texto libre: No, hoy lo llevo por bni y manual pero quiero automatizarlo para obtener leads de alto nivel en automatico (área: ventas y seguimiento)
+[2026-06-05T02:02:11.508Z] Dolor por texto libre: 1 por mes (área: ventas y CRM por WhatsApp)
+[2026-06-05T02:02:30.573Z] Dolor por texto libre: Todo lo hago yo, soy solopreneur (área: seguimiento de prospectos)
+[2026-06-05T02:02:48.897Z] Dolor por texto libre: Obtener los de alto perfil (área: ventas y CRM)
+[2026-06-05T02:03:23.646Z] Dolor por texto libre: Empresarios de empresas exitosas y los que no pertenecen sólitos se van al ver el precio (área: ventas y seguimiento)
+[2026-06-05T02:03:41.340Z] Dolor por texto libre: Por el tamaño de la empresa (área: ventas y CRM)
+[2026-06-05T02:04:00.593Z] Dolor por texto libre: Urgencia que demuestra en la adopcion de ia (área: estrategia y gobierno de IA)
+[2026-06-05T14:15:57.686Z] Dolor por texto libre: vienen
+[2026-06-05T14:16:10.595Z] Dolor por texto libre: Conseguir clientes nuevos (área: ventas y CRM por WhatsApp)
+[2026-06-05T14:16:23.169Z] Dolor por texto libre: whatsapp (área: ventas y CRM por WhatsApp)
+[2026-06-05T14:16:35.654Z] Dolor por texto libre: solos (área: ventas y CRM por WhatsApp)
+[2026-06-05T14:16:47.592Z] Dolor por texto libre: seguimiento (área: seguimiento)
+[2026-06-05T14:17:02.670Z] Dolor por texto libre: todo yo (área: seguimiento de leads por WhatsApp)
+[2026-06-05T14:17:15.546Z] Dolor por texto libre: 1 por mes (área: seguimiento)
+[2026-06-05T14:17:36.837Z] Dolor por texto libre: ya te dije que todso yo mporque mne preguntas lo mismo (área: seguimiento)
+[2026-06-05T14:18:49.017Z] Solicitó agenda por texto libre (si); fecha interpretada sin fecha → próximos días; se consulta Calendar real
+[2026-06-05T18:27:05.763Z] Dolor por texto libre: Conseguir clientes nuevos (área: ventas y CRM por WhatsApp)
+[2026-06-05T18:27:23.785Z] Solicitó agenda por texto libre (whatsapp); fecha interpretada sin fecha → próximos días; se consulta Calendar real
+[2026-06-05T18:27:45.739Z] Solicitó agenda por texto libre (solos); fecha interpretada sin fecha → próximos días; se consulta Calendar real
+[2026-06-05T18:27:56.003Z] Dolor por texto libre: seguimiento (área: seguimiento)
+[2026-06-05T18:28:07.491Z] Dolor por texto libre: todo yo (área: seguimiento por WhatsApp)
+[2026-06-05T22:38:03.766Z] Alek eligió pipeline persona_beta, pero aún no está cableado para envío automático.
+[2026-06-06T14:54:52.802Z] Dolor por texto libre: Y que sabes de mi?
+[2026-06-08T15:08:40.168Z] Solicitó agenda por texto libre (cuándo podemos agendar?); fecha interpretada sin fecha → próximos días; se consulta Calendar real
+[2026-06-08T15:09:08.490Z] Reunión confirmada. Calendar event: pcbl5l7d9lsrcp8ougnk49s9j4; Zoom meeting: 89169226195; inicio: 2026-06-10T16:00:00.000Z
+[2026-06-08T15:09:39.230Z] pre_call_intake_submitted: Geek studio / Cdo (con reunión ya agendada)
+[2026-06-08T17:38:35.179Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-08T17:40:08.225Z] diagnostic_answered: ventas / esta_semana
+[2026-06-08T17:40:23.737Z] 100M flow: Sí, agendar → Requiere Alek
+[2026-06-08T17:40:29.532Z] Preferencia de día seleccionada: Esta semana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-08T17:40:44.573Z] Reunión confirmada. Calendar event: enjn59poo4ki7f060fq9um52n0; Zoom meeting: 89212798854; inicio: 2026-06-10T17:00:00.000Z
+[2026-06-08T21:49:37.171Z] Reunión confirmada. Calendar event: r11rv3ajrbkjt1pmei6781ep30; Zoom meeting: 87042400174; inicio: 2026-06-11T16:00:00.000Z
+[2026-06-08T21:57:03.018Z] Dolor por texto libre: whatsapp
+[2026-06-08T21:57:11.578Z] Dolor por texto libre: tengo problemas con el seguimiento de ventas (área: operacion_cliente)
+[2026-06-08T22:15:59.036Z] Reunión confirmada. Calendar event: mimu4riho282uds03adb8dp0lk; Zoom meeting: 89662379329; inicio: 2026-06-10T19:00:00.000Z
+[2026-06-08T22:16:31.391Z] pre_call_intake_submitted: Geek Studio / CDO (con reunión ya agendada)
+[2026-06-09T00:31:36.996Z] Reunión confirmada. Calendar event: q2ka0gakk9g34b8mrbt5vrgamo; Zoom meeting: 86520922242; inicio: 2026-06-12T19:00:00.000Z
+[2026-06-09T19:32:08.318Z] Reunión confirmada. Calendar event: uv950935pdc9540mm58h2t9bg4; Zoom meeting: 81685035029; inicio: 2026-06-10T22:00:00.000Z
+[2026-06-10T14:38:38.114Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-10T14:38:59.796Z] diagnostic_answered: ventas / esta_semana
+[2026-06-10T14:41:12.841Z] 100M flow: Captura manual → Dolor calificado
+[2026-06-10T14:41:23.744Z] 100M flow: Agente follow-up → Propuesta / siguiente paso
+[2026-06-10T14:41:29.570Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-10T14:41:48.193Z] offer_router_answered: menos_5m / menos_50k → Starter
+[2026-06-10T14:44:03.443Z] 100M flow: Agente follow-up → Propuesta / siguiente paso
+[2026-06-10T14:44:08.382Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-10T14:44:26.363Z] offer_router_answered: menos_5m / menos_50k → Starter
+[2026-06-10T14:46:06.183Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-10T14:48:21.927Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-10T14:48:28.451Z] Solicitó Aplicarlo del ejemplo WhatsApp → CRM
+[2026-06-10T14:48:35.504Z] Solicitó detalle: Alcance
+[2026-06-10T14:48:43.680Z] Solicitó Aplicarlo del ejemplo WhatsApp → CRM
+[2026-06-10T14:48:48.545Z] Solicitó detalle: Costo
+[2026-06-10T14:48:55.986Z] Solicitó detalle: Alcance
+[2026-06-10T15:00:09.712Z] 100M flow: Captura manual → Dolor calificado
+[2026-06-10T15:00:19.175Z] 100M flow: ERP → BI → Propuesta / siguiente paso
+[2026-06-10T15:00:23.167Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-10T15:00:27.660Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-10T15:00:41.054Z] Preferencia de día seleccionada: Hoy; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-10T15:00:48.630Z] 100M flow: Ver ejemplo → Propuesta / siguiente paso
+[2026-06-10T15:02:00.981Z] 100M flow: WhatsApp → CRM → Propuesta / siguiente paso
+[2026-06-10T15:02:06.921Z] 100M flow: Ver ejemplo → Propuesta / siguiente paso
+[2026-06-10T15:02:18.322Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-10T15:02:25.443Z] 100M flow: Estoy explorando → Nutrición
+[2026-06-10T15:02:30.688Z] 100M flow: ERP → BI → Propuesta / siguiente paso
+[2026-06-10T15:02:34.603Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-10T15:02:41.095Z] 100M flow: No prioritario → Nutrición
+[2026-06-10T15:02:49.571Z] Solicitó Aplicarlo del ejemplo WhatsApp → CRM
+[2026-06-10T15:02:54.824Z] Solicitó detalle: Costo
+[2026-06-10T15:03:03.422Z] Solicitó llamada; falta crear evento real en calendario/Zoom
+[2026-06-10T15:03:30.625Z] pre_call_intake_submitted: Geek studio / Cdo (con reunión ya agendada)
+[2026-06-10T15:09:32.132Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-10T15:09:47.711Z] 100M flow: Sí, urgente → Requiere Alek
+[2026-06-10T15:09:53.455Z] Preferencia de día seleccionada: Esta semana; se consultó disponibilidad real de Calendar para ofrecer horas libres
+[2026-06-10T15:23:41.375Z] 100M flow: Diagnóstico rápido → Intención detectada
+[2026-06-10T15:24:00.337Z] diagnostic_answered: ventas / este_mes
+[2026-06-10T15:24:20.084Z] 100M flow: Primero el mapa → Diagnóstico enviado
+[2026-06-10T15:24:25.667Z] 100M flow: Estoy explorando → Nutrición
+[2026-06-10T15:24:31.507Z] 100M flow: WhatsApp → CRM → Propuesta / siguiente paso
+[2026-06-10T15:24:37.124Z] 100M flow: Quiero mapa → Diagnóstico enviado
+[2026-06-10T15:24:45.351Z] 100M flow: Estoy explorando → Nutrición
+[2026-06-10T15:30:46.620Z] Área de dolor seleccionada: Gobierno IA
+[2026-06-10T15:30:53.021Z] Solicitó diagnóstico ligero de 5 preguntas
+[2026-06-10T15:31:00.576Z] Pregunta 1/5: trabajo manual o doble captura en ERP
+[2026-06-10T15:31:06.964Z] Solicitó detalle: Arquitectura
+[2026-06-10T15:31:11.636Z] Solicitó llamada; falta crear evento real en calendario/Zoom
+[2026-06-10T15:31:31.845Z] pre_call_intake_submitted: Geek Studio / CDO (con reunión ya agendada)",0,,,1,2026-06-02 22:24:21.938573+00,2026-06-10 15:31:31.846662+00
