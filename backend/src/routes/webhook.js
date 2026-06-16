@@ -16,6 +16,13 @@ const {
   ia360PipelineForRelationship,
   ia360ResolveStageName,
 } = require('./ia360DealRouting');
+const {
+  parseIa360OwnerIntroCommand,
+  sanitizeIntroName: sanitizeIa360IntroNamePure,
+  compactQuienIntro: compactQuienIntroPure,
+  buildIntroCustomFields: buildIa360IntroCustomFields,
+  buildReferidoContextoDraft: buildIa360ReferidoContextoDraft,
+} = require('./ia360ReferidoIntro');
 
 const router = Router();
 
@@ -1068,18 +1075,11 @@ function inferIa360QaPersonaHint(name) {
 // el remitente). Se sanitiza antes de persistir: sin caracteres de control ni
 // saltos de línea, sin llaves de placeholder, espacios colapsados y tope de 60
 // caracteres. Devuelve null si no queda nada usable.
+// G9: delega en el modulo puro ia360ReferidoIntro para que el vCard y el comando
+// del owner "intro <contacto>: <quien>" compartan exactamente la misma regla de
+// sanitizado (control/bidi/zero-width fuera, sin llaves, tope 60 code points).
 function sanitizeIa360IntroName(raw) {
-  const clean = String(raw || '')
-    .replace(/[\u0000-\u001F\u007F\u2028\u2029\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, ' ')
-    .replace(/[{}]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  // Corte por code points (no por unidades UTF-16): un emoji en la frontera de
-  // los 60 caracteres no deja un surrogate suelto que rompa el jsonb al persistir.
-  const capped = Array.from(clean).slice(0, 60).join('').trim();
-  if (!capped) return null;
-  if (!/[\p{L}]/u.test(capped)) return null; // sin letras (solo dígitos/símbolos) no sirve como nombre
-  return capped;
+  return sanitizeIa360IntroNamePure(raw);
 }
 
 async function upsertIa360SharedContact({ record, shared }) {
@@ -2904,7 +2904,7 @@ const IA360_PERSONA_SEQUENCE_FLOWS = {
         step2: {
           pregunta: '¿Qué te contó la persona que nos presentó sobre lo que hace Alek, y qué te llamó la atención para aceptar la introducción? Con eso evitamos mandarte algo fuera de lugar.',
         },
-        draft: ({ name, quienIntro }) => `Hola ${name}, soy la IA de Alek. Te escribo porque nos presentó ${quienIntro || '{{quien_intro}}'} y, antes de mandarte cualquier propuesta, Alek quiere entender tu contexto para no escribirte algo fuera de lugar. ¿Cómo prefieres empezar?`,
+        draft: ({ name, quienIntro }) => buildIa360ReferidoContextoDraft({ name, quienIntro }),
         // G-COLD: el {{2}} del template es quien_intro; en frío se exige el dato
         // antes de aprobar (ver handleIa360OwnerApproveSend).
         metaTemplateName: 'ia360_referido_contexto',
@@ -4742,9 +4742,12 @@ async function handleIa360OwnerApproveSend({ record, targetContact, sequenceId }
     // Meta rechaza parámetros con saltos de línea o 4+ espacios consecutivos.
     let templateVars = null;
     if (sequence.id === 'referido_contexto') {
-      const quienIntro = compactForWhatsApp(contact.custom_fields?.quien_intro || '', 60);
+      // G9: el quien_intro tecleado por el owner ("intro <contacto>: <quien>")
+      // alimenta este mismo {{2}}. compactQuienIntroPure colapsa/topa y devuelve
+      // null si falta el dato -> seguimos avisando con cold_send_missing_quien_intro.
+      const quienIntro = compactQuienIntroPure(contact.custom_fields?.quien_intro || '', 60);
       if (!quienIntro) {
-        return deny('cold_send_missing_quien_intro', `El template de ${sequence.id} necesita saber quién hizo la introducción y ${name} no tiene quien_intro registrado. Captura ese dato (o elige otra secuencia) y vuelve a intentar. No envié nada.`);
+        return deny('cold_send_missing_quien_intro', `El template de ${sequence.id} necesita saber quién hizo la introducción y ${name} no tiene quien_intro registrado. Captura ese dato con "intro ${name}: <quién presenta>" (o elige otra secuencia) y vuelve a intentar. No envié nada.`);
       }
       templateVars = { '2': quienIntro };
     }
@@ -6071,6 +6074,82 @@ async function handleIa360OwnerVaultSync({ record, query }) {
   } catch (err) {
     console.error('[ia360-vault] sync error:', err.message);
     await ownerText('ia360_vault_sync_error', `No pude sincronizar "${query}" ahora mismo (error interno). Inténtalo de nuevo en un momento.`).catch(() => {});
+  }
+}
+
+// G9 — Comando del owner: "intro <contacto>: <quien presenta>" (o el atajo
+// "referido <contacto> de <quien>"). Reanima la INTRO del referido BNI: persiste
+// quien_intro en el contacto referido para que la secuencia referido_contexto
+// arme la intro real en lugar de bloquearse (cold_send_missing_quien_intro /
+// placeholder caliente). Resuelve el contacto con la misma tolerancia del
+// expediente; intenta resolver al aliado real a un numero para referido_por
+// (nunca el owner). try/catch total: NUNCA queda mudo.
+async function handleIa360OwnerIntroCommand({ record, target, introducer }) {
+  const ownerText = (label, body) => sendIa360DirectText({
+    record, toNumber: IA360_OWNER_NUMBER, label, body, ownerBudget: true,
+  });
+  try {
+    const quienIntroName = sanitizeIa360IntroNamePure(introducer);
+    if (!quienIntroName) {
+      await ownerText('ia360_intro_bad_name',
+        `No leí un nombre válido de quién presenta en "${introducer}". Usa: intro <contacto>: <quién presenta>.`);
+      return;
+    }
+    const resolved = await resolveIa360MemoryTarget(target);
+    if (resolved.kind === 'none') {
+      await ownerText('ia360_intro_target_none',
+        `No encontré a "${target}" ni como nombre ni como número. Revisa el nombre o usa el número: intro <número>: ${quienIntroName}.`);
+      return;
+    }
+    if (resolved.kind === 'ambiguous') {
+      const list = resolved.candidates.slice(0, 8)
+        .map(c => `- ${c.contact_name || 'sin nombre'} (${c.contact_number})`).join('\n');
+      await ownerText('ia360_intro_target_ambiguous',
+        `Hay varios contactos que coinciden con "${target}". ¿A cuál le pongo la intro de ${quienIntroName}?\n${list}\n\nMándame "intro <número>: ${quienIntroName}".`);
+      return;
+    }
+    const contactNumber = normalizePhone(resolved.candidates[0].contact_number);
+    // Intenta resolver al aliado real a un número para referido_por. Solo cuenta
+    // un match directo (nombre único o número); si es ambiguo o no existe ficha,
+    // no tocamos referido_por (quien_intro tecleado ya es la señal primaria).
+    let introducerNumber = null;
+    try {
+      const introResolved = await resolveIa360MemoryTarget(introducer);
+      if (introResolved.kind === 'name' || introResolved.kind === 'number') {
+        introducerNumber = normalizePhone(introResolved.candidates[0].contact_number);
+      }
+    } catch (e) {
+      console.error('[ia360-intro] introducer resolve:', e.message);
+    }
+    const customFields = buildIa360IntroCustomFields({
+      quienIntroName,
+      introducerNumber,
+      ownerNumber: IA360_OWNER_NUMBER,
+      contactNumber,
+      botNumber: IA360_BOT_WA_NUMBER,
+      nowIso: new Date().toISOString(),
+    });
+    await mergeContactIa360State({
+      waNumber: record.wa_number,
+      contactNumber,
+      customFields,
+    });
+    const display = resolved.candidates[0].contact_name || contactNumber;
+    const refLine = customFields.referido_por
+      ? ` Aliado vinculado: ${customFields.referido_por}.`
+      : ' (No reconocí un número del aliado; quedó solo el nombre, suficiente para la intro.)';
+    await sendIa360DirectText({
+      record,
+      toNumber: IA360_OWNER_NUMBER,
+      label: 'ia360_intro_saved',
+      body: `Listo. ${display} (${contactNumber}) ahora figura presentado por ${quienIntroName}.${refLine} La secuencia de referido ya arma la intro real sin pedirte el dato.`,
+      targetContact: contactNumber,
+      ownerBudget: true,
+    });
+  } catch (err) {
+    console.error('[ia360-intro] owner command error:', err.message);
+    await ownerText('ia360_intro_error',
+      `No pude registrar la intro de "${target}" ahora mismo (error interno). Inténtalo de nuevo en un momento.`).catch(() => {});
   }
 }
 
@@ -9001,7 +9080,8 @@ async function handleBrainV2Canary(record) {
         '- `/sim <mensaje>` para probar cómo respondería a un contacto.',
         '- `idea: <texto>` para mandar algo a la bandeja de ideas.',
         '- `qué sabes de <nombre|número>` para consultar memoria.',
-        '- `sincroniza a <nombre|número>` para vincular notas del vault.'
+        '- `sincroniza a <nombre|número>` para vincular notas del vault.',
+        '- `intro <contacto>: <quién presenta>` para teclear la intro de un referido.'
       ].join('\n')
     });
     return;
@@ -9245,6 +9325,19 @@ router.post('/webhook/whatsapp', async (req, res) => {
             if (syncMatch && syncMatch[1].trim()) {
               await handleIa360OwnerVaultSync({ record, query: syncMatch[1].trim() })
                 .catch(e => console.error('[ia360-vault] owner command error:', e.message));
+              continue; // no procesar como mensaje normal
+            }
+          }
+          // ── G9: comando del owner "intro <contacto>: <quien presenta>" ──
+          // Reanima la intro del referido BNI: persiste quien_intro para que la
+          // secuencia referido_contexto deje de bloquearse. Mismo patrón que los
+          // demás comandos del owner: va ANTES del canary Brain v2 y corta el flujo.
+          if (record.message_type === 'text'
+              && normalizePhone(record.contact_number) === IA360_OWNER_NUMBER) {
+            const introCmd = parseIa360OwnerIntroCommand(record.message_body);
+            if (introCmd) {
+              await handleIa360OwnerIntroCommand({ record, target: introCmd.target, introducer: introCmd.introducer })
+                .catch(e => console.error('[ia360-intro] owner command error:', e.message));
               continue; // no procesar como mensaje normal
             }
           }
