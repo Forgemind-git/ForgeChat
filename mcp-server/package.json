@@ -1,6 +1,6 @@
 {
   "name": "forgechat-mcp",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "sthirumalairajan2212",
   "description": "MCP server for building and managing ForgeChat WhatsApp AI agents from Claude Desktop.",
   "type": "module",
