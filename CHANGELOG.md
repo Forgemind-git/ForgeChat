@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-17
+
+### Fixed
+- **Media-template broadcasts** — broadcasting an approved template with a Media
+  Library header image failed immediately (status went *Pending → Failed* with
+  nothing sent), even though *Send Test* of the same template delivered fine.
+  The broadcast now resolves the header image from the template's own saved
+  media (just like Send Test), and the Bulk Message screen pre-fills it, so
+  template broadcasts send correctly with their image.
+
 ## [1.2.0] - 2026-06-10
 
 ### Added
