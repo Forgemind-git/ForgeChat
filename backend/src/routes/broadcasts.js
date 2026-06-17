@@ -50,7 +50,7 @@ async function enqueueBroadcastRecipient({ broadcast, template, account, recipie
         header_text: template.header_text || null,
         // Stable pointer to the header image so the Chats bubble renders the
         // real picture instead of a grey "Image header" placeholder.
-        header_media_library_id: broadcast.media_library_id || null,
+        header_media_library_id: broadcast.media_library_id || (template && template.header_media_library_id) || null,
         footer: template.footer || null,
         buttons: Array.isArray(template.buttons) ? template.buttons : (template.buttons || []),
       },
@@ -425,7 +425,8 @@ router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (re
   try {
     const { rows: bRows } = await pool.query(
       `SELECT b.*, t.id AS t_id, t.name AS t_name, t.language AS t_language, t.body AS t_body,
-              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples
+              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples,
+              t.header_media_library_id AS t_header_media_library_id
          FROM coexistence.broadcasts b
          LEFT JOIN coexistence.message_templates t ON t.id = b.template_id
         WHERE b.id = $1`,
@@ -435,7 +436,8 @@ router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (re
     const broadcast = bRows[0];
     const template = broadcast.message_type === 'template'
       ? { id: broadcast.t_id, name: broadcast.t_name, language: broadcast.t_language, body: broadcast.t_body,
-          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples }
+          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples,
+          header_media_library_id: broadcast.t_header_media_library_id }
       : null;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: broadcast.from_number });
@@ -458,11 +460,17 @@ router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (re
     // broadcast.media_library_id.
     const _tplHt = template ? String(template.header_type || '').toUpperCase() : '';
     const _needsHeaderMedia = broadcast.message_type === 'template' && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(_tplHt);
-    if ((['image', 'video', 'audio', 'document'].includes(broadcast.message_type) || _needsHeaderMedia) && broadcast.media_library_id) {
+    // A media-header template carries its own image in header_media_library_id.
+    // Fall back to it when the broadcast has no explicitly-attached media, so a
+    // template broadcast resolves the header exactly like a template test-send
+    // instead of failing at Meta with #131008 (missing required header param).
+    const mediaSourceId = broadcast.media_library_id
+      || (_needsHeaderMedia && template ? template.header_media_library_id : null);
+    if ((['image', 'video', 'audio', 'document'].includes(broadcast.message_type) || _needsHeaderMedia) && mediaSourceId) {
       const { syncMediaToAccount } = require('./mediaLibrary');
       const { rows: mRows } = await pool.query(
         `SELECT * FROM coexistence.media_library WHERE id = $1 AND deleted_at IS NULL`,
-        [broadcast.media_library_id]
+        [mediaSourceId]
       );
       if (mRows.length) {
         const media = mRows[0];
@@ -538,7 +546,8 @@ router.post('/broadcasts/:id/test', requirePermission('bulk-message'), async (re
 
     const { rows: bRows } = await pool.query(
       `SELECT b.*, t.id AS t_id, t.name AS t_name, t.language AS t_language, t.body AS t_body,
-              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples
+              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples,
+              t.header_media_library_id AS t_header_media_library_id
          FROM coexistence.broadcasts b
          LEFT JOIN coexistence.message_templates t ON t.id = b.template_id
         WHERE b.id = $1`,
@@ -548,7 +557,8 @@ router.post('/broadcasts/:id/test', requirePermission('bulk-message'), async (re
     const broadcast = bRows[0];
     const template = broadcast.message_type === 'template'
       ? { id: broadcast.t_id, name: broadcast.t_name, language: broadcast.t_language, body: broadcast.t_body,
-          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples }
+          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples,
+          header_media_library_id: broadcast.t_header_media_library_id }
       : null;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: broadcast.from_number });
@@ -561,11 +571,17 @@ router.post('/broadcasts/:id/test', requirePermission('bulk-message'), async (re
     // broadcast.media_library_id.
     const _tplHt = template ? String(template.header_type || '').toUpperCase() : '';
     const _needsHeaderMedia = broadcast.message_type === 'template' && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(_tplHt);
-    if ((['image', 'video', 'audio', 'document'].includes(broadcast.message_type) || _needsHeaderMedia) && broadcast.media_library_id) {
+    // A media-header template carries its own image in header_media_library_id.
+    // Fall back to it when the broadcast has no explicitly-attached media, so a
+    // template broadcast resolves the header exactly like a template test-send
+    // instead of failing at Meta with #131008 (missing required header param).
+    const mediaSourceId = broadcast.media_library_id
+      || (_needsHeaderMedia && template ? template.header_media_library_id : null);
+    if ((['image', 'video', 'audio', 'document'].includes(broadcast.message_type) || _needsHeaderMedia) && mediaSourceId) {
       const { syncMediaToAccount } = require('./mediaLibrary');
       const { rows: mRows } = await pool.query(
         `SELECT * FROM coexistence.media_library WHERE id = $1 AND deleted_at IS NULL`,
-        [broadcast.media_library_id]
+        [mediaSourceId]
       );
       if (mRows.length) {
         const media = mRows[0];

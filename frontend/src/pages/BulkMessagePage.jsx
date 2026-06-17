@@ -430,6 +430,18 @@ export default function BulkMessagePage({ onNavigate }) {
       .then(res => {
         const filtered = (res.media || []).filter(m => m.mediaType === neededType);
         setNewBroadcastMediaItems(filtered);
+        // For a media-header template, auto-prefill the picker with the image the
+        // template was built with (its header_media_library_id), if it still
+        // exists in the library — so the user doesn't have to re-select it and a
+        // template broadcast works just like a template test-send. They can still
+        // override the choice.
+        if (newBroadcastMessageType === 'template') {
+          const tpl = templates.find(t => t.id.toString() === newBroadcastTemplateId);
+          const savedId = tpl?.header_media_library_id;
+          if (savedId && filtered.some(m => String(m.id) === String(savedId))) {
+            setNewBroadcastMediaLibraryId(prev => prev || String(savedId));
+          }
+        }
       })
       .catch(() => setNewBroadcastMediaItems([]))
       .finally(() => setNewBroadcastMediaLoading(false));
