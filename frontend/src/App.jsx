@@ -3,6 +3,7 @@ import { api } from './api.js';
 import { C, FONT } from './constants.js';
 import { useHashRoute } from './hooks/useHashRoute.js';
 import LoginGate from './components/LoginGate.jsx';
+import SetupWizard from './components/SetupWizard.jsx';
 import Topbar from './components/Topbar.jsx';
 import Sidebar from './components/Sidebar.jsx';
 import ChatsPage from './components/ChatsPage.jsx';
@@ -15,15 +16,18 @@ import AdminSettingsPage from './pages/AdminSettingsPage.jsx';
 import MediaLibraryPage from './pages/MediaLibraryPage.jsx';
 import AboutUsPage from './pages/AboutUsPage.jsx';
 import PipelinesPage from './pages/PipelinesPage.jsx';
+import AiAgentBuilderPage from './pages/AiAgentBuilderPage.jsx';
 
 const VALID_PAGES = new Set([
   'home', 'chatbot-builder', 'template-builder', 'chats',
   'contacts', 'pipelines', 'bulk-message', 'admin-settings', 'media-library', 'about',
+  'ai-agent-builder',
 ]);
 
 export default function App() {
   const [user, setUser] = useState(null);
   const [checking, setChecking] = useState(true);
+  const [setupRequired, setSetupRequired] = useState(false);
   const [routeParts, navigate, replaceRoute] = useHashRoute();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
@@ -55,10 +59,23 @@ export default function App() {
   }, [page]);
 
   useEffect(() => {
-    api.auth.me()
-      .then(({ user }) => setUser(user))
-      .catch(() => setUser(null))
-      .finally(() => setChecking(false));
+    // First check whether the instance needs first-run setup (no users yet).
+    // If so, show the setup wizard; otherwise resume the normal session check.
+    api.auth.status()
+      .then(({ setupRequired: needed }) => {
+        if (needed) { setSetupRequired(true); setChecking(false); return null; }
+        return api.auth.me()
+          .then(({ user }) => setUser(user))
+          .catch(() => setUser(null))
+          .finally(() => setChecking(false));
+      })
+      .catch(() => {
+        // status unavailable (DB warming) — fall back to a normal session check.
+        api.auth.me()
+          .then(({ user }) => setUser(user))
+          .catch(() => setUser(null))
+          .finally(() => setChecking(false));
+      });
   }, []);
 
   const handleLogout = async () => {
@@ -82,6 +99,10 @@ export default function App() {
     );
   }
 
+  if (setupRequired && !user) {
+    return <SetupWizard onComplete={(u) => { setSetupRequired(false); setUser(u); }} />;
+  }
+
   if (!user) {
     return <LoginGate onLogin={setUser} />;
   }
@@ -90,12 +111,13 @@ export default function App() {
     switch (page) {
       case 'home': return <HomePage user={user} onPageChange={setPage} />;
       case 'chats': return <ChatsPage subParts={subParts} navigate={navigate} user={user} />;
-      case 'contacts': return <ContactsPage user={user} />;
+      case 'contacts': return <ContactsPage user={user} onNavigate={navigate} />;
       case 'pipelines': return <PipelinesPage user={user} />;
-      case 'template-builder': return <TemplateBuilderPage />;
+      case 'template-builder': return <TemplateBuilderPage subParts={subParts} navigate={navigate} />;
       case 'media-library': return <MediaLibraryPage />;
-      case 'bulk-message': return <BulkMessagePage />;
+      case 'bulk-message': return <BulkMessagePage onNavigate={navigate} />;
       case 'chatbot-builder': return <ChatbotBuilderPage subParts={subParts} navigate={navigate} />;
+      case 'ai-agent-builder': return <AiAgentBuilderPage user={user} navigate={navigate} />;
       case 'about': return <AboutUsPage />;
       case 'admin-settings': return <AdminSettingsPage onLogout={handleLogout} onNavigate={setPage} subParts={subParts} navigate={navigate} user={user} />;
       default: return <HomePage user={user} onPageChange={setPage} />;

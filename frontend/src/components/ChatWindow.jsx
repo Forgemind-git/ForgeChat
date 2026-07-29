@@ -1,11 +1,17 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Search, Loader2, MoreVertical, Phone, Pencil, X, Send, Lock, Paperclip, Image as ImageIcon, FileText, Video, Music, Library, RefreshCw, CheckCircle2, AlertTriangle, Mic, Square, Trash2, User, Download, Forward, Reply, Tag, UserPlus, Check } from 'lucide-react';
+import { Search, Loader2, MoreVertical, Phone, Pencil, X, Send, Lock, Paperclip, Image as ImageIcon, FileText, Video, Music, Library, RefreshCw, CheckCircle2, AlertTriangle, Mic, Square, Trash2, User, Download, Forward, Reply, Tag, UserPlus, Check, Bot } from 'lucide-react';
 import { usePolling } from '../hooks/usePolling.js';
+import { useServerEvents } from '../hooks/useServerEvents.js';
 import { api } from '../api.js';
-import { C, FONT, MONO, maskPhone } from '../constants.js';
+import { C, FONT, MONO, maskPhone, darkenColor } from '../constants.js';
 import MessageBubble, { quoteSnippet } from './MessageBubble.jsx';
 import MaskedNumber from './MaskedNumber.jsx';
 import { CustomFieldEditor } from './CustomFieldInputs.jsx';
+
+// Monotonic delivery lifecycle — mirror of the backend STATUS_RANK. Used to
+// merge a live SSE tick onto the polled status without ever downgrading.
+const STATUS_RANK = { sending: 0, sent: 1, delivered: 2, read: 3, played: 3, failed: 2 };
+const higherStatus = (a, b) => ((STATUS_RANK[b] ?? -1) > (STATUS_RANK[a] ?? -1) ? b : a);
 
 // Forward a message to another contact on the same WhatsApp number.
 function ForwardModal({ waNumber, message, onClose }) {
@@ -96,6 +102,8 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
   // Chat-header quick-actions: tag + assign
   const [assignedUserId, setAssignedUserId] = useState(null);
   const [assignableUsers, setAssignableUsers] = useState(null); // null = non-admin/unknown -> Assign hidden
+  const [agentConv, setAgentConv] = useState(null);
+  const [agentBusy, setAgentBusy] = useState(false);
   const [tagPopoverOpen, setTagPopoverOpen] = useState(false);
   const [assignPopoverOpen, setAssignPopoverOpen] = useState(false);
   const [headerSaving, setHeaderSaving] = useState(false);
@@ -126,6 +134,23 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
   const [replyTo, setReplyTo] = useState(null); // message being quote-replied to
   const [myReactions, setMyReactions] = useState({}); // messageId -> emoji ('' = removed), optimistic
   const [starOverrides, setStarOverrides] = useState({}); // messageId -> bool, optimistic
+  const [statusOverrides, setStatusOverrides] = useState({}); // wamid -> 'delivered'|'read'|… live SSE tick updates
+
+  // Real-time delivery/read ticks: when a webhook advances an outbound message's
+  // status the backend pushes a `message-status` SSE event; apply it instantly
+  // (monotonically) so the tick turns blue without waiting for the 15s poll.
+  const onServerEvent = useCallback((ev) => {
+    if (ev.type !== 'message-status') return;
+    const d = ev.data || {};
+    const digits = (s) => String(s || '').replace(/\D/g, '');
+    if (digits(d.waNumber) !== digits(waNumber) || digits(d.contactNumber) !== digits(contactNumber)) return;
+    if (!d.messageId || !d.status) return;
+    setStatusOverrides(prev => ({ ...prev, [d.messageId]: higherStatus(prev[d.messageId] || 'sent', d.status) }));
+  }, [waNumber, contactNumber]);
+  useServerEvents(onServerEvent);
+
+  // Drop stale overrides when switching conversations.
+  useEffect(() => { setStatusOverrides({}); }, [waNumber, contactNumber]);
 
   // Send/remove our reaction to a message. Optimistic; reverts on failure.
   const handleReact = async (msg, emoji) => {
@@ -524,7 +549,27 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
       setAllTags(tgs);
       setAssignableUsers(usrs);
     });
+    // Is an AI agent active on this number, and is it paused for a human?
+    // Guarded so a missing endpoint / api shape never breaks the chat header.
+    api.agentConversation?.status?.(waNumber, contactNumber)
+      ?.then(setAgentConv, () => setAgentConv(null));
   }, [waNumber, contactNumber]);
+
+  // Take over / return to bot.
+  const toggleAgentBot = async () => {
+    if (!agentConv?.hasAgent || agentBusy) return;
+    setAgentBusy(true);
+    try {
+      const r = agentConv.paused
+        ? await api.agentConversation.resume(waNumber, contactNumber)
+        : await api.agentConversation.pause(waNumber, contactNumber);
+      setAgentConv(c => ({ ...c, paused: !!r.paused }));
+    } catch (e) {
+      alert('Could not switch the bot: ' + (e.message || 'try again'));
+    } finally {
+      setAgentBusy(false);
+    }
+  };
 
   // Auto-scroll to bottom on first load
   useEffect(() => {
@@ -673,6 +718,15 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
     }
     const star = starOverrides[m.message_id];
     if (star !== undefined) out = { ...out, starred: star };
+    // Live tick: merge any SSE status update, monotonically (never downgrade
+    // the polled status — e.g. a late 'delivered' SSE can't undo a polled 'read').
+    if (m.direction === 'outgoing' && m.message_id) {
+      const live = statusOverrides[m.message_id];
+      if (live) {
+        const merged = higherStatus(out.status || 'sent', live);
+        if (merged !== out.status) out = { ...out, status: merged };
+      }
+    }
     return out;
   };
   const messages = [...(data?.messages || []), ...optimisticMessages]
@@ -735,7 +789,7 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
 
   return (
     <div style={{
-      flex: 1, display: 'flex', flexDirection: 'column',
+      flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column',
       overflow: 'hidden',
       background: 'var(--c-chatWall)',
     }}>
@@ -924,6 +978,22 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
                   </div>
                 )}
               </div>
+            )}
+
+            {/* AI agent take-over toggle — only when an agent is active on this number */}
+            {agentConv?.hasAgent && (
+              <button
+                onClick={toggleAgentBot}
+                disabled={agentBusy}
+                title={agentConv.paused
+                  ? 'Bot paused — you have taken over. Click to return this chat to the AI agent.'
+                  : `AI agent "${agentConv.agentName || 'bot'}" is handling this chat. Click to take over (pause the bot).`}
+                style={{ ...headerIconBtn, position: 'relative', color: '#fff', opacity: agentBusy ? 0.5 : 1, background: agentConv.paused ? 'transparent' : 'rgba(255,255,255,0.20)' }}>
+                {agentBusy
+                  ? <Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} />
+                  : <Bot size={18} />}
+                <span style={{ position: 'absolute', top: 5, right: 5, width: 8, height: 8, borderRadius: '50%', background: agentConv.paused ? '#f59e0b' : '#22c55e', border: '1.5px solid #fff' }} />
+              </button>
             )}
 
             {/* Search toggle */}
@@ -1326,9 +1396,9 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
                     <span key={t.id} style={{
                       display: 'inline-flex', alignItems: 'center', gap: 4,
                       padding: '3px 8px', borderRadius: 4,
-                      background: t.color,
+                      background: darkenColor(t.color),
                       color: '#fff',
-                      border: `1px solid ${t.color}`,
+                      border: `1px solid ${darkenColor(t.color)}`,
                       fontSize: 11, fontWeight: 700, fontFamily: FONT,
                     }}>
                       {t.name}
@@ -1474,7 +1544,6 @@ function LibraryPickerModal({ waNumber, sending, onClose, onSend }) {
 
   const handleSendClick = () => {
     if (!selected) return;
-    const meta = TYPE_META[selected.mediaType] || TYPE_META.document;
     onSend({
       mediaLibraryId: Number(selected.id),
       caption: caption.trim(),

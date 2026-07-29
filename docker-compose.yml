@@ -1,0 +1,98 @@
+# ForgeChat — standalone deployment. PostgreSQL + Redis + backend + frontend.
+#
+# Quick start (no configuration needed):
+#   docker compose up -d
+#   open http://localhost:8080      # then create your admin account in the browser
+#
+# The backend auto-generates its secrets (kept in the `secrets` volume) and
+# applies all database migrations on first boot — there is nothing to edit here.
+#
+# For a public HTTPS deployment (required for WhatsApp to deliver messages), add
+# the production overlay — see README "Production":
+#   DOMAIN=chat.example.com docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Optional overrides: create a root `.env` with any of POSTGRES_PASSWORD,
+# HTTP_PORT, or backend feature keys (e.g. OPENAI_API_KEY). None are required.
+# Requires Docker Compose v2.24+.
+
+services:
+  forgecrm-db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      # Internal-only credential (the DB has no host port). Override via root .env
+      # for hardened setups; changing it later requires `docker compose down -v`.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forgechat}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  forgecrm-backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3011"                     # the frontend (nginx) proxies to forgecrm-backend:3011
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-forgechat}@forgecrm-db:5432/postgres
+      REDIS_URL: redis://redis:6379
+      FORGECHAT_DATA_DIR: /app/data    # persisted auto-generated secrets live here
+    env_file:
+      - path: .env                     # optional advanced overrides; absent is fine
+        required: false
+    volumes:
+      - secrets:/app/data              # JWT + encryption key — KEEP THIS VOLUME
+      - media:/app/media               # downloaded inbound/outbound chat media
+      - uploads:/app/uploads           # profile pictures / uploaded files
+    depends_on:
+      forgecrm-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  forgecrm-frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"        # open http://localhost:8080
+    depends_on:
+      - forgecrm-backend
+
+  # Optional quick tunnel so Meta can reach your webhook on a LOCAL install —
+  # no account, no install. Start it with:  docker compose --profile tunnel up -d
+  # then read the public https URL from:    docker compose logs tunnel
+  # You still use the app at http://localhost:8080; this only carries Meta's
+  # webhook traffic to the frontend. Not started by a plain `up` (profile-gated).
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://forgecrm-frontend:80
+    depends_on:
+      - forgecrm-frontend
+
+volumes:
+  pgdata:
+  redisdata:
+  secrets:
+  media:
+  uploads:

@@ -1,5 +1,4 @@
 const { Router } = require('express');
-const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const pool = require('./db');
@@ -33,25 +32,10 @@ async function loadUserSession(userId) {
   };
 }
 
+// JWT_SECRET is guaranteed present + strong by util/instanceSecrets, which runs
+// first in index.js (resolves from env, else a persisted file, else generates
+// one). The fallback below only matters for non-standard entry points.
 const JWT_SECRET = process.env.JWT_SECRET || 'forgecrm-dev-secret-change-me';
-// Known-weak / placeholder secrets that must never reach production. Includes the
-// code's own dev fallback and the placeholders shipped in backend/.env.example —
-// a self-hoster who copies the example unchanged must NOT pass this guard.
-const WEAK_SECRETS = new Set([
-  'forgecrm-dev-secret-change-me',
-  'change-this-to-a-random-string',
-  'change-this-to-another-random-string',
-]);
-// In production, refuse to start with a missing, placeholder, or low-entropy
-// signing secret — otherwise auth tokens could be forged (the source is public).
-// Dev/test keep the convenient fallback.
-if (process.env.NODE_ENV === 'production') {
-  const s = process.env.JWT_SECRET;
-  if (!s || WEAK_SECRETS.has(s) || s.length < 32) {
-    console.error('[auth] FATAL: JWT_SECRET must be a strong, unique value (>= 32 chars) in production — not blank, a placeholder, or the example value.');
-    process.exit(1);
-  }
-}
 const COOKIE_NAME = 'forgecrm_token';
 const TOKEN_EXPIRY = '24h';
 
@@ -74,34 +58,24 @@ async function ensureTables() {
       )
     `);
 
-    // Seed the first admin only when the users table is empty. The password
-    // comes from ADMIN_PASSWORD; if that is unset we generate a random one and
-    // print it once, so there is never a well-known default credential.
+    // First admin: when the users table is empty, only seed non-interactively if
+    // ADMIN_PASSWORD is provided (headless/CI installs). Otherwise leave the
+    // table empty so the first-run UI setup wizard (GET /auth/status ->
+    // setupRequired, POST /auth/setup) creates the admin in the browser. No
+    // password is ever generated or written to disk.
     const { rows } = await client.query('SELECT COUNT(*) FROM coexistence.forgecrm_users');
     if (parseInt(rows[0].count, 10) === 0) {
-      const adminEmail = process.env.ADMIN_EMAIL || 'admin@forgemind.space';
-      const generated = !process.env.ADMIN_PASSWORD;
-      const adminPassword = process.env.ADMIN_PASSWORD || crypto.randomBytes(12).toString('base64url');
-      const hash = await bcrypt.hash(adminPassword, 10);
-      await client.query(
-        `INSERT INTO coexistence.forgecrm_users (username, email, password, display_name, role)
-         VALUES ('admin', $1, $2, 'Admin', 'admin')`,
-        [adminEmail, hash]
-      );
-      if (generated) {
-        // Do NOT print the password to stdout — container logs are often shipped
-        // to aggregators where the credential would persist. Write it to a
-        // 0600 file the operator reads once, then deletes.
-        const fs = require('fs');
-        const pwFile = process.env.ADMIN_PASSWORD_FILE || 'admin-initial-password.txt';
-        try {
-          fs.writeFileSync(pwFile, `email: ${adminEmail}\npassword: ${adminPassword}\n`, { mode: 0o600 });
-          console.log(`[auth] Created admin '${adminEmail}'. One-time generated password written to ${pwFile} (mode 0600). Log in, change it via Admin Settings, then delete that file. Set ADMIN_PASSWORD to skip generation.`);
-        } catch (e) {
-          console.log(`[auth] Created admin '${adminEmail}' with a generated password, but could not write ${pwFile} (${e.message}). Set ADMIN_PASSWORD and recreate to avoid this.`);
-        }
+      if (process.env.ADMIN_PASSWORD) {
+        const adminEmail = (process.env.ADMIN_EMAIL || 'admin@forgemind.space').trim().toLowerCase();
+        const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD, 10);
+        await client.query(
+          `INSERT INTO coexistence.forgecrm_users (username, email, password, display_name, role)
+           VALUES ('admin', $1, $2, 'Admin', 'admin')`,
+          [adminEmail, hash]
+        );
+        console.log(`[auth] Seeded admin '${adminEmail}' from ADMIN_PASSWORD.`);
       } else {
-        console.log(`[auth] Created admin '${adminEmail}' from ADMIN_PASSWORD.`);
+        console.log('[auth] No users yet — the first-run setup wizard will create the admin account in the UI.');
       }
     }
   } finally {
@@ -218,6 +192,65 @@ router.get('/auth/me', authMiddleware, async (req, res) => {
 router.post('/auth/logout', (req, res) => {
   res.clearCookie(COOKIE_NAME);
   res.json({ ok: true });
+});
+
+// GET /api/auth/status — public. Tells the frontend whether to show the
+// first-run setup wizard (no users yet) instead of the login screen.
+router.get('/auth/status', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM coexistence.forgecrm_users');
+    res.json({ setupRequired: rows[0].n === 0 });
+  } catch (err) {
+    // DB not ready / not migrated yet — let the UI retry.
+    res.status(503).json({ error: 'Service starting' });
+  }
+});
+
+// POST /api/auth/setup — public, ONE-TIME. Creates the first admin only while
+// the users table is empty, then issues the auth cookie. Returns 409 once an
+// account exists. A transaction-scoped advisory lock serializes concurrent
+// setup attempts so exactly one admin is created.
+router.post('/auth/setup', async (req, res) => {
+  const { email, password, displayName } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(947218531)');
+    const { rows: cnt } = await client.query('SELECT COUNT(*)::int AS n FROM coexistence.forgecrm_users');
+    if (cnt[0].n > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Setup already completed' });
+    }
+    const hash = await bcrypt.hash(password, 10);
+    const { rows: ins } = await client.query(
+      `INSERT INTO coexistence.forgecrm_users (username, email, password, display_name, role)
+       VALUES ('admin', $1, $2, $3, 'admin')
+       RETURNING id, username, display_name, role`,
+      [email.trim().toLowerCase(), hash, (displayName || 'Admin').trim()]
+    );
+    await client.query('COMMIT');
+    const token = signToken(ins[0]);
+    res.cookie(COOKIE_NAME, token, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+    const session = await loadUserSession(ins[0].id);
+    res.status(201).json({ user: session });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    if (err && err.code === '23505') {
+      // Unique violation (email/username) — treat as already set up.
+      return res.status(409).json({ error: 'Setup already completed' });
+    }
+    console.error('[auth] setup error:', err.message);
+    res.status(500).json({ error: 'Setup failed' });
+  } finally {
+    client.release();
+  }
 });
 
 module.exports = { router, authMiddleware, ensureTables, COOKIE_NAME };

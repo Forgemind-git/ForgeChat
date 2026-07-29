@@ -1,4 +1,7 @@
 require('dotenv').config();
+// Resolve/auto-generate JWT_SECRET + FORGECRM_ENCRYPTION_KEY into process.env
+// BEFORE any module that reads them at require-time (./auth, crypto consumers).
+require('./util/instanceSecrets').bootstrapSecrets();
 
 const express = require('express');
 const cors = require('cors');
@@ -20,10 +23,22 @@ const { router: mediaRouter } = require('./routes/media');
 const { router: mediaLibraryRouter } = require('./routes/mediaLibrary');
 const mediaStorage = require('./util/pgStorage');
 const { router: whatsappAccountsRouter } = require('./routes/whatsappAccounts');
+const {
+  router: googleIntegrationsRouter,
+  publicRouter: googleIntegrationsPublicRouter,
+} = require('./routes/googleIntegrations');
+const { router: agentsRouter } = require('./routes/agents');
+const { router: agentConversationRouter } = require('./routes/agentConversation');
+const { router: aiModelsRouter } = require('./routes/aiModels');
+const { router: eventsRouter } = require('./routes/events');
 const { router: dashboardRouter } = require('./routes/dashboard');
 const { router: pipelinesRouter } = require('./routes/pipelines');
+const { adminRouter: mcpAdminRouter, apiRouter: mcpApiRouter, ensureMcpTables } = require('./routes/mcp');
+const { mcpHttpHandler } = require('./mcpHttp');
 const { startWorker: startMediaWorker, shutdown: shutdownMediaQueue } = require('./queue/mediaQueue');
 const { startSendWorker, shutdownSendQueue } = require('./queue/sendQueue');
+const { startAgentWorker, shutdownAgentQueue } = require('./queue/agentQueue');
+const { reconcileMessageStatuses } = require('./services/statusReconciler');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -32,6 +47,14 @@ const ALLOWED_ORIGINS = [
   process.env.CORS_ORIGIN,
   'http://localhost:5173',
 ].filter(Boolean);
+
+// A local `docker compose up -d` serves the app at http://localhost:8080 (or a
+// custom HTTP_PORT) behind a same-origin nginx proxy, so requests carry an
+// Origin like http://localhost:8080 that won't match CORS_ORIGIN. Allow any
+// localhost / 127.0.0.1 origin (any port) so the documented local install works
+// out of the box without needing CORS_ORIGIN; production still restricts to the
+// explicit CORS_ORIGIN domain. Safe because auth cookies are sameSite=strict.
+const isLocalOrigin = (o) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o);
 
 const CORS_DOMAIN = (process.env.CORS_ORIGIN || '').replace(/^https?:\/\//, '');
 
@@ -58,7 +81,7 @@ app.use(cors({
   credentials: true,
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin) || isLocalOrigin(origin)) return callback(null, true);
     callback(new Error('Not allowed by CORS'));
   },
 }));
@@ -68,9 +91,8 @@ app.use(cookieParser());
 // X-Hub-Signature-256 HMAC over the exact bytes Meta signed.
 app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
-// Serve uploaded files (BDA profile images) behind auth, so they can't be
-// fetched anonymously by guessing a filename.
-app.use('/uploads', authMiddleware, express.static(UPLOAD_DIR));
+// Serve uploaded files statically
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // Rate limiting
 const apiLimiter = rateLimit({
@@ -98,8 +120,17 @@ app.use(apiLimiter);
 // Health check
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Public routes (webhook from n8n — no auth)
+// Public routes (Meta webhook — no auth)
 app.use('/api', webhookRouter);
+// Google OAuth callback is public: Google redirects the user's browser back
+// here, and we re-derive the user from the signed `state` param (see
+// routes/googleIntegrations.js). Everything else under /google-integrations is
+// auth-required and mounted further down.
+app.use('/api', googleIntegrationsPublicRouter);
+// MCP API — authenticates via its OWN bearer middleware (not the JWT cookie)
+app.use('/api/mcp/v1', mcpApiRouter);
+// Remote (Streamable HTTP) MCP connector — key in the URL path, public.
+app.all('/api/mcp/http/:key', mcpHttpHandler);
 
 // Auth routes (public)
 app.use('/api', authRouter);
@@ -116,6 +147,12 @@ app.use('/api', authMiddleware, chatbotsRouter);
 app.use('/api', authMiddleware, mediaRouter);
 app.use('/api', authMiddleware, mediaLibraryRouter);
 app.use('/api', authMiddleware, whatsappAccountsRouter);
+app.use('/api', authMiddleware, googleIntegrationsRouter);
+app.use('/api', authMiddleware, agentsRouter);
+app.use('/api', authMiddleware, agentConversationRouter);
+app.use('/api', authMiddleware, mcpAdminRouter);
+app.use('/api', authMiddleware, aiModelsRouter);
+app.use('/api', authMiddleware, eventsRouter);
 app.use('/api', authMiddleware, dashboardRouter);
 app.use('/api', authMiddleware, pipelinesRouter);
 
@@ -129,12 +166,34 @@ app.use((err, req, res, next) => {
 
 // Start server
 async function start() {
+  // Apply any pending SQL migrations before touching the schema or serving.
+  await require('./db/migrate').runMigrations(pool);
   await ensureTables();
+  await ensureMcpTables().catch(err =>
+    console.error('[mcp] table ensure failed (apply migration 057):', err.message)
+  );
   mediaStorage.ensureBucket().catch(err =>
     console.error('[media-storage] table ensure failed (will retry on first upload):', err.message)
   );
   startMediaWorker();
   startSendWorker();
+  startAgentWorker();
+
+  // Self-healing delivery/read ticks: re-derive each outbound message's true
+  // status from the stored webhook receipts and upgrade any chat_history row
+  // that's behind (monotonic). On boot we sweep a wider 7-day window to backfill
+  // anything missed while the process was down; then every 60s a cheap 2-day pass.
+  reconcileMessageStatuses({ windowDays: 7 })
+    .then(n => { if (n > 0) console.log(`[status-reconcile] boot: fixed ${n} tick(s)`); })
+    .catch(err => console.error('[status-reconcile] boot error:', err.message));
+  setInterval(async () => {
+    try {
+      const n = await reconcileMessageStatuses({ windowDays: 2 });
+      if (n > 0) console.log(`[status-reconcile] fixed ${n} tick(s)`);
+    } catch (err) {
+      console.error('[status-reconcile] error:', err.message);
+    }
+  }, 60 * 1000).unref();
 
   // Stale-pause sweeper: mark paused automation executions that have outlived
   // their expires_at as error. Resume already inline-checks expires_at, so
@@ -165,6 +224,16 @@ async function start() {
       console.error('[sweeper] error:', err.message);
     }
   }, 30 * 60 * 1000).unref();
+
+  // Agent close-summary sweeper: when an idle-summary agent's conversation goes
+  // quiet (no new message for its idle window) and no human has taken over, ask
+  // the agent to write its final summary to the sheet/CRM. Every 2 min.
+  const { sweepClosedConversations } = require('./services/agentCloseSummary');
+  setInterval(() => {
+    sweepClosedConversations()
+      .then(n => { if (n > 0) console.log(`[closeSummary] summarised ${n} closed conversation(s)`); })
+      .catch(err => console.error('[closeSummary] sweep error:', err.message));
+  }, 2 * 60 * 1000).unref();
 
   // Template status auto-sync: Meta does NOT push template approval/rejection
   // status — we must poll. The tick fires every 10 min but only calls Meta while
@@ -201,6 +270,7 @@ async function start() {
     server.close(() => {});
     await shutdownMediaQueue();
     await shutdownSendQueue();
+    await shutdownAgentQueue();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));

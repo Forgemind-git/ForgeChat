@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  Plus, ChevronDown, MoreVertical, X, Loader2, Trash2, Pencil, Search,
+  Plus, ChevronDown, MoreVertical, X, Loader2, Trash2, Search,
   BarChart3, Wallet, Target, TrendingUp, Trophy, XCircle, Check, GripVertical,
 } from 'lucide-react';
 import { api } from '../api.js';
 import { C, FONT, MONO, maskPhone } from '../constants.js';
+import SearchableSelect from '../components/SearchableSelect.jsx';
 
 /* --------------------------------- helpers -------------------------------- */
 const fmtMoney = (n, currency = 'INR') => {
@@ -408,19 +409,26 @@ function DealModal({ deal, defaultStageId, pipeline, stages, isAdmin, onClose, o
               onChange={e => setForm({ ...form, value: e.target.value })} placeholder="0" />
           </Field>
           <Field label="Stage" style={{ flex: 1 }}>
-            <select style={inp} value={form.stageId} disabled={readOnly}
-              onChange={e => setForm({ ...form, stageId: Number(e.target.value) })}>
-              {stages.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
+            <SearchableSelect
+              value={form.stageId}
+              disabled={readOnly}
+              onChange={(val) => setForm({ ...form, stageId: Number(val) })}
+              options={stages.map(s => ({ value: String(s.id), label: s.name }))}
+              placeholder="Select stage…"
+              searchPlaceholder="Search stages…"
+            />
           </Field>
         </div>
 
         {isAdmin && (
           <Field label="Assigned to">
-            <select style={inp} value={form.assignedUserId || ''} onChange={e => setForm({ ...form, assignedUserId: e.target.value ? Number(e.target.value) : '' })}>
-              <option value="">Unassigned</option>
-              {users.map(u => <option key={u.id} value={u.id}>{u.displayName || u.username}{u.role === 'admin' ? ' (admin)' : ''}</option>)}
-            </select>
+            <SearchableSelect
+              value={form.assignedUserId || ''}
+              onChange={(val) => setForm({ ...form, assignedUserId: val ? Number(val) : '' })}
+              options={[{ value: '', label: 'Unassigned' }, ...users.map(u => ({ value: String(u.id), label: `${u.displayName || u.username}${u.role === 'admin' ? ' (admin)' : ''}` }))]}
+              placeholder="Unassigned"
+              searchPlaceholder="Search users…"
+            />
           </Field>
         )}
 
@@ -558,9 +566,13 @@ function StagesModal({ pipeline, onClose, onChanged }) {
             <input type="color" value={s.color || '#64748B'} onChange={e => patch(s.id, 'color', e.target.value)} style={{ width: 28, height: 28, border: 'none', background: 'none', cursor: 'pointer', flexShrink: 0 }} />
             <input style={{ ...inp, flex: 2 }} value={s.name} onChange={e => patch(s.id, 'name', e.target.value)} />
             <input style={{ ...inp, width: 70, fontFamily: MONO }} type="number" min="0" max="100" value={s.probability} onChange={e => patch(s.id, 'probability', Number(e.target.value))} title="Win probability %" />
-            <select style={{ ...inp, width: 90 }} value={s.stageType} onChange={e => patch(s.id, 'stageType', e.target.value)}>
-              {STAGE_TYPES.map(t => <option key={t.v} value={t.v}>{t.l}</option>)}
-            </select>
+            <SearchableSelect
+              value={s.stageType}
+              onChange={(val) => patch(s.id, 'stageType', val)}
+              options={STAGE_TYPES.map(t => ({ value: t.v, label: t.l }))}
+              style={{ width: 90 }}
+              triggerStyle={{ padding: '7px 9px', fontSize: 12 }}
+            />
             <button onClick={() => saveStage(s)} disabled={busy} style={{ ...iconBtnStyle, color: C.green }} title="Save"><Check size={16} /></button>
             <button onClick={() => delStage(s)} disabled={busy} style={{ ...iconBtnStyle, color: C.primary }} title="Delete"><Trash2 size={15} /></button>
           </div>

@@ -17,6 +17,9 @@ build/
 **/.env
 !.env.example
 !**/.env.example
+# First-run generated admin credential (written by the backend on first boot)
+.admin-password
+**/.admin-password
 
 # Runtime data (mounted as docker volumes in prod)
 backend/uploads/
@@ -58,19 +61,17 @@ scratch/
 /*.jsx
 transform.js
 
-# Local deployment compose — copy from docker-compose.sample.yml (gitignored so
-# each deployment keeps its own).
-docker-compose.yml
-
-# PDFs / large generated artifacts
-ForgeCRM_LLD.html
-*.pdf
-
-# Local Claude memory (machine-specific)
+# Local AI-assistant / IDE scratch state (machine-specific, never commit)
 .claude/
 .CLAUDE.md
+.cursor/
+.continue/
+.aider*
 
 # Backups
 *.dump
 *.sql.gz
 *.backup
+
+# Internal ops doc — not for the public repo
+ForgeMind_CICD_Setup_Guide.pdf

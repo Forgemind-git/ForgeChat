@@ -155,6 +155,48 @@ router.post('/chatbots/:id/duplicate', requirePermission('chatbot-builder'), asy
   }
 });
 
+// GET /chatbots/:id/export — portable automation file (id/timestamps stripped).
+router.get('/chatbots/:id/export', requirePermission('chatbot-builder'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT name, description, trigger_type, config FROM coexistence.chatbots WHERE id = $1',
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Chatbot not found' });
+    const c = rows[0];
+    res.json({
+      type: 'forgechat.automation',
+      version: 1,
+      automation: { name: c.name, description: c.description, trigger_type: c.trigger_type, config: c.config || {} },
+    });
+  } catch (err) {
+    console.error('[chatbots] export error:', err.message);
+    res.status(500).json({ error: 'Failed to export chatbot' });
+  }
+});
+
+// POST /chatbots/import — create a new automation from an export file. Always
+// lands DISABLED ('inactive') so it can't fire until reviewed/enabled.
+router.post('/chatbots/import', requirePermission('chatbot-builder'), async (req, res) => {
+  try {
+    const payload = req.body || {};
+    if (payload.type !== 'forgechat.automation' || !payload.automation || !payload.automation.name) {
+      return res.status(400).json({ error: 'That file is not a ForgeChat automation export.' });
+    }
+    const a = payload.automation;
+    const { rows } = await pool.query(
+      `INSERT INTO coexistence.chatbots (name, description, status, trigger_type, config)
+       VALUES ($1,$2,'inactive',$3,$4)
+       RETURNING id, name, description, status, trigger_type, config, created_at, updated_at`,
+      [`${String(a.name).trim()} (imported)`.slice(0, 200), a.description || null, a.trigger_type || 'keyword', JSON.stringify(sanitizeToLinear(a.config) || {})]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('[chatbots] import error:', err.message);
+    res.status(500).json({ error: 'Failed to import chatbot' });
+  }
+});
+
 // DELETE /chatbots/:id
 router.delete('/chatbots/:id', requirePermission('chatbot-builder'), async (req, res) => {
   try {

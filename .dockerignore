@@ -1,0 +1,16 @@
+# Backend image build context is the repo root (so db/migrations is included).
+# Exclude everything the backend image doesn't need to keep the context small.
+.git
+**/node_modules
+frontend
+docs
+*.md
+*.pdf
+docker-compose*.yml
+Caddyfile
+install.sh
+install.ps1
+.env
+**/.env
+.admin-password
+**/.admin-password

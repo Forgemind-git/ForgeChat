@@ -2,12 +2,19 @@ import { FONT } from '../constants.js';
 import { api } from '../api.js';
 
 /* ── iPhone 16 frame ─────────────────────────────────────────────── */
-export function PhoneFrame({ children, headerTitle = 'Your Business', headerSubtitle = 'online', minHeight = 280 }) {
+// `height` fixes the phone to an actual mobile length so the frame never grows
+// with content — the chat body (flex:1 + overflowY:auto) scrolls internally
+// instead, which also guarantees no message text spills outside the phone UI.
+// `inputBar` lets a caller swap the static "Message" bar for a real, typable
+// composer (used by the agent live-test preview). `bodyRef` exposes the
+// scrolling chat body so callers can auto-scroll to the newest message.
+export function PhoneFrame({ children, headerTitle = 'Your Business', headerSubtitle = 'online', minHeight = 280, height = 580, inputBar, bodyRef }) {
   const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
   return (
     <div style={{
       width: 278,
+      height,
       background: 'linear-gradient(155deg, #D8D8DE 0%, #A6A6AD 30%, #82828A 58%, #BFBFC5 82%, #6E6E76 100%)',
       borderRadius: 52,
       padding: 3.5,
@@ -79,9 +86,9 @@ export function PhoneFrame({ children, headerTitle = 'Your Business', headerSubt
           </div>
 
           {/* Chat body */}
-          <div style={{
+          <div ref={bodyRef} style={{
             flex: 1,
-            minHeight,
+            minHeight: 0,
             overflowY: 'auto',
             background: 'var(--c-chatWall)',
             padding: '10px 7px',
@@ -91,18 +98,25 @@ export function PhoneFrame({ children, headerTitle = 'Your Business', headerSubt
           </div>
 
           {/* Input bar + home indicator */}
-          <div style={{ background: 'var(--c-hover)', padding: '7px 9px 22px', display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0, position: 'relative' }}>
-            <div style={{ flex: 1, background: 'var(--c-cardBg)', borderRadius: 99, padding: '6px 12px', fontSize: 10, color: 'var(--c-textMuted)', border: '1px solid var(--c-border)' }}>
-              Message
+          {inputBar ? (
+            <div style={{ background: 'var(--c-hover)', flexShrink: 0, position: 'relative' }}>
+              {inputBar}
+              <div style={{ position: 'absolute', bottom: 6, left: '50%', transform: 'translateX(-50%)', width: 110, height: 4, background: '#111', borderRadius: 99, opacity: .85, pointerEvents: 'none' }} />
             </div>
-            <div style={{ width: 28, height: 28, background: '#25D366', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', flexShrink: 0, boxShadow: '0 1px 2px rgba(0,0,0,.15)' }}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                <line x1="22" y1="2" x2="11" y2="13"/>
-                <polygon points="22,2 15,22 11,13 2,9 22,2" fill="currentColor" stroke="none"/>
-              </svg>
+          ) : (
+            <div style={{ background: 'var(--c-hover)', padding: '7px 9px 22px', display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0, position: 'relative' }}>
+              <div style={{ flex: 1, background: 'var(--c-cardBg)', borderRadius: 99, padding: '6px 12px', fontSize: 10, color: 'var(--c-textMuted)', border: '1px solid var(--c-border)' }}>
+                Message
+              </div>
+              <div style={{ width: 28, height: 28, background: '#25D366', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', flexShrink: 0, boxShadow: '0 1px 2px rgba(0,0,0,.15)' }}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="22" y1="2" x2="11" y2="13"/>
+                  <polygon points="22,2 15,22 11,13 2,9 22,2" fill="currentColor" stroke="none"/>
+                </svg>
+              </div>
+              <div style={{ position: 'absolute', bottom: 6, left: '50%', transform: 'translateX(-50%)', width: 110, height: 4, background: '#111', borderRadius: 99, opacity: .85 }} />
             </div>
-            <div style={{ position: 'absolute', bottom: 6, left: '50%', transform: 'translateX(-50%)', width: 110, height: 4, background: '#111', borderRadius: 99, opacity: .85 }} />
-          </div>
+          )}
         </div>
       </div>
     </div>

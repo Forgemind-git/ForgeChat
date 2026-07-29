@@ -2,10 +2,8 @@ import { useState, useEffect } from 'react';
 import { Search, User } from 'lucide-react';
 import { usePolling } from '../hooks/usePolling.js';
 import { api } from '../api.js';
-import { C, FONT, relativeTime, maskPhone } from '../constants.js';
+import { C, FONT, relativeTime, maskPhone, darkenColor } from '../constants.js';
 import TagMultiSelect from './TagMultiSelect.jsx';
-
-
 
 export default function ContactList({ waNumber, width = 380, selectedContact, onSelectContact, refreshKey, user }) {
   const [search, setSearch] = useState('');
@@ -210,9 +208,9 @@ export default function ContactList({ waNumber, width = 380, selectedContact, on
                         alignSelf: 'flex-start',
                         padding: '2px 6px',
                         borderRadius: 4,
-                        background: t.color || '#54656f',
+                        background: darkenColor(t.color),
                         color: '#fff',
-                        border: `1px solid ${t.color || '#54656f'}`,
+                        border: `1px solid ${darkenColor(t.color)}`,
                         fontSize: 9,
                         fontWeight: 700,
                         letterSpacing: '0.04em',

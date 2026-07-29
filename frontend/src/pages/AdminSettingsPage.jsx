@@ -2,12 +2,15 @@ import { useState, useEffect } from 'react';
 import {
   Settings, Tag, FolderOpen,
   LogOut, Trash2, FormInput, Users as UsersIcon, Shield, Copy,
-  ArrowLeft, Plus, X, ChevronLeft, Eye, EyeOff, Phone, User,
-  Loader2, MessageSquare, Key, Check,
+  ArrowLeft, Plus, X, ChevronLeft, Eye, EyeOff,
+  Loader2, MessageSquare, Key, Check, Globe,
+  PlugZap, Terminal, ChevronRight,
 } from 'lucide-react';
 import { api } from '../api.js';
 import { C, FONT, MONO, maskPhone } from '../constants.js';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
+import SearchableSelect from '../components/SearchableSelect.jsx';
+import IntegrationsTab from '../components/settings/IntegrationsTab.jsx';
 import { useTableSelection, SelectAllCheckbox, RowCheckbox, BulkDeleteButton, runBulkDelete } from '../components/TableSelection.jsx';
 
 const TABS = [
@@ -16,6 +19,8 @@ const TABS = [
   { key: 'category', label: 'Category', icon: FolderOpen },
   { key: 'fields', label: 'Fields', icon: FormInput },
   { key: 'whatsapp-accounts', label: 'WhatsApp Accounts', icon: MessageSquare },
+  { key: 'integrations', label: 'Integrations', icon: Globe },
+  { key: 'mcp', label: 'MCP Tools', icon: PlugZap },
   { key: 'users', label: 'Users', icon: UsersIcon },
 ];
 
@@ -91,13 +96,14 @@ function GeneralTab({ onLogout, user }) {
           <div style={{ fontSize: 13, fontWeight: 600, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 12 }}>
             Timezone
           </div>
-          <select value={timezone} onChange={e => setTimezone(e.target.value)} style={{
-            width: '100%', maxWidth: 360, padding: '10px 12px', borderRadius: 8,
-            border: `1px solid ${C.border}`, fontSize: 14, fontFamily: FONT,
-            color: C.text, background: 'var(--c-cardBg)', outline: 'none', cursor: 'pointer',
-          }}>
-            {TIMEZONES.map(tz => <option key={tz} value={tz}>{tz}</option>)}
-          </select>
+          <SearchableSelect
+            value={timezone}
+            onChange={(val) => setTimezone(val)}
+            options={TIMEZONES.map(tz => ({ value: String(tz), label: tz }))}
+            searchPlaceholder="Search timezones…"
+            style={{ width: '100%', maxWidth: 360 }}
+            triggerStyle={{ padding: '10px 32px 10px 12px', fontSize: 14 }}
+          />
         </div>
 
         <div style={{ marginBottom: 32 }}>
@@ -115,7 +121,6 @@ function GeneralTab({ onLogout, user }) {
             </button>
 
             {/* Single-owner system: the owner manages their own account. */}
-            {true && (
             <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 16, marginTop: 6 }}>
               <button onClick={handleDeleteClick} style={{
                 width: 'fit-content', display: 'flex', alignItems: 'center', gap: 8,
@@ -140,7 +145,6 @@ function GeneralTab({ onLogout, user }) {
                 </div>
               )}
             </div>
-            )}
           </div>
         </div>
       </div>
@@ -235,20 +239,15 @@ function TagsTab({ categories, tags, onRefresh }) {
       }}>
         <h1 style={{ fontSize: 22, fontWeight: 700, color: C.text, margin: 0, letterSpacing: '-.02em', fontFamily: FONT }}>Tags</h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <select
+          <SearchableSelect
             value={filterCategoryId}
-            onChange={e => setFilterCategoryId(e.target.value)}
-            title="Filter by category"
-            style={{
-              padding: '8px 12px', borderRadius: 8,
-              border: `1px solid ${C.border}`, fontSize: 13, fontFamily: FONT,
-              color: filterCategoryId ? C.text : C.textSecondary, background: 'var(--c-cardBg)',
-              outline: 'none', cursor: 'pointer', maxWidth: 220,
-            }}
-          >
-            <option value="">All categories</option>
-            {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
+            onChange={(val) => setFilterCategoryId(val)}
+            options={[{ value: '', label: 'All categories' }, ...categories.map(c => ({ value: String(c.id), label: c.name }))]}
+            placeholder="All categories"
+            searchPlaceholder="Search categories…"
+            style={{ maxWidth: 220 }}
+            triggerStyle={{ padding: '8px 32px 8px 12px' }}
+          />
           <BulkDeleteButton sel={sel} label="tag" onConfirm={handleBulkDelete} />
           <button onClick={openAdd} style={{
             display: 'flex', alignItems: 'center', gap: 6,
@@ -379,14 +378,15 @@ function TagsTab({ categories, tags, onRefresh }) {
 
             <div style={{ marginBottom: 20 }}>
               <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Category</label>
-              <select value={categoryId} onChange={e => setCategoryId(e.target.value)} style={{
-                width: '100%', padding: '10px 12px', borderRadius: 8,
-                border: `1px solid ${C.border}`, fontSize: 14, fontFamily: FONT,
-                color: C.text, background: 'var(--c-cardBg)', outline: 'none', cursor: 'pointer',
-              }}>
-                <option value="">Select category…</option>
-                {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
+              <SearchableSelect
+                value={categoryId}
+                onChange={(val) => setCategoryId(val)}
+                options={categories.map(c => ({ value: String(c.id), label: c.name }))}
+                placeholder="Select category…"
+                searchPlaceholder="Search categories…"
+                style={{ width: '100%' }}
+                triggerStyle={{ fontSize: 14 }}
+              />
             </div>
 
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
@@ -844,8 +844,8 @@ function WhatsappAccountsTab() {
           border: `1px dashed ${C.border}`, borderRadius: 12, color: C.textMuted, fontSize: 13,
         }}>
           <MessageSquare size={36} style={{ opacity: 0.5, marginBottom: 12 }} />
-          <div style={{ marginBottom: 6, color: C.textSecondary, fontWeight: 600 }}>No WhatsApp account connected yet</div>
-          <div>Connect your one WhatsApp account to start creating templates and broadcasts.</div>
+          <div style={{ marginBottom: 6, color: C.textSecondary, fontWeight: 600 }}>No WhatsApp Business account connected yet</div>
+          <div>Connect your WhatsApp Business account to start creating templates and broadcasts.</div>
         </div>
       ) : (
         <div style={{ background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 10, overflow: 'hidden' }}>
@@ -917,7 +917,7 @@ function WhatsappAccountsTab() {
           <div onClick={e => e.stopPropagation()} style={{ background: 'var(--c-cardBg)', borderRadius: 14, width: 520, maxHeight: '90vh', overflow: 'auto', boxShadow: C.shadowLg, padding: 24 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
               <h3 style={{ fontSize: 18, fontWeight: 700, color: C.text, margin: 0 }}>
-                {editing ? 'Edit WhatsApp account' : 'New WhatsApp account'}
+                {editing ? 'Edit WhatsApp Business account' : 'Add WhatsApp Business account'}
               </h3>
               <button onClick={() => setShowForm(false)} style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: C.textMuted }}><X size={20} /></button>
             </div>
@@ -926,15 +926,15 @@ function WhatsappAccountsTab() {
               {/* API Credentials */}
               <div>
                 <h4 style={sectionTitleStyle}>API Credentials</h4>
-                <p style={sectionSubStyle}>Enter your Meta WhatsApp Business API credentials.</p>
+                <p style={sectionSubStyle}>Enter your WhatsApp Cloud API credentials (from Meta Business Suite).</p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                   <div>
                     <label style={labelStyle}>Phone Number ID</label>
-                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.phoneNumberId} onChange={e => setForm({ ...form, phoneNumberId: e.target.value })} placeholder="e.g. 100234567890123" autoFocus />
+                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.phoneNumberId} onChange={e => setForm({ ...form, phoneNumberId: e.target.value })} placeholder="e.g. 100234567890123" autoFocus autoComplete="off" name="wa-phone-number-id" inputMode="numeric" />
                   </div>
                   <div>
                     <label style={labelStyle}>WhatsApp Business Account ID</label>
-                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.wabaId} onChange={e => setForm({ ...form, wabaId: e.target.value })} placeholder="e.g. 100234567890456" />
+                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.wabaId} onChange={e => setForm({ ...form, wabaId: e.target.value })} placeholder="e.g. 100234567890456" autoComplete="off" name="wa-waba-id" inputMode="numeric" />
                   </div>
                   <div>
                     <label style={labelStyle}>
@@ -947,6 +947,8 @@ function WhatsappAccountsTab() {
                         value={form.accessToken}
                         onChange={e => setForm({ ...form, accessToken: e.target.value })}
                         placeholder={editing ? '••••••••' : 'Enter your access token'}
+                        autoComplete="new-password"
+                        name="wa-system-user-token"
                       />
                       <button type="button" onClick={() => setShowToken(s => !s)} style={eyeBtnStyle}>
                         {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
@@ -958,12 +960,12 @@ function WhatsappAccountsTab() {
                   </div>
                   <div>
                     <label style={labelStyle}>Webhook Verify Token</label>
-                    <input style={inpStyle} value={form.verifyToken} onChange={e => setForm({ ...form, verifyToken: e.target.value })} placeholder="Create a custom verify token" />
+                    <input style={inpStyle} value={form.verifyToken} onChange={e => setForm({ ...form, verifyToken: e.target.value })} placeholder="Create a custom verify token" autoComplete="off" name="wa-verify-token" />
                     <div style={hintRow}>A custom string you create. Must match the token you set in Meta webhook settings.</div>
                   </div>
                   <div>
                     <label style={labelStyle}>Meta App ID <span style={hintInline}>(only required for media-header templates)</span></label>
-                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.metaAppId} onChange={e => setForm({ ...form, metaAppId: e.target.value })} placeholder="e.g. 1191602295745986" />
+                    <input style={{ ...inpStyle, fontFamily: MONO }} value={form.metaAppId} onChange={e => setForm({ ...form, metaAppId: e.target.value })} placeholder="e.g. 1191602295745986 (15–16 digits)" autoComplete="off" name="meta-app-id" inputMode="numeric" />
                     <div style={hintRow}>From Meta App Dashboard → App Settings → Basic → App ID. Needed for uploading image/video/document template headers.</div>
                   </div>
                 </div>
@@ -1167,14 +1169,14 @@ function FieldsTab({ fields, onRefresh }) {
 
             <div style={{ marginBottom: 16 }}>
               <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Type</label>
-              <select value={fieldType} onChange={e => setFieldType(e.target.value)}
-                style={{
-                  width: '100%', padding: '10px 12px', borderRadius: 8,
-                  border: `1px solid ${C.border}`, fontSize: 14, fontFamily: FONT,
-                  color: C.text, outline: 'none', background: 'var(--c-cardBg)', cursor: 'pointer',
-                }}>
-                {FIELD_TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
+              <SearchableSelect
+                value={fieldType}
+                onChange={(val) => setFieldType(val)}
+                options={FIELD_TYPE_OPTIONS.map(o => ({ value: String(o.value), label: o.label }))}
+                searchPlaceholder="Search types…"
+                style={{ width: '100%' }}
+                triggerStyle={{ fontSize: 14 }}
+              />
             </div>
 
             <div style={{ marginBottom: 22 }}>
@@ -1412,9 +1414,13 @@ function UsersTab({ currentUser }) {
               </div>
               <div>
                 <label style={labelStyle}>Role</label>
-                <select value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} style={{ ...inputStyle, cursor: 'pointer' }}>
-                  {ROLE_OPTIONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
-                </select>
+                <SearchableSelect
+                  value={form.role}
+                  onChange={(val) => setForm({ ...form, role: val })}
+                  options={ROLE_OPTIONS.map(r => ({ value: String(r.value), label: r.label }))}
+                  triggerStyle={{ padding: '10px 32px 10px 12px', fontSize: 14 }}
+                />
+
               </div>
             </div>
             <div style={{ marginBottom: 14 }}>
@@ -1476,8 +1482,418 @@ const iconBtnStyle = { background: 'transparent', border: 'none', cursor: 'point
 
 /*  Main Page                                                          */
 /* ------------------------------------------------------------------ */
+
+const MCP_CAPABILITIES = [
+  { key: 'discovery', label: 'Discovery / read', desc: 'List WhatsApp numbers, models, spreadsheets, tabs, media, templates, and existing agents.' },
+  { key: 'create_agent', label: 'Create agents', desc: 'Create new AI agents.' },
+  { key: 'update_agent', label: 'Update agents', desc: 'Edit existing agents (name, prompt, model, trigger, etc.).' },
+  { key: 'manage_tools', label: 'Configure tools', desc: 'Add or edit agent tools — Google Sheets and HTTP request (external API/device).' },
+  { key: 'delete', label: 'Delete', desc: 'Delete agents and remove tools.' },
+];
+
+// Small inline pill toggle — consistent with the settings look, no extra deps.
+function Toggle({ checked, onChange, disabled }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={() => !disabled && onChange(!checked)}
+      style={{
+        width: 38, height: 22, borderRadius: 999, border: 'none', padding: 0,
+        position: 'relative', flexShrink: 0,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.45 : 1,
+        background: checked ? C.green : '#cfcfca',
+        transition: 'background .15s',
+      }}
+    >
+      <span style={{
+        position: 'absolute', top: 2, left: checked ? 18 : 2,
+        width: 18, height: 18, borderRadius: '50%', background: '#fff',
+        boxShadow: '0 1px 2px rgba(0,0,0,.25)', transition: 'left .15s',
+      }} />
+    </button>
+  );
+}
+
+function McpToolsTab() {
+  const [settings, setSettings] = useState(null);   // { masterEnabled, capabilities }
+  const [keys, setKeys] = useState([]);
+  const [install, setInstall] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [savingCap, setSavingCap] = useState(false);
+  const [newLabel, setNewLabel] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [freshKey, setFreshKey] = useState(null);   // { ...key, key } shown once
+  const [revokeTarget, setRevokeTarget] = useState(null);
+  const [copied, setCopied] = useState('');
+  const [showInstall, setShowInstall] = useState(false);
+
+  const load = async () => {
+    try {
+      const [s, k, inst] = await Promise.all([
+        api.mcp.getSettings(),
+        api.mcp.listKeys(),
+        api.mcp.install().catch(() => null),
+      ]);
+      setSettings(s);
+      setKeys(k);
+      setInstall(inst);
+    } catch (err) {
+      alert(err.message || 'Failed to load MCP settings');
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { load(); }, []);
+
+  const copy = async (text, tag) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(tag);
+      setTimeout(() => setCopied(''), 1500);
+    } catch { /* */ }
+  };
+
+  const saveSettings = async (patch) => {
+    setSavingCap(true);
+    const prev = settings;
+    setSettings(s => ({                       // optimistic
+      ...s,
+      ...(patch.masterEnabled !== undefined ? { masterEnabled: patch.masterEnabled } : {}),
+      capabilities: { ...s.capabilities, ...(patch.capabilities || {}) },
+    }));
+    try {
+      const updated = await api.mcp.updateSettings(patch);
+      setSettings(updated);
+    } catch (err) {
+      setSettings(prev);                      // revert
+      alert(err.message || 'Failed to update MCP settings');
+    } finally {
+      setSavingCap(false);
+    }
+  };
+
+  const createKey = async () => {
+    const label = newLabel.trim();
+    if (!label) { alert('Give the key a label first'); return; }
+    setCreating(true);
+    try {
+      const k = await api.mcp.createKey(label);
+      setFreshKey(k);
+      setNewLabel('');
+      await load();
+    } catch (err) {
+      alert(err.message || 'Failed to create key');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const toggleKey = async (k) => {
+    const prev = keys;
+    setKeys(ks => ks.map(x => x.id === k.id ? { ...x, isEnabled: !x.isEnabled } : x));
+    try {
+      await api.mcp.updateKey(k.id, { isEnabled: !k.isEnabled });
+    } catch (err) {
+      setKeys(prev);
+      alert(err.message || 'Failed to update key');
+    }
+  };
+
+  const revokeKey = async () => {
+    const k = revokeTarget;
+    setRevokeTarget(null);
+    try {
+      await api.mcp.deleteKey(k.id);
+      setKeys(ks => ks.filter(x => x.id !== k.id));
+    } catch (err) {
+      alert(err.message || 'Failed to revoke key');
+    }
+  };
+
+  if (loading || !settings) {
+    return <div style={{ flex: 1, padding: 40, textAlign: 'center', color: C.textMuted, fontFamily: FONT }}>Loading…</div>;
+  }
+
+  const master = settings.masterEnabled;
+  const card = { background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20, marginBottom: 18 };
+  const h2 = { fontSize: 15, fontWeight: 700, color: C.text, margin: '0 0 4px' };
+  const sub = { fontSize: 12.5, color: C.textSecondary, margin: '0 0 16px', lineHeight: 1.5 };
+  const codeBox = {
+    background: '#0F0F10', color: '#E5E5E2', fontFamily: MONO, fontSize: 12,
+    borderRadius: 8, padding: 14, overflowX: 'auto', whiteSpace: 'pre', lineHeight: 1.5,
+  };
+
+  const snippet = install ? JSON.stringify(install.configSnippet, null, 2) : '';
+
+  return (
+    <div style={{ flex: 1, padding: 24, overflow: 'auto', fontFamily: FONT, maxWidth: 1320 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+        <PlugZap size={20} color={C.primary} />
+        <h1 style={{ fontSize: 20, fontWeight: 700, color: C.text, margin: 0 }}>MCP Tools</h1>
+      </div>
+      <p style={{ fontSize: 13, color: C.textSecondary, margin: '0 0 22px', lineHeight: 1.6, maxWidth: 720 }}>
+        Let an external MCP server (e.g. Claude Desktop) build and manage your AI agents over a secure API key.
+        Turn capabilities on or off here — changes apply instantly to every connected client.
+      </p>
+
+      {/* Two-column layout: access + capabilities on the left, keys + install on the right.
+          flex-wrap with a 420px basis collapses to one column on narrow windows. */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 18, alignItems: 'flex-start' }}>
+      <div style={{ flex: '1 1 420px', minWidth: 0 }}>
+
+      {/* Access (master switch) */}
+      <div style={card}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16 }}>
+          <div>
+            <h2 style={h2}>MCP access</h2>
+            <p style={{ ...sub, margin: 0 }}>
+              Master switch for all MCP access. When off, every MCP request is rejected regardless of key or capability.
+            </p>
+          </div>
+          <Toggle checked={master} disabled={savingCap} onChange={(v) => saveSettings({ masterEnabled: v })} />
+        </div>
+        {!master && (
+          <div style={{
+            marginTop: 14, padding: '10px 12px', borderRadius: 8,
+            background: '#FCEBEB', color: '#A32D2D', fontSize: 12.5, fontWeight: 500,
+          }}>
+            MCP access is currently disabled.
+          </div>
+        )}
+      </div>
+
+      {/* Capabilities */}
+      <div style={{ ...card, opacity: master ? 1 : 0.6 }}>
+        <h2 style={h2}>Capabilities</h2>
+        <p style={sub}>Fine-grained control over what an MCP client may do.</p>
+        {MCP_CAPABILITIES.map((c, i) => (
+          <div key={c.key} style={{
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16,
+            padding: '12px 0', borderTop: i === 0 ? 'none' : `1px solid ${C.border}`,
+          }}>
+            <div>
+              <div style={{ fontSize: 13.5, fontWeight: 600, color: C.text }}>{c.label}</div>
+              <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 2 }}>{c.desc}</div>
+            </div>
+            <Toggle
+              checked={!!settings.capabilities[c.key]}
+              disabled={!master || savingCap}
+              onChange={(v) => saveSettings({ capabilities: { [c.key]: v } })}
+            />
+          </div>
+        ))}
+      </div>
+
+      </div>{/* /left column */}
+      <div style={{ flex: '1 1 420px', minWidth: 0 }}>
+
+      {/* API keys */}
+      <div style={card}>
+        <h2 style={h2}>API keys</h2>
+        <p style={sub}>Bearer keys MCP clients use to authenticate. The full key is shown only once at creation.</p>
+
+        <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+          <input
+            value={newLabel}
+            onChange={e => setNewLabel(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') createKey(); }}
+            placeholder="Key label (e.g. My MacBook — Claude Desktop)"
+            style={{
+              flex: 1, padding: '9px 12px', borderRadius: 8, border: `1px solid ${C.border}`,
+              fontSize: 13, fontFamily: FONT, background: C.cardBg, color: C.text,
+            }}
+          />
+          <button
+            onClick={createKey}
+            disabled={creating}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 6, padding: '9px 16px',
+              background: C.primary, color: '#fff', border: 'none', borderRadius: 8,
+              fontSize: 13, fontWeight: 600, cursor: creating ? 'wait' : 'pointer', fontFamily: FONT,
+            }}
+          >
+            <Plus size={15} /> Generate key
+          </button>
+        </div>
+
+        {keys.length === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: C.textMuted, fontSize: 13, border: `1px dashed ${C.border}`, borderRadius: 8 }}>
+            No API keys yet.
+          </div>
+        ) : (
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: 'var(--c-hover, #f7f7f3)', textAlign: 'left' }}>
+                  <th style={{ padding: '10px 14px', fontWeight: 600, color: C.textSecondary }}>Label</th>
+                  <th style={{ padding: '10px 14px', fontWeight: 600, color: C.textSecondary }}>Key</th>
+                  <th style={{ padding: '10px 14px', fontWeight: 600, color: C.textSecondary }}>Last used</th>
+                  <th style={{ padding: '10px 14px', fontWeight: 600, color: C.textSecondary }}>Enabled</th>
+                  <th style={{ padding: '10px 14px' }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {keys.map(k => (
+                  <tr key={k.id} style={{ borderTop: `1px solid ${C.border}` }}>
+                    <td style={{ padding: '10px 14px', color: C.text }}>{k.label}</td>
+                    <td style={{ padding: '10px 14px', color: C.textSecondary, fontFamily: MONO, fontSize: 12 }}>
+                      {k.keyPrefix}…{k.keyLast4}
+                    </td>
+                    <td style={{ padding: '10px 14px', color: C.textSecondary }}>
+                      {k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : 'Never'}
+                    </td>
+                    <td style={{ padding: '10px 14px' }}>
+                      <Toggle checked={k.isEnabled} onChange={() => toggleKey(k)} />
+                    </td>
+                    <td style={{ padding: '10px 14px', textAlign: 'right' }}>
+                      <button
+                        onClick={() => setRevokeTarget(k)}
+                        title="Revoke"
+                        style={{ background: 'none', border: 'none', cursor: 'pointer', color: C.primary, padding: 4 }}
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Install instructions */}
+      <div style={card}>
+        <button
+          onClick={() => setShowInstall(s => !s)}
+          style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontFamily: FONT }}
+        >
+          <Terminal size={16} color={C.textSecondary} />
+          <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>Install in Claude Desktop</span>
+          <ChevronRight size={16} color={C.textMuted} style={{ transform: showInstall ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
+        </button>
+
+        {showInstall && (
+          <div style={{ marginTop: 16 }}>
+            {/* Remote (recommended) */}
+            <div style={{ fontSize: 13.5, fontWeight: 700, color: C.text, margin: '0 0 6px' }}>Option 1 — Remote URL (recommended, any device)</div>
+            <ol style={{ fontSize: 13, color: C.text, lineHeight: 1.8, paddingLeft: 18, margin: '0 0 10px' }}>
+              <li>Enable the master switch + capabilities above, then <b>Generate a key</b> (the key-created popup shows a ready-to-paste URL).</li>
+              <li>In Claude (web/desktop/mobile) → <b>Settings → Connectors → Add custom connector</b>, paste the URL below with your key appended.</li>
+              <li>Say <i>“create a ForgeChat agent”</i> — it asks the setup questions.</li>
+            </ol>
+            {install?.remoteUrl && (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18, gap: 8 }}>
+                <code style={{ flex: 1, ...codeBox, whiteSpace: 'nowrap', overflowX: 'auto', padding: '10px 12px' }}>{install.remoteUrl}</code>
+                <button
+                  onClick={() => copy(install.remoteUrl, 'remoteurl')}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, padding: '8px 10px', fontSize: 12, cursor: 'pointer', color: C.text, fontFamily: FONT }}
+                >
+                  {copied === 'remoteurl' ? <Check size={13} /> : <Copy size={13} />}
+                  {copied === 'remoteurl' ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            )}
+
+            {/* Local (stdio) */}
+            <div style={{ fontSize: 13.5, fontWeight: 700, color: C.text, margin: '0 0 6px' }}>Option 2 — Local server (Claude Desktop config)</div>
+            <ol style={{ fontSize: 13, color: C.text, lineHeight: 1.8, paddingLeft: 18, margin: '0 0 16px' }}>
+              <li>On the machine running Claude Desktop, install the server: <code style={{ fontFamily: MONO, fontSize: 12 }}>cd {install?.serverPath?.replace('/src/index.js', '') || '/root/FORGECHAT/mcp-server'} && npm install</code></li>
+              <li>Open Claude Desktop → <b>Settings → Developer → Edit Config</b> and add the block below (paste your key).</li>
+              <li>Fully quit and reopen Claude Desktop. The <code style={{ fontFamily: MONO, fontSize: 12 }}>forgechat-agents</code> tools appear.</li>
+            </ol>
+
+            {install && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <span style={{ fontSize: 12, color: C.textSecondary }}>MCP API URL: <code style={{ fontFamily: MONO }}>{install.apiUrl}</code></span>
+                  <button
+                    onClick={() => copy(snippet, 'snippet')}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, padding: '5px 10px', fontSize: 12, cursor: 'pointer', color: C.text, fontFamily: FONT }}
+                  >
+                    {copied === 'snippet' ? <Check size={13} /> : <Copy size={13} />}
+                    {copied === 'snippet' ? 'Copied' : 'Copy config'}
+                  </button>
+                </div>
+                <div style={codeBox}>{snippet}</div>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      </div>{/* /right column */}
+      </div>{/* /two-column wrapper */}
+
+      {/* One-time fresh-key modal */}
+      {freshKey && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 300, fontFamily: FONT }}>
+          <div style={{ background: C.cardBg, borderRadius: 14, padding: 24, width: 480, boxShadow: C.shadowLg }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              <Key size={18} color={C.green} />
+              <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>API key created</div>
+            </div>
+            <div style={{ fontSize: 13, color: C.textSecondary, marginBottom: 12, lineHeight: 1.6 }}>
+              Copy this key now — it won’t be shown again. Store it in your Claude Desktop config as <code style={{ fontFamily: MONO }}>FORGECHAT_API_KEY</code>.
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+              <code style={{ flex: 1, ...codeBox, whiteSpace: 'nowrap', overflowX: 'auto', padding: '12px 14px' }}>{freshKey.key}</code>
+              <button
+                onClick={() => copy(freshKey.key, 'fresh')}
+                style={{ display: 'flex', alignItems: 'center', gap: 6, background: C.primary, color: '#fff', border: 'none', borderRadius: 8, padding: '0 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: FONT }}
+              >
+                {copied === 'fresh' ? <Check size={14} /> : <Copy size={14} />}
+                {copied === 'fresh' ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: C.text, margin: '0 0 6px' }}>
+              Remote connector URL <span style={{ fontWeight: 400, color: C.textSecondary }}>— paste into Claude → Add custom connector (works on web, desktop, mobile)</span>
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+              <code style={{ flex: 1, ...codeBox, whiteSpace: 'nowrap', overflowX: 'auto', padding: '12px 14px' }}>
+                {`${window.location.origin}/api/mcp/http/${freshKey.key}`}
+              </code>
+              <button
+                onClick={() => copy(`${window.location.origin}/api/mcp/http/${freshKey.key}`, 'freshurl')}
+                style={{ display: 'flex', alignItems: 'center', gap: 6, background: C.text, color: '#fff', border: 'none', borderRadius: 8, padding: '0 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: FONT }}
+              >
+                {copied === 'freshurl' ? <Check size={14} /> : <Copy size={14} />}
+                {copied === 'freshurl' ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <div style={{ textAlign: 'right' }}>
+              <button
+                onClick={() => setFreshKey(null)}
+                style={{ background: C.text, color: '#fff', border: 'none', borderRadius: 8, padding: '9px 18px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: FONT }}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <DeleteConfirmModal
+        open={!!revokeTarget}
+        title="Revoke API key"
+        message={`Revoke “${revokeTarget?.label}”? Any MCP client using it will immediately lose access.`}
+        confirmText="Revoke"
+        onConfirm={revokeKey}
+        onCancel={() => setRevokeTarget(null)}
+      />
+    </div>
+  );
+}
+
+
 export default function AdminSettingsPage({ onLogout, onNavigate, subParts = [], navigate, user }) {
-  const VALID_TABS = ['general', 'tags', 'category', 'fields', 'whatsapp-accounts', 'users'];
+  // 'google-integrations' kept as a back-compat deep link (old bookmarks /
+  // any cached OAuth redirects) — it maps onto Integrations → Google below.
+  const VALID_TABS = ['general', 'tags', 'category', 'fields', 'whatsapp-accounts', 'integrations', 'google-integrations', 'mcp', 'users'];
   // Admins see every tab; other roles see only tabs granted by their pages
   // (e.g. Sales users get General only).
   const visibleTabs = (user?.role === 'admin' || !Array.isArray(user?.pages))
@@ -1520,11 +1936,6 @@ export default function AdminSettingsPage({ onLogout, onNavigate, subParts = [],
     setCategoryDetailId(null);
   };
 
-  const handleRequestAddCategory = () => {
-    setShowCategoryAddForm(true);
-    setActiveTab('category');
-  };
-
   const renderTab = () => {
     if (loading) {
       return (
@@ -1556,6 +1967,11 @@ export default function AdminSettingsPage({ onLogout, onNavigate, subParts = [],
       );
       case 'fields': return <FieldsTab fields={fields} onRefresh={refresh} />;
       case 'whatsapp-accounts': return <WhatsappAccountsTab />;
+      case 'integrations': return <IntegrationsTab subParts={subParts} navigate={navigate} />;
+      // Back-compat: old #/admin-settings/google-integrations links land on the
+      // Google detail view inside the renamed Integrations tab.
+      case 'google-integrations': return <IntegrationsTab subParts={['integrations', 'google']} navigate={navigate} />;
+      case 'mcp': return <McpToolsTab />;
       case 'users': return <UsersTab currentUser={user} />;
       default: return <GeneralTab onLogout={onLogout} user={user} />;
     }

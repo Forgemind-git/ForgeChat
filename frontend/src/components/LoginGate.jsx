@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Lock, LogIn, Eye, EyeOff, Shield } from 'lucide-react';
+import { Lock, LogIn, Eye, EyeOff } from 'lucide-react';
 import { api } from '../api.js';
 import { C, FONT } from '../constants.js';
 
@@ -110,38 +110,30 @@ export default function LoginGate({ onLogin }) {
             lineHeight: 1.6,
             marginBottom: 40,
           }}>
-            The unified WhatsApp Business platform for teams. Automate replies, build chatbots, and nurture leads — all in one place.
+            Reply to WhatsApp chats, build templates, send broadcasts, and automate responses — all from one place for your team.
           </p>
 
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 12,
-            padding: '14px 18px',
-            borderRadius: 12,
-            background: C.headerSurface,
-            border: `1px solid ${C.headerBorder}`,
-            maxWidth: 340,
-          }}>
-            <Shield size={20} color={C.primary} />
-            <span style={{ fontSize: 13, fontWeight: 600, color: '#d4d4d8' }}>
-              Enterprise-grade security & compliance
-            </span>
-          </div>
         </div>
 
-        <div style={{
-          position: 'absolute',
-          bottom: 32,
-          left: 64,
-          fontSize: 10,
-          fontWeight: 600,
-          color: '#52525b',
-          letterSpacing: '.06em',
-          textTransform: 'uppercase',
-        }}>
-          Powered by FMOS
-        </div>
+        <a
+          href="https://forgemind.in/"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            position: 'absolute',
+            bottom: 32,
+            left: 64,
+            fontSize: 10,
+            fontWeight: 600,
+            color: '#52525b',
+            letterSpacing: '.06em',
+            textTransform: 'uppercase',
+            textDecoration: 'none',
+            cursor: 'pointer',
+          }}
+        >
+          FORGEMIND <span style={{ color: C.primary }}>AI</span>
+        </a>
       </div>
 
       {/* Right form panel */}

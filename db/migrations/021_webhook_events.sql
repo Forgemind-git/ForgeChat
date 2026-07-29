@@ -1,4 +1,4 @@
--- Webhook audit log: stores every inbound Meta/n8n webhook payload + processing
+-- Webhook audit log: stores every inbound Meta webhook payload + processing
 -- outcome. Used by the Admin Settings → Webhooks tab for debugging delivery
 -- pipelines, replaying failed payloads, and verifying message extraction.
 --
@@ -8,7 +8,7 @@
 CREATE TABLE IF NOT EXISTS coexistence.webhook_events (
   id                 BIGSERIAL PRIMARY KEY,
   received_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  source             TEXT,                     -- 'meta' | 'n8n' | 'replay' | 'verify'
+  source             TEXT,                     -- 'meta' | 'replay' | 'verify'
   remote_ip          TEXT,
   request_headers    JSONB,
   payload            JSONB NOT NULL,

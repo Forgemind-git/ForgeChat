@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-17
+
+### Fixed
+- **Media-template broadcasts** — broadcasting an approved template with a Media
+  Library header image failed immediately (status went *Pending → Failed* with
+  nothing sent), even though *Send Test* of the same template delivered fine.
+  The broadcast now resolves the header image from the template's own saved
+  media (just like Send Test), and the Bulk Message screen pre-fills it, so
+  template broadcasts send correctly with their image.
+
+## [1.2.0] - 2026-06-10
+
+### Added
+- **Google Sheets `upsert` for agents** — an agent finds a contact's existing
+  row by a key column (e.g. phone number) and updates only the columns you name,
+  or adds a new row if none exists. No duplicate rows and no row-number/column
+  tracking — the reliable way to keep one evolving row per contact.
+- **CRM write-back tools** — an agent can act on its own conversation's contact
+  inside ForgeChat: save the name, add tags, and set custom fields (gated by an
+  "Update CRM" toggle on the agent).
+- **Human handoff** — an `escalate_to_human` tool, configurable handoff keywords,
+  and round-robin assignment to a chosen set of team members. Handing off pauses
+  the bot for that conversation; a take-over toggle in the chat header lets a
+  teammate take over or return the chat to the bot.
+- **Auto-summary on close** — when a conversation goes idle, the agent writes a
+  final summary to the sheet/CRM, so a row reflects the whole chat.
+- **"New conversations only" trigger** — an agent engages a contact only on
+  their first-ever message and never joins conversations that already existed.
+- **MCP agent-builder server** (stdio + remote HTTP) — build and configure
+  agents by chatting with Claude, including `read_sheet_values` and the Sheets
+  `upsert` op over MCP.
+
+## [1.1.0] - 2026-06-04
+
+### Added
+- **AI agents that reply for you** — connect an AI model and an agent answers
+  customers automatically. Shape it with a plain-English system prompt,
+  conversation context, and tools; trigger on keyword / any-message / new
+  contact; and let it send media back to the customer.
+- **AI model connectors** — OpenAI and Anthropic (Claude) providers, managed in
+  **Settings → AI Models**; the automation builder can target an agent as a block.
+- **Google integration (Sheets & Drive)** — an agent can look up rows in Google
+  Sheets and use Drive files. Google **Client ID / Secret / redirect are entered
+  in Settings → Integrations** and stored encrypted in the database — no env files.
+- **Voice-note understanding** — incoming WhatsApp audio is transcribed and
+  answered like any text message.
+- **WhatsApp-style template rendering** — chat and broadcast previews now render
+  approved templates the way WhatsApp shows them, including `{{1}}` variable
+  substitution and image headers.
+- **Custom-text variables in broadcasts** — map per-recipient custom text into
+  template variables when sending a bulk broadcast.
+- A bundled **`docker-compose.yml`** (plus a `docker-compose.prod.yml` overlay) so
+  a fresh clone runs with a single `docker compose up -d`, plus clearer macOS /
+  Docker Desktop setup notes in the README.
+
+### Changed
+- **Brand-language pass for Meta / WhatsApp guidelines:** dropped "official … /
+  unofficial hack" framing in README, reworded the login splash to no longer
+  read as if ForgeChat *is* the WhatsApp Business Platform, switched API/account
+  naming to the documented "WhatsApp Cloud API" and "WhatsApp Business Account",
+  scoped trademark ownership in `TRADEMARK.md` to **Forgemind AI** only and
+  added a third-party trademarks section acknowledging Meta / WhatsApp marks,
+  and added an affiliation disclaimer to the README footer.
+
 ## [1.0.1] - 2026-05-24
 
 ### Added
@@ -74,6 +138,7 @@ WhatsApp Cloud API.
   interpolation).
 - `helmet` and a 600 req/min/user rate limiter on the API surface.
 
-[Unreleased]: https://github.com/Forgemind-git/ForgeChat/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/Forgemind-git/ForgeChat/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/Forgemind-git/ForgeChat/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/Forgemind-git/ForgeChat/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Forgemind-git/ForgeChat/releases/tag/v1.0.0

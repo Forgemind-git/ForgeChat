@@ -8,7 +8,6 @@ const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'voice', 'document', 'st
 /* ── Global single-audio controller ────────────────────────────────── */
 const globalAudioControllers = new Set();
 
-function isImageMime(m) { return (m || '').startsWith('image/'); }
 function formatBytes(n) {
   if (!n) return '';
   if (n < 1024) return `${n} B`;
@@ -616,13 +615,24 @@ export default function MessageBubble({ message, isOutgoing, senderAvatarUrl, co
               </div>
             )}
             {mediaHeader && (
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6,
-                padding: '6px 8px', borderRadius: 6, background: 'rgba(0,0,0,0.04)',
-                color: C.textSecondary, fontSize: 11, fontFamily: FONT,
-              }}>
-                <HeaderMediaIcon size={14} /> {String(tm.header_type).charAt(0) + String(tm.header_type).slice(1).toLowerCase()} header
-              </div>
+              tm.header_media_library_id && tm.header_type === 'IMAGE' ? (
+                <img
+                  src={api.mediaLibrary.downloadUrl(tm.header_media_library_id)}
+                  alt=""
+                  style={{
+                    display: 'block', width: 'calc(100% + 16px)', margin: '-6px -7px 6px -9px',
+                    maxHeight: 200, objectFit: 'cover', borderRadius: '7px 7px 0 0',
+                  }}
+                />
+              ) : (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6,
+                  padding: '6px 8px', borderRadius: 6, background: 'rgba(0,0,0,0.04)',
+                  color: C.textSecondary, fontSize: 11, fontFamily: FONT,
+                }}>
+                  <HeaderMediaIcon size={14} /> {String(tm.header_type).charAt(0) + String(tm.header_type).slice(1).toLowerCase()} header
+                </div>
+              )
             )}
             {/* Body */}
             <div style={{ fontSize: 13.5, lineHeight: 1.5, fontFamily: FONT, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>

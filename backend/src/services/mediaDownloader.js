@@ -8,8 +8,26 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const pool = require('../db');
 const { getMediaInfo, downloadMediaBinary } = require('../integrations/metaMedia');
+const { decrypt } = require('../util/crypto');
 
 const pexecFile = promisify(execFile);
+
+// Resolve the per-account Meta access token for a business number. `wa_number`
+// on chat_history is the account's own display phone; match it (digits-only, to
+// tolerate '+'/spaces) or the phone_number_id. Returns null when not found, so
+// metaMedia falls back to the META_ACCESS_TOKEN env var if one is set.
+async function resolveAccountToken(waNumber) {
+  if (!waNumber) return null;
+  const { rows } = await pool.query(
+    `SELECT access_token_encrypted FROM coexistence.whatsapp_accounts
+      WHERE regexp_replace(display_phone_number, '[^0-9]', '', 'g') = regexp_replace($1, '[^0-9]', '', 'g')
+         OR phone_number_id = $1
+      LIMIT 1`,
+    [String(waNumber)]
+  );
+  if (!rows[0]?.access_token_encrypted) return null;
+  try { return decrypt(rows[0].access_token_encrypted) || null; } catch { return null; }
+}
 const MEDIA_DIR = process.env.MEDIA_DIR || '/app/media';
 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'voice', 'document', 'sticker']);
 const TRANSCODE_AUDIO = process.env.MEDIA_TRANSCODE_AUDIO !== 'false';  // default on
@@ -100,8 +118,9 @@ async function downloadOne(messageId) {
   try {
     await markStatus(messageId, 'downloading', { media_error: null });
 
-    const info = await getMediaInfo(mediaId);
-    const bin = await downloadMediaBinary(info.url);
+    const accessToken = await resolveAccountToken(row.wa_number);
+    const info = await getMediaInfo(mediaId, accessToken);
+    const bin = await downloadMediaBinary(info.url, accessToken);
     const mime = info.mime_type || bin.contentType;
     const ext = extFor(mime);
     const ts = row.timestamp ? new Date(row.timestamp) : new Date();

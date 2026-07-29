@@ -5,13 +5,16 @@ RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 
-COPY package.json ./
+# Build context is the repo ROOT (see docker-compose.yml: context: .) so the
+# boot-time migration runner can copy db/migrations into the image.
+COPY backend/package.json ./
 RUN npm install --omit=dev
 
-COPY src/ ./src/
-COPY scripts/ ./scripts/
+COPY backend/src/ ./src/
+COPY backend/scripts/ ./scripts/
+COPY db/migrations/ ./db/migrations/
 
 ENV NODE_ENV=production
-EXPOSE 3003
+EXPOSE 3011
 
 CMD ["node", "src/index.js"]

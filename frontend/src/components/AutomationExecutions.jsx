@@ -3,6 +3,7 @@ import { ArrowLeft, Loader2, CheckCircle2, XCircle, AlertCircle, Clock, RefreshC
 import { api } from '../api.js';
 import { FONT, MONO, maskPhone } from '../constants.js';
 import ExecutionFlowCanvas from './ExecutionFlowCanvas.jsx';
+import SearchableSelect from './SearchableSelect.jsx';
 
 /* ── Design Tokens ──────────────────────────────────────────────────────────── */
 const C = {
@@ -381,43 +382,43 @@ function FilterBar({ filters, onChange, onApply, onReset }) {
           <div style={{ display: 'flex', gap: 8 }}>
             <div style={{ flex: 1 }}>
               <label style={{ display: 'block', fontSize: 10, fontWeight: 700, color: C.t5, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.06em' }}>Flow Status</label>
-              <select
+              <SearchableSelect
                 value={status}
-                onChange={e => onChange({ ...filters, status: e.target.value })}
-                style={{
-                  width: '100%', padding: '6px 8px', borderRadius: 8,
-                  border: `1.5px solid ${C.cardBorder}`, fontSize: 11, fontFamily: FONT,
-                  background: '#fff', color: C.t2, outline: 'none', cursor: 'pointer',
-                }}
-              >
-                <option value="all">All statuses</option>
-                <option value="success">Success</option>
-                <option value="error">Error</option>
-                <option value="running">Running</option>
-                <option value="paused">Waiting for reply</option>
-                <option value="queued">Queued</option>
-                <option value="cancelled">Cancelled</option>
-              </select>
+                onChange={val => onChange({ ...filters, status: val })}
+                options={[
+                  { value: 'all', label: 'All statuses' },
+                  { value: 'success', label: 'Success' },
+                  { value: 'error', label: 'Error' },
+                  { value: 'running', label: 'Running' },
+                  { value: 'paused', label: 'Waiting for reply' },
+                  { value: 'queued', label: 'Queued' },
+                  { value: 'cancelled', label: 'Cancelled' },
+                ]}
+                placeholder="All statuses"
+                searchPlaceholder="Search…"
+                style={{ width: '100%' }}
+                triggerStyle={{ padding: '6px 28px 6px 8px', fontSize: 11 }}
+              />
             </div>
             <div style={{ flex: 1 }}>
               <label style={{ display: 'block', fontSize: 10, fontWeight: 700, color: C.t5, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.06em' }}>Message Status</label>
-              <select
+              <SearchableSelect
                 value={messageStatus}
-                onChange={e => onChange({ ...filters, messageStatus: e.target.value })}
-                style={{
-                  width: '100%', padding: '6px 8px', borderRadius: 8,
-                  border: `1.5px solid ${C.cardBorder}`, fontSize: 11, fontFamily: FONT,
-                  background: '#fff', color: C.t2, outline: 'none', cursor: 'pointer',
-                }}
-              >
-                <option value="all">All messages</option>
-                <option value="sent">Sent</option>
-                <option value="delivered">Delivered</option>
-                <option value="read">Read</option>
-                <option value="received">Received</option>
-                <option value="accepted">Accepted</option>
-                <option value="failed">Failed</option>
-              </select>
+                onChange={val => onChange({ ...filters, messageStatus: val })}
+                options={[
+                  { value: 'all', label: 'All messages' },
+                  { value: 'sent', label: 'Sent' },
+                  { value: 'delivered', label: 'Delivered' },
+                  { value: 'read', label: 'Read' },
+                  { value: 'received', label: 'Received' },
+                  { value: 'accepted', label: 'Accepted' },
+                  { value: 'failed', label: 'Failed' },
+                ]}
+                placeholder="All messages"
+                searchPlaceholder="Search…"
+                style={{ width: '100%' }}
+                triggerStyle={{ padding: '6px 28px 6px 8px', fontSize: 11 }}
+              />
             </div>
           </div>
 

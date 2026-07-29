@@ -14,6 +14,9 @@ async function req(path, opts = {}) {
 export const api = {
   auth: {
     me: () => req('/auth/me'),
+    status: () => req('/auth/status'),
+    setup: (email, password, displayName) =>
+      req('/auth/setup', { method: 'POST', body: JSON.stringify({ email, password, displayName }) }),
     login: (email, password) =>
       req('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
     logout: () => req('/auth/logout', { method: 'POST' }),
@@ -45,6 +48,10 @@ export const api = {
     req(`/saved-contacts?waNumber=${encodeURIComponent(waNumber)}`),
   deleteContact: (waNumber, contactNumber) =>
     req(`/contact?waNumber=${encodeURIComponent(waNumber)}&contactNumber=${encodeURIComponent(contactNumber)}`, { method: 'DELETE' }),
+  // Change a contact's phone number — migrates the conversation + history across
+  // every table keyed on (wa_number, contact_number), transactionally.
+  changeContactNumber: (waNumber, oldNumber, newNumber) =>
+    req('/contacts/change-number', { method: 'POST', body: JSON.stringify({ waNumber, oldNumber, newNumber }) }),
   // Same-origin download URL for the sample import sheet — the auth cookie rides
   // along on a plain anchor navigation.
   importContactsTemplateUrl: () => '/api/contacts/import/template',
@@ -131,6 +138,8 @@ export const api = {
     update: (id, data) => req(`/chatbots/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
     duplicate: (id) => req(`/chatbots/${id}/duplicate`, { method: 'POST' }),
     delete: (id) => req(`/chatbots/${id}`, { method: 'DELETE' }),
+    exportOne: (id) => req(`/chatbots/${id}/export`),
+    import: (payload) => req('/chatbots/import', { method: 'POST', body: JSON.stringify(payload) }),
     executions: (id, { page = 1, limit = 20, status = 'all', startDate = '', endDate = '', messageStatus = 'all' } = {}) => {
       const qs = new URLSearchParams({ page: String(page), limit: String(limit) });
       if (status && status !== 'all') qs.set('status', status);
@@ -146,10 +155,90 @@ export const api = {
   },
   whatsappAccounts: {
     list: (activeOnly = false) => req(`/whatsapp-accounts${activeOnly ? '?activeOnly=true' : ''}`),
-    get: (id, reveal = false) => req(`/whatsapp-accounts/${id}${reveal ? '?reveal=1' : ''}`),
+    get: (id) => req(`/whatsapp-accounts/${id}`),
     create: (data) => req('/whatsapp-accounts', { method: 'POST', body: JSON.stringify(data) }),
     update: (id, data) => req(`/whatsapp-accounts/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
     delete: (id) => req(`/whatsapp-accounts/${id}`, { method: 'DELETE' }),
+  },
+  // Google integrations (v1: Google Sheets only; Gmail + Calendar in a later
+  // release reuse the same /google-integrations table and OAuth flow).
+  googleIntegrations: {
+    status: () => req('/google-integrations/status'),
+    // Admin-only: the workspace Google OAuth app credentials (Client ID /
+    // Secret / Redirect URI). getCredentials never returns the secret.
+    getCredentials: (reveal = false) => req(`/google-integrations/credentials${reveal ? '?reveal=1' : ''}`),
+    saveCredentials: (data) =>
+      req('/google-integrations/credentials', { method: 'PUT', body: JSON.stringify(data) }),
+    deleteCredentials: () =>
+      req('/google-integrations/credentials', { method: 'DELETE' }),
+    list: () => req('/google-integrations'),
+    authorize: () => req('/google-integrations/authorize', { method: 'POST' }),
+    disconnect: (id) => req(`/google-integrations/${id}`, { method: 'DELETE' }),
+    listSpreadsheets: (id, q = '') =>
+      req(`/google-integrations/${id}/spreadsheets${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+    listTabs: (id, spreadsheetId) =>
+      req(`/google-integrations/${id}/spreadsheets/${encodeURIComponent(spreadsheetId)}/tabs`),
+  },
+  // AI Models registry — workspace-wide LLM provider credentials (Admin
+  // Settings → Integrations → AI Models). Agents reference a row by id; the key
+  // is encrypted server-side and only revealed to admins via ?reveal=1.
+  aiModels: {
+    list: () => req('/ai-models'),
+    get: (id, reveal = false) => req(`/ai-models/${id}${reveal ? '?reveal=1' : ''}`),
+    create: (data) => req('/ai-models', { method: 'POST', body: JSON.stringify(data) }),
+    update: (id, data) => req(`/ai-models/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+    delete: (id) => req(`/ai-models/${id}`, { method: 'DELETE' }),
+  },
+  // AI Agents — standalone LLM-driven chat handlers bound to a WhatsApp account.
+  agents: {
+    list: () => req('/agents'),
+    get: (id, reveal = false) => req(`/agents/${id}${reveal ? '?reveal=1' : ''}`),
+    create: (data) => req('/agents', { method: 'POST', body: JSON.stringify(data) }),
+    update: (id, data) => req(`/agents/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+    delete: (id) => req(`/agents/${id}`, { method: 'DELETE' }),
+    exportOne: (id) => req(`/agents/${id}/export`),
+    import: (payload) => req('/agents/import', { method: 'POST', body: JSON.stringify(payload) }),
+    runs: (id, limit = 50) => req(`/agents/${id}/runs?limit=${limit}`),
+    run: (id, runId) => req(`/agents/${id}/runs/${runId}`),
+    addTool: (id, data) => req(`/agents/${id}/tools`, { method: 'POST', body: JSON.stringify(data) }),
+    updateTool: (id, toolId, data) =>
+      req(`/agents/${id}/tools/${toolId}`, { method: 'PUT', body: JSON.stringify(data) }),
+    removeTool: (id, toolId) => req(`/agents/${id}/tools/${toolId}`, { method: 'DELETE' }),
+    // Dry-run an agent without sending the reply to WhatsApp — used by the
+    // "Test chat" panel inside the agent editor.
+    test: (id, messages) => req(`/agents/${id}/test`, {
+      method: 'POST', body: JSON.stringify({ messages }),
+    }),
+    // Transcribe a voice note recorded in the test chat (mic button).
+    testTranscribe: (id, audioBlob, filename = 'voice.webm') => {
+      const form = new FormData();
+      form.append('audio', audioBlob, filename);
+      return fetch(`/api/agents/${id}/test/transcribe`, {
+        method: 'POST', credentials: 'include', body: form,
+      }).then(async res => {
+        if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`${res.status} ${t}`); }
+        return res.json();
+      });
+    },
+  },
+  // Per-conversation bot control (Chats header 🤖 toggle).
+  agentConversation: {
+    status: (waNumber, contactNumber) =>
+      req(`/agent-conversation?waNumber=${encodeURIComponent(waNumber)}&contactNumber=${encodeURIComponent(contactNumber)}`),
+    pause: (waNumber, contactNumber) =>
+      req('/agent-conversation/pause', { method: 'POST', body: JSON.stringify({ waNumber, contactNumber }) }),
+    resume: (waNumber, contactNumber) =>
+      req('/agent-conversation/resume', { method: 'POST', body: JSON.stringify({ waNumber, contactNumber }) }),
+  },
+  // External MCP access — admin management of keys + capability toggles.
+  mcp: {
+    getSettings: () => req('/mcp/settings'),
+    updateSettings: (data) => req('/mcp/settings', { method: 'PUT', body: JSON.stringify(data) }),
+    listKeys: () => req('/mcp/keys'),
+    createKey: (label) => req('/mcp/keys', { method: 'POST', body: JSON.stringify({ label }) }),
+    updateKey: (id, data) => req(`/mcp/keys/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+    deleteKey: (id) => req(`/mcp/keys/${id}`, { method: 'DELETE' }),
+    install: () => req('/mcp/install'),
   },
   pipelines: {
     list: () => req('/pipelines'),

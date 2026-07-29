@@ -140,7 +140,8 @@ router.get('/templates', async (req, res) => {
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const { rows } = await pool.query(
-      `SELECT t.id, t.name, t.category, t.language, t.header_type, t.header_text, t.body, t.footer,
+      `SELECT t.id, t.name, t.category, t.language, t.header_type, t.header_text, t.media_handle,
+              t.header_media_library_id, t.body, t.footer,
               t.buttons, t.samples, t.security_recommendation, t.code_expiry_minutes,
               t.allow_category_change, t.status, t.meta_template_id, t.submitted_at,
               t.quality_score, t.rejection_reason, t.previous_category, t.last_synced_at,
@@ -170,7 +171,8 @@ router.get('/templates', async (req, res) => {
 router.get('/templates/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT t.id, t.name, t.category, t.language, t.header_type, t.header_text, t.media_handle, t.body, t.footer,
+      `SELECT t.id, t.name, t.category, t.language, t.header_type, t.header_text, t.media_handle,
+              t.header_media_library_id, t.body, t.footer,
               t.buttons, t.samples, t.security_recommendation, t.code_expiry_minutes,
               t.allow_category_change, t.status, t.meta_template_id, t.submitted_at,
               t.quality_score, t.rejection_reason, t.previous_category, t.last_synced_at,
@@ -227,8 +229,8 @@ router.post('/templates', requirePermission('template-builder'), async (req, res
     `INSERT INTO coexistence.message_templates
      (name, category, language, header_type, header_text, media_handle, body, footer,
       buttons, samples, security_recommendation, code_expiry_minutes, allow_category_change, status,
-      whatsapp_account_id, template_group_key)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      whatsapp_account_id, template_group_key, header_media_library_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
      RETURNING *`,
     [
       data.name, data.category, data.language, data.header_type || 'NONE',
@@ -238,6 +240,7 @@ router.post('/templates', requirePermission('template-builder'), async (req, res
       data.allow_category_change !== false, 'DRAFT',
       data.whatsappAccountId || null,
       String(data.name || '').toLowerCase(),
+      data.header_media_library_id || null,
     ]
   );
   res.status(201).json(rows[0]);
@@ -332,6 +335,7 @@ router.put('/templates/:id', requirePermission('template-builder'), async (req, 
         status = $15,
         meta_template_id = CASE WHEN $16::boolean THEN meta_template_id ELSE NULL END,
         submitted_at = CASE WHEN $16::boolean THEN NOW() ELSE NULL END,
+        header_media_library_id = $18,
         updated_at = NOW()
        WHERE id = $17
        RETURNING *`,
@@ -346,6 +350,7 @@ router.put('/templates/:id', requirePermission('template-builder'), async (req, 
         newStatus,
         isApprovedEdit,
         req.params.id,
+        data.header_media_library_id || null,
       ]
     );
     await client.query('COMMIT');
@@ -473,9 +478,55 @@ const { listTemplates: metaListTemplates, deleteTemplate: metaDeleteTemplate, ed
  * Internal helper — sync templates for one WABA from Meta and upsert into
  * local DB. Returns { updated, total } counts.
  */
+// Reverse of buildPayload: turn Meta's components[] back into our local fields
+// so a template that exists on Meta (e.g. the pre-approved hello_world, or one
+// created directly in Business Manager) can be imported and used in the app.
+function parseMetaComponents(components = []) {
+  const out = {
+    header_type: 'NONE', header_text: null, body: '', footer: null,
+    buttons: [], samples: {}, security_recommendation: false, code_expiry_minutes: null,
+  };
+  const varsIn = (s) => (String(s || '').match(/\{\{\s*(\w+)\s*\}\}/g) || []).map(v => v.replace(/[{}\s]/g, ''));
+  for (const c of components || []) {
+    const type = String(c.type || '').toUpperCase();
+    if (type === 'HEADER') {
+      out.header_type = String(c.format || 'TEXT').toUpperCase();
+      if (out.header_type === 'TEXT') {
+        out.header_text = c.text || null;
+        const hv = varsIn(c.text);
+        if (hv[0] && c.example?.header_text?.[0] != null) out.samples[hv[0]] = c.example.header_text[0];
+      }
+      // Media headers (IMAGE/VIDEO/DOCUMENT): the Meta handle isn't recoverable
+      // from a list, so header_type is set but no media is attached.
+    } else if (type === 'BODY') {
+      out.body = c.text || '';
+      if (c.add_security_recommendation) out.security_recommendation = true;
+      const bv = varsIn(c.text);
+      const ex = c.example?.body_text?.[0] || [];
+      bv.forEach((v, i) => { if (ex[i] != null) out.samples[v] = ex[i]; });
+    } else if (type === 'FOOTER') {
+      if (c.code_expiration_minutes != null) out.code_expiry_minutes = c.code_expiration_minutes;
+      else out.footer = c.text || null;
+    } else if (type === 'BUTTONS') {
+      out.buttons = (c.buttons || []).map(b => {
+        const bt = String(b.type || '').toUpperCase();
+        if (bt === 'URL') return { type: 'URL', text: b.text, value: b.url, urlSample: b.example?.[0] || '' };
+        if (bt === 'PHONE_NUMBER') return { type: 'PHONE_NUMBER', text: b.text, value: b.phone_number };
+        if (bt === 'COPY_CODE') return { type: 'COPY_CODE', value: (b.example && b.example[0]) || '' };
+        if (bt === 'OTP') return { type: 'OTP', text: b.text, otpType: b.otp_type, packageName: b.package_name, signatureHash: b.signature_hash };
+        return { type: 'QUICK_REPLY', text: b.text };
+      });
+    }
+  }
+  return out;
+}
+
 async function syncAccountTemplates(account) {
-  const remote = await metaListTemplates(account.wabaId, account.accessToken);
+  const remote = await metaListTemplates(account.wabaId, account.accessToken, {
+    fields: 'name,language,status,category,previous_category,quality_score,rejected_reason,id,components',
+  });
   let updated = 0;
+  let imported = 0;
   for (const r of remote) {
     const status = (r.status || 'PENDING').toUpperCase();
     const localStatus = status === 'PENDING' ? 'SUBMITTED' : status; // PAUSED, DISABLED, APPROVED, REJECTED pass through
@@ -506,9 +557,43 @@ async function syncAccountTemplates(account) {
         r.language,
       ]
     );
-    if (result.rowCount > 0) updated++;
+    if (result.rowCount > 0) {
+      updated++;
+    } else {
+      // Exists on Meta but not locally → import it so the app can use it
+      // (e.g. the pre-approved hello_world, or templates made in Business Manager).
+      const p = parseMetaComponents(r.components);
+      await pool.query(
+        `INSERT INTO coexistence.message_templates
+           (name, category, language, header_type, header_text, body, footer, buttons, samples,
+            security_recommendation, code_expiry_minutes, status, meta_template_id,
+            whatsapp_account_id, template_group_key, quality_score, previous_category,
+            last_synced_at, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),NOW(),NOW())`,
+        [
+          r.name,
+          r.category ? String(r.category).toUpperCase() : 'UTILITY',
+          r.language,
+          p.header_type,
+          p.header_text,
+          p.body,
+          p.footer,
+          JSON.stringify(p.buttons || []),
+          JSON.stringify(p.samples || {}),
+          p.security_recommendation || false,
+          p.code_expiry_minutes,
+          localStatus,
+          r.id || null,
+          account.id,
+          String(r.name || '').toLowerCase(),
+          qs || null,
+          r.previous_category || null,
+        ]
+      );
+      imported++;
+    }
   }
-  return { updated, total: remote.length };
+  return { updated, imported, total: remote.length };
 }
 
 /**
@@ -554,13 +639,14 @@ async function syncAllAccountTemplates() {
   const { rows: accs } = await pool.query(
     `SELECT * FROM coexistence.whatsapp_accounts WHERE is_active = TRUE`
   );
-  let totalUpdated = 0, totalRemote = 0;
+  let totalUpdated = 0, totalImported = 0, totalRemote = 0;
   for (const r of accs) {
     const account = await getAccountWithToken(r.id);
     if (!account?.accessToken) continue;
     try {
       const result = await syncAccountTemplates(account);
       totalUpdated += result.updated;
+      totalImported += result.imported || 0;
       totalRemote += result.total;
       await markAccountHealth(account.id, 'healthy');
     } catch (err) {
@@ -568,7 +654,7 @@ async function syncAllAccountTemplates() {
       await markAccountHealth(account.id, classifyMetaError(err), err.message);
     }
   }
-  return { accountsScanned: accs.length, totalUpdated, totalRemote };
+  return { accountsScanned: accs.length, totalUpdated, totalImported, totalRemote };
 }
 
 /**
@@ -623,11 +709,6 @@ router.post('/templates/bulk-submit', requirePermission('template-builder'), asy
     const results = [];
     for (const id of ids) {
       try {
-        const fakeReq = { params: { id }, body: {} };
-        const fakeRes = { _status: 200, _body: null,
-          status(c) { this._status = c; return this; },
-          json(b) { this._body = b; return this; },
-        };
         // Re-invoke the existing /:id/submit handler logic inline by calling it
         await new Promise((resolve) => {
           submitOneInline(id).then(out => {
@@ -706,6 +787,7 @@ router.get('/templates/:id/payload', async (req, res) => {
  */
 const { resolveAccount, insertPendingRow } = require('../services/messageSender');
 const { enqueueSend } = require('../queue/sendQueue');
+const { buildTemplateComponents, resolveTemplateText } = require('../services/templateComponents');
 
 router.post('/templates/:id/test-send', requirePermission('template-builder'), async (req, res) => {
   try {
@@ -713,7 +795,9 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
     if (!to) return res.status(400).json({ error: 'to (recipient phone) required' });
 
     const { rows } = await pool.query(
-      `SELECT id, name, language, body, whatsapp_account_id FROM coexistence.message_templates WHERE id = $1`,
+      `SELECT id, name, language, header_type, header_text, body, buttons, samples,
+              media_handle, header_media_library_id, whatsapp_account_id
+         FROM coexistence.message_templates WHERE id = $1`,
       [req.params.id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Template not found' });
@@ -723,14 +807,36 @@ router.post('/templates/:id/test-send', requirePermission('template-builder'), a
     const { account, error } = await resolveAccount({ accountId: tpl.whatsapp_account_id });
     if (error) return res.status(400).json({ error });
 
-    // Build components from sampleValues (sorted numerically by var index)
-    const keys = Object.keys(sampleValues).sort((a, b) => +a - +b);
-    const components = keys.length > 0
-      ? [{ type: 'body', parameters: keys.map(k => ({ type: 'text', text: String(sampleValues[k] || ' ') })) }]
-      : [];
+    // Resolve a per-account Meta media id for media-header templates, so the
+    // required header parameter can be supplied (omitting it → Meta #131008).
+    let headerMediaId = null;
+    const ht = String(tpl.header_type || 'NONE').toUpperCase();
+    if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(ht) && tpl.header_media_library_id) {
+      try {
+        const { syncMediaToAccount } = require('./mediaLibrary');
+        const sync = await syncMediaToAccount(tpl.header_media_library_id, account.id);
+        headerMediaId = sync?.metaMediaId || null;
+      } catch (e) {
+        console.error('[templates] test-send media resolve failed:', e.message);
+      }
+    }
+
+    // Complete component set: header (media/text-var), body vars (falling back
+    // to the template's stored samples), and dynamic buttons (copy-code/URL).
+    const components = buildTemplateComponents({ template: tpl, values: sampleValues, headerMediaId });
 
     const localId = await insertPendingRow({
-      account, toNumber: to, messageType: 'template', messageBody: tpl.body || `Template: ${tpl.name}`,
+      account, toNumber: to, messageType: 'template',
+      // Resolved body (sample values) + full template_meta so the test message
+      // renders the real card in Chats — filled text, header image, buttons.
+      messageBody: resolveTemplateText(tpl.body, sampleValues, tpl.samples, null) || `Template: ${tpl.name}`,
+      templateMeta: {
+        header_type: tpl.header_type || 'NONE',
+        header_text: tpl.header_text || null,
+        header_media_library_id: tpl.header_media_library_id || null,
+        footer: tpl.footer || null,
+        buttons: Array.isArray(tpl.buttons) ? tpl.buttons : (tpl.buttons || []),
+      },
     });
     await enqueueSend({
       kind: 'template',

@@ -1,5 +1,5 @@
 -- 001: ForgeChat Chat History Schema
--- Stores WhatsApp messages received via Meta Cloud API webhooks (processed by n8n)
+-- Stores WhatsApp messages received via Meta Cloud API webhooks
 
 CREATE SCHEMA IF NOT EXISTS coexistence;
 

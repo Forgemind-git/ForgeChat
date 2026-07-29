@@ -76,6 +76,37 @@ export function maskPhone(raw) {
   return digits.slice(0, 2) + '*'.repeat(digits.length - 5) + digits.slice(-3);
 }
 
+// Tag colors are stored as pale pastels (good as light fills, unreadable with
+// the white chip text). Darken a hex color so a white label reads clearly while
+// the tag keeps its own hue. Falls back to a dark slate for missing/invalid.
+export function darkenColor(hex, factor = 0.5) {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex || '');
+  if (!m) return '#374151';
+  const n = parseInt(m[1], 16);
+  const r = Math.round(((n >> 16) & 255) * factor);
+  const g = Math.round(((n >> 8) & 255) * factor);
+  const b = Math.round((n & 255) * factor);
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+// Trigger a client-side download of a JS object as a pretty-printed .json file.
+export function downloadJson(filename, obj) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename.endsWith('.json') ? filename : `${filename}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Slugify a name into a safe filename fragment.
+export function slugifyName(name) {
+  return String(name || 'export').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'export';
+}
+
 export function formatDate(ts) {
   const d = new Date(ts);
   const now = new Date();

@@ -9,5 +9,5 @@ CREATE TABLE IF NOT EXISTS coexistence.wa_links (
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_wa_links_slug ON coexistence.wa_links (slug);
-CREATE INDEX idx_wa_links_created_at ON coexistence.wa_links (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wa_links_slug ON coexistence.wa_links (slug);
+CREATE INDEX IF NOT EXISTS idx_wa_links_created_at ON coexistence.wa_links (created_at DESC);

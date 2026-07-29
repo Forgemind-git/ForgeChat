@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Filter, ChevronDown, Check, X } from 'lucide-react';
+import { Filter, ChevronDown, Check, X, Search } from 'lucide-react';
 import { C, FONT } from '../constants.js';
 
 /**
@@ -11,6 +11,7 @@ import { C, FONT } from '../constants.js';
  */
 export default function TagMultiSelect({ categories = [], tags = [], selectedIds = [], onChange, minWidth = 200, placeholder = 'All tags' }) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
   const ref = useRef(null);
 
   useEffect(() => {
@@ -19,6 +20,9 @@ export default function TagMultiSelect({ categories = [], tags = [], selectedIds
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
   }, [open]);
+
+  // Clear the filter each time the popover opens so a stale query doesn't hide tags.
+  useEffect(() => { if (open) setQuery(''); }, [open]);
 
   const selected = new Set(selectedIds);
   const toggle = (id) => {
@@ -32,10 +36,16 @@ export default function TagMultiSelect({ categories = [], tags = [], selectedIds
     : count === 1 ? (tags.find(t => String(t.id) === String([...selected][0]))?.name || '1 tag')
     : `${count} tags`;
 
+  // Type-to-filter the tag list (matches the SearchableSelect search box). Only
+  // shown when there are enough tags to warrant it, mirroring the ≤5 auto-hide.
+  const q = query.trim().toLowerCase();
+  const match = (t) => !q || String(t.name).toLowerCase().includes(q);
+  const showSearch = tags.length > 5;
+
   const groups = categories
-    .map(cat => ({ cat, catTags: tags.filter(t => t.category_id === cat.id) }))
+    .map(cat => ({ cat, catTags: tags.filter(t => t.category_id === cat.id && match(t)) }))
     .filter(g => g.catTags.length > 0);
-  const uncategorized = tags.filter(t => !categories.some(c => c.id === t.category_id));
+  const uncategorized = tags.filter(t => !categories.some(c => c.id === t.category_id) && match(t));
 
   const Row = ({ tag }) => {
     const on = selected.has(tag.id);
@@ -70,9 +80,9 @@ export default function TagMultiSelect({ categories = [], tags = [], selectedIds
         onClick={() => setOpen(o => !o)}
         style={{
           width: '100%', display: 'flex', alignItems: 'center', gap: 8,
-          padding: '8px 10px', borderRadius: 8,
-          border: `1px solid ${count ? C.primary : C.border}`, background: C.cardBg,
-          cursor: 'pointer', fontFamily: FONT,
+          padding: '10px 12px', borderRadius: 8,
+          border: `1.5px solid ${(open || count) ? C.primary : C.border}`, background: 'var(--c-cardBg)',
+          cursor: 'pointer', fontFamily: FONT, boxSizing: 'border-box',
         }}
       >
         <Filter size={14} color={count ? C.primary : C.textMuted} style={{ flexShrink: 0 }} />
@@ -97,10 +107,29 @@ export default function TagMultiSelect({ categories = [], tags = [], selectedIds
           position: 'absolute', top: 'calc(100% + 4px)', left: 0,
           minWidth: Math.max(minWidth, 220), background: 'var(--c-cardBg)',
           border: `1px solid ${C.border}`, borderRadius: 10, boxShadow: C.shadowLg,
-          zIndex: 60, maxHeight: 320, overflowY: 'auto', padding: 6, fontFamily: FONT,
+          zIndex: 60, fontFamily: FONT, overflow: 'hidden',
         }}>
+          {showSearch && (
+            <div style={{ padding: 8, borderBottom: `1px solid ${C.border}` }}>
+              <div style={{ position: 'relative' }}>
+                <Search size={13} color={C.textMuted} style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
+                <input
+                  autoFocus
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                  placeholder="Search tags…"
+                  style={{
+                    width: '100%', padding: '7px 9px 7px 28px', borderRadius: 7,
+                    border: `1px solid ${C.border}`, fontSize: 12.5, fontFamily: FONT,
+                    color: C.text, outline: 'none', background: 'var(--c-cardBg)', boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          <div style={{ maxHeight: 280, overflowY: 'auto', padding: 6 }}>
           {groups.length === 0 && uncategorized.length === 0 && (
-            <div style={{ padding: 12, color: C.textMuted, fontSize: 12 }}>No tags available</div>
+            <div style={{ padding: 12, color: C.textMuted, fontSize: 12 }}>{q ? 'No matching tags' : 'No tags available'}</div>
           )}
           {groups.map(({ cat, catTags }) => (
             <div key={cat.id} style={{ marginBottom: 2 }}>
@@ -118,6 +147,7 @@ export default function TagMultiSelect({ categories = [], tags = [], selectedIds
               {uncategorized.map(tag => <Row key={tag.id} tag={tag} />)}
             </div>
           )}
+          </div>
         </div>
       )}
     </div>
