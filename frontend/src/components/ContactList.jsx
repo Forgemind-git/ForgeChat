@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react';
-import { Search, User } from 'lucide-react';
+import { Search, User, MoreVertical, Trash2 } from 'lucide-react';
 import { usePolling } from '../hooks/usePolling.js';
 import { api } from '../api.js';
 import { C, FONT, relativeTime, maskPhone, darkenColor } from '../constants.js';
 import TagMultiSelect from './TagMultiSelect.jsx';
+import DeleteConfirmModal from './DeleteConfirmModal.jsx';
 
-export default function ContactList({ waNumber, width = 380, selectedContact, onSelectContact, refreshKey, user }) {
+export default function ContactList({ waNumber, width = 380, selectedContact, onSelectContact, refreshKey, user, onChatDeleted }) {
   const [search, setSearch] = useState('');
   const [categories, setCategories] = useState([]);
   const [allTags, setAllTags] = useState([]);
@@ -25,6 +26,45 @@ export default function ContactList({ waNumber, width = 380, selectedContact, on
   }, [waNumber]);
   // Polling refresh (every 30s).
   const { data, loading, refetch } = usePolling(() => api.contacts(waNumber, '30d'), 30000);
+
+  // Per-row chat actions: which row's kebab menu is open, which row is hovered
+  // (the kebab only appears on hover so the list stays clean), and the pending
+  // delete — { contactNumber, mode } where mode is 'history' | 'contact'.
+  const [menuFor, setMenuFor] = useState(null);
+  const [hoverRow, setHoverRow] = useState(null);
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState(null);
+
+  // Any click outside a row menu dismisses it.
+  useEffect(() => {
+    if (!menuFor) return;
+    const onDown = () => setMenuFor(null);
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [menuFor]);
+
+  const runDelete = async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api.deleteChatHistory(waNumber, pendingDelete.contactNumber, {
+        withContact: pendingDelete.mode === 'contact',
+      });
+      const wasOpen = selectedContact === pendingDelete.contactNumber;
+      setPendingDelete(null);
+      refetch();
+      if (wasOpen) onChatDeleted?.();
+    } catch (err) {
+      const m = (err?.message || '').match(/^\d+\s+(.+)$/);
+      let msg = err?.message || 'Failed to delete chat';
+      try { if (m) msg = JSON.parse(m[1]).error || msg; } catch { /* keep raw */ }
+      setDeleteError(msg);
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   // Tag taxonomy for the filter dropdown.
   useEffect(() => {
@@ -124,9 +164,14 @@ export default function ContactList({ waNumber, width = 380, selectedContact, on
           const unread = Number(c.unread_count) || 0;
 
           return (
-            <button
+            <div
               key={c.contact_number}
+              role="button"
+              tabIndex={0}
               onClick={() => onSelectContact(c.contact_number)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectContact(c.contact_number); }
+              }}
               style={{
                 width: '100%',
                 display: 'flex',
@@ -142,8 +187,8 @@ export default function ContactList({ waNumber, width = 380, selectedContact, on
                 transition: 'background .1s',
                 position: 'relative',
               }}
-              onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = '#f5f6f6'; }}
-              onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = '#ffffff'; }}
+              onMouseEnter={e => { setHoverRow(c.contact_number); if (!isActive) e.currentTarget.style.background = '#f5f6f6'; }}
+              onMouseLeave={e => { setHoverRow(h => (h === c.contact_number ? null : h)); if (!isActive) e.currentTarget.style.background = '#ffffff'; }}
             >
               {/* Active indicator */}
               {isActive && (
@@ -222,9 +267,77 @@ export default function ContactList({ waNumber, width = 380, selectedContact, on
                   </div>
                 )}
               </div>
-            </button>
+
+              {/* Row actions — same two deletions as the in-chat 3-dot menu, so
+                  a chat can be cleared without opening it. Only rendered on
+                  hover (or while its menu is open) to keep the list quiet. */}
+              {(hoverRow === c.contact_number || menuFor === c.contact_number) && (
+                <div style={{ position: 'relative', flexShrink: 0, alignSelf: 'flex-start', marginTop: 2 }}>
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    title="Chat options"
+                    onMouseDown={e => e.stopPropagation()}
+                    onClick={e => {
+                      e.stopPropagation();
+                      setMenuFor(m => (m === c.contact_number ? null : c.contact_number));
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault(); e.stopPropagation();
+                        setMenuFor(m => (m === c.contact_number ? null : c.contact_number));
+                      }
+                    }}
+                    style={{
+                      width: 26, height: 26, borderRadius: '50%', cursor: 'pointer',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      color: C.textSecondary, background: 'transparent',
+                    }}
+                  >
+                    <MoreVertical size={16} />
+                  </div>
+                  {menuFor === c.contact_number && (
+                    <div
+                      onClick={e => e.stopPropagation()}
+                      onMouseDown={e => e.stopPropagation()}
+                      style={{
+                        position: 'absolute', top: '100%', right: 0,
+                        background: 'var(--c-cardBg)', borderRadius: 10,
+                        boxShadow: C.shadowLg, border: `1px solid ${C.border}`,
+                        minWidth: 200, zIndex: 60, overflow: 'hidden', fontFamily: FONT,
+                      }}
+                    >
+                      {[
+                        { mode: 'history', label: 'Delete chat history' },
+                        { mode: 'contact', label: 'Delete contact & chat' },
+                      ].map(item => (
+                        <div
+                          key={item.mode}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => {
+                            setMenuFor(null);
+                            setDeleteError(null);
+                            setPendingDelete({ contactNumber: c.contact_number, mode: item.mode, name: displayName });
+                          }}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: 10,
+                            padding: '10px 14px', cursor: 'pointer',
+                            fontSize: 13, fontWeight: 500, color: C.primary,
+                          }}
+                          onMouseEnter={e => { e.currentTarget.style.background = '#FEF2F2'; }}
+                          onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                        >
+                          <Trash2 size={15} color={C.primary} /><span>{item.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           );
-        })},
+        })}
 
         {contacts.length === 0 && !loading && (
           <div style={{ padding: 40, textAlign: 'center', color: C.textMuted, fontSize: 13 }}>
@@ -232,6 +345,23 @@ export default function ContactList({ waNumber, width = 380, selectedContact, on
           </div>
         )}
       </div>
+
+      <DeleteConfirmModal
+        open={!!pendingDelete}
+        title={pendingDelete?.mode === 'contact' ? 'Delete contact & chat' : 'Delete chat history'}
+        message={
+          <>
+            {pendingDelete?.mode === 'contact'
+              ? <>This permanently deletes every message with <b>{pendingDelete?.name}</b> on this WhatsApp number, along with their saved name, tags, custom fields and assignment.</>
+              : <>This permanently deletes every message with <b>{pendingDelete?.name}</b> on this WhatsApp number, including any photos, voice notes and documents. The contact’s name, tags and assignment are kept.</>}
+            <div style={{ marginTop: 10, color: C.primary, fontWeight: 600 }}>This cannot be undone.</div>
+            {deleteError && <div style={{ marginTop: 10, color: C.primary }}>{deleteError}</div>}
+          </>
+        }
+        confirmText={deleting ? 'Deleting…' : (pendingDelete?.mode === 'contact' ? 'Delete contact & chat' : 'Delete history')}
+        onConfirm={deleting ? () => {} : runDelete}
+        onCancel={() => { if (!deleting) { setPendingDelete(null); setDeleteError(null); } }}
+      />
     </div>
   );
 }

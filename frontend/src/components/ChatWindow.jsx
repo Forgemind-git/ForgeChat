@@ -7,9 +7,26 @@ import { C, FONT, MONO, maskPhone, darkenColor } from '../constants.js';
 import MessageBubble, { quoteSnippet } from './MessageBubble.jsx';
 import MaskedNumber from './MaskedNumber.jsx';
 import { CustomFieldEditor } from './CustomFieldInputs.jsx';
+import DeleteConfirmModal from './DeleteConfirmModal.jsx';
 
 // Monotonic delivery lifecycle — mirror of the backend STATUS_RANK. Used to
 // merge a live SSE tick onto the polled status without ever downgrading.
+// api.js throws `Error("<status> <raw body>")`. Unwrap the server's friendly
+// message so the UI never shows an HTTP code or a JSON blob. Same shape as the
+// prettyError used by the agent editor.
+function prettyError(e) {
+  if (!e) return 'Unknown error';
+  const msg = e.message || String(e);
+  try {
+    const m = msg.match(/^\d+\s+(.+)$/);
+    if (m) {
+      const body = JSON.parse(m[1]);
+      if (body && body.error) return body.error;
+    }
+  } catch { /* fall through */ }
+  return msg;
+}
+
 const STATUS_RANK = { sending: 0, sent: 1, delivered: 2, read: 3, played: 3, failed: 2 };
 const higherStatus = (a, b) => ((STATUS_RANK[b] ?? -1) > (STATUS_RANK[a] ?? -1) ? b : a);
 
@@ -80,7 +97,7 @@ function ForwardModal({ waNumber, message, onClose }) {
   );
 }
 
-export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) {
+export default function ChatWindow({ waNumber, contactNumber, onContactSaved, user, onChatDeleted }) {
   const [page, setPage] = useState(1);
   const [limit] = useState(50);
   const [search, setSearch] = useState('');
@@ -109,6 +126,11 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
   const [headerSaving, setHeaderSaving] = useState(false);
   const tagMenuRef = useRef(null);
   const assignMenuRef = useRef(null);
+  // Chat deletion: null | 'history' | 'contact' — drives which confirm copy the
+  // shared modal shows and which flag the API call sends.
+  const [deleteMode, setDeleteMode] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState(null);
 
   const fetchMessages = useCallback(() => {
     return api.messages({
@@ -776,6 +798,25 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
     setMenuOpen(false);
   };
 
+  // Delete this conversation. 'history' clears the messages and leaves the
+  // contact (name/tags/assignment) in place; 'contact' also removes the saved
+  // contact record. Either way the parent unselects the chat, because the
+  // window it is showing no longer exists.
+  const handleDeleteChat = async () => {
+    if (!deleteMode) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api.deleteChatHistory(waNumber, contactNumber, { withContact: deleteMode === 'contact' });
+      setDeleteMode(null);
+      onChatDeleted?.({ contactNumber, contactRemoved: deleteMode === 'contact' });
+    } catch (err) {
+      setDeleteError(prettyError(err));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const headerIconBtn = {
     width: 32, height: 32, borderRadius: '50%', border: 'none', background: 'transparent',
     cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1038,6 +1079,27 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
                   >
                     <Download size={15} color={C.textSecondary} /><span>Export chat</span>
                   </button>
+                  {/* Anyone who can open this conversation may delete it — the
+                      backend applies the same assertContactAccess check. */}
+                  <>
+                      <div style={{ height: 1, background: C.border }} />
+                      <button
+                        onClick={() => { setDeleteMode('history'); setMenuOpen(false); }}
+                        style={{ ...menuItemStyle, color: C.primary }}
+                        onMouseEnter={e => { e.currentTarget.style.background = '#FEF2F2'; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = '#fff'; }}
+                      >
+                        <Trash2 size={15} color={C.primary} /><span>Delete chat history</span>
+                      </button>
+                      <button
+                        onClick={() => { setDeleteMode('contact'); setMenuOpen(false); }}
+                        style={{ ...menuItemStyle, color: C.primary }}
+                        onMouseEnter={e => { e.currentTarget.style.background = '#FEF2F2'; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = '#fff'; }}
+                      >
+                        <Trash2 size={15} color={C.primary} /><span>Delete contact &amp; chat</span>
+                      </button>
+                  </>
                 </div>
               )}
             </div>
@@ -1498,6 +1560,25 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved }) 
           onSend={handleSendLibraryMedia}
         />
       )}
+
+      <DeleteConfirmModal
+        open={!!deleteMode}
+        title={deleteMode === 'contact' ? 'Delete contact & chat' : 'Delete chat history'}
+        message={
+          <>
+            {deleteMode === 'contact'
+              ? <>This permanently deletes every message with <b>{contactName || `+${maskPhone(contactNumber)}`}</b> on this WhatsApp number, along with their saved name, tags, custom fields and assignment.</>
+              : <>This permanently deletes every message with <b>{contactName || `+${maskPhone(contactNumber)}`}</b> on this WhatsApp number, including any photos, voice notes and documents. The contact’s name, tags and assignment are kept.</>}
+            <div style={{ marginTop: 10, color: C.primary, fontWeight: 600 }}>This cannot be undone.</div>
+            {deleteError && (
+              <div style={{ marginTop: 10, color: C.primary }}>{deleteError}</div>
+            )}
+          </>
+        }
+        confirmText={deleting ? 'Deleting\u2026' : (deleteMode === 'contact' ? 'Delete contact & chat' : 'Delete history')}
+        onConfirm={deleting ? () => {} : handleDeleteChat}
+        onCancel={() => { if (!deleting) { setDeleteMode(null); setDeleteError(null); } }}
+      />
     </div>
   );
 }

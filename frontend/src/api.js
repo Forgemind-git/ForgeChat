@@ -48,6 +48,10 @@ export const api = {
     req(`/saved-contacts?waNumber=${encodeURIComponent(waNumber)}`),
   deleteContact: (waNumber, contactNumber) =>
     req(`/contact?waNumber=${encodeURIComponent(waNumber)}&contactNumber=${encodeURIComponent(contactNumber)}`, { method: 'DELETE' }),
+  // Wipe a conversation (admin only). withContact:true also removes the saved
+  // contact record — the two 3-dot menu items in ChatWindow map onto this flag.
+  deleteChatHistory: (waNumber, contactNumber, { withContact = false } = {}) =>
+    req(`/chat-history?waNumber=${encodeURIComponent(waNumber)}&contactNumber=${encodeURIComponent(contactNumber)}${withContact ? '&withContact=1' : ''}`, { method: 'DELETE' }),
   // Change a contact's phone number — migrates the conversation + history across
   // every table keyed on (wa_number, contact_number), transactionally.
   changeContactNumber: (waNumber, oldNumber, newNumber) =>
