@@ -11,7 +11,7 @@ const { uploadMedia } = require('../integrations/metaSend');
 const { markAccountHealth, classifyMetaError } = require('../services/accountHealth');
 const storage = require('../util/pgStorage');
 const { syncMediaToAccount } = require('./mediaLibrary');
-const { assertWaAccess, assertContactAccess } = require('../middleware/access');
+const { assertWaAccess, assertContactAccess, auditLog } = require('../middleware/access');
 const { isAdmin } = require('../permissions');
 const { canonicalizeMime, chatKindFor, CHAT_TYPES_MSG } = require('../util/metaMime');
 const ExcelJS = require('exceljs');
@@ -81,6 +81,17 @@ function persistOutboundMedia({ accountPhoneDigits, messageId, buffer, ext }) {
   const absPath = path.join(dir, filename);
   fs.writeFileSync(absPath, buffer);
   return { absPath, size: buffer.length };
+}
+
+/**
+ * Only ever touch files that really live under MEDIA_DIR. media_storage_path is
+ * DB-sourced, so a traversal value there must never reach the wider filesystem.
+ * Mirrors the same guard the media-streaming route applies on read.
+ */
+function resolveInMediaDir(p) {
+  if (!p) return null;
+  const resolved = path.resolve(p);
+  return resolved.startsWith(path.resolve(MEDIA_DIR) + path.sep) ? resolved : null;
 }
 
 const router = Router();
@@ -593,6 +604,96 @@ router.delete('/contact', async (req, res) => {
     console.error('[messages] DELETE /contact error:', err.message);
     res.status(500).json({ error: 'Failed to delete contact' });
   }
+});
+
+// DELETE /api/chat-history?waNumber=xxx&contactNumber=xxx[&withContact=1]
+// Admin-only, irreversible. Wipes one conversation, keyed on the same
+// (wa_number, contact_number) pair everything else in this file is keyed on:
+// its chat_history rows, their reactions, and the read marker that drives the
+// unread badge. Media owned by those messages is unlinked from MEDIA_DIR —
+// those files are per-message copies (see persistOutboundMedia), never shared
+// with the media library, so removing them cannot orphan anything else.
+//
+// withContact=1 also drops the saved contact record (name / profile_name / tags
+// / custom fields / assignment) — the "Delete contact & chat" menu item. Deals
+// and automation_executions are deliberately left alone: they are CRM history,
+// not chat history.
+router.delete('/chat-history', async (req, res) => {
+  // Destructive and unrecoverable, so it is gated on role rather than on
+  // conversation access — a BDA can read and reply to their chats, not erase them.
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  const waNumber = String(req.query.waNumber || req.body?.waNumber || '').replace(/\D/g, '');
+  const contactNumber = String(req.query.contactNumber || req.body?.contactNumber || '').replace(/\D/g, '');
+  const withContact = String(req.query.withContact ?? req.body?.withContact ?? '') === '1';
+  if (!waNumber || !contactNumber) {
+    return res.status(400).json({ error: 'waNumber and contactNumber required' });
+  }
+
+  const client = await pool.connect();
+  let mediaPaths = [];
+  let deletedMessages = 0;
+  let deletedContact = 0;
+  try {
+    await client.query('BEGIN');
+    // Read the media paths first — once the rows are gone there is no way back
+    // to them, and the files would linger on the volume forever.
+    const media = await client.query(
+      `SELECT media_storage_path FROM coexistence.chat_history
+        WHERE wa_number = $1 AND contact_number = $2 AND media_storage_path IS NOT NULL`,
+      [waNumber, contactNumber]
+    );
+    mediaPaths = media.rows.map(r => r.media_storage_path);
+
+    const del = await client.query(
+      `DELETE FROM coexistence.chat_history WHERE wa_number = $1 AND contact_number = $2`,
+      [waNumber, contactNumber]
+    );
+    deletedMessages = del.rowCount;
+
+    await client.query(
+      `DELETE FROM coexistence.message_reactions WHERE wa_number = $1 AND contact_number = $2`,
+      [waNumber, contactNumber]
+    );
+    await client.query(
+      `DELETE FROM coexistence.conversation_reads WHERE wa_number = $1 AND contact_number = $2`,
+      [waNumber, contactNumber]
+    );
+    if (withContact) {
+      const c = await client.query(
+        `DELETE FROM coexistence.contacts WHERE wa_number = $1 AND contact_number = $2`,
+        [waNumber, contactNumber]
+      );
+      deletedContact = c.rowCount;
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[messages] DELETE /chat-history error:', err.message);
+    return res.status(500).json({ error: 'Failed to delete chat history' });
+  } finally {
+    client.release();
+  }
+
+  // Best-effort file cleanup. The DB commit above is the source of truth, so a
+  // failed unlink must not fail the request — it only leaves an orphan blob.
+  let filesRemoved = 0;
+  for (const p of mediaPaths) {
+    const abs = resolveInMediaDir(p);
+    if (!abs) continue;
+    try { fs.unlinkSync(abs); filesRemoved++; } catch {}
+  }
+
+  await auditLog({
+    actor: req.user,
+    action: withContact ? 'chat.delete_with_contact' : 'chat.delete_history',
+    targetType: 'conversation',
+    targetId: `${waNumber}:${contactNumber}`,
+    payload: { deletedMessages, deletedContact, filesRemoved },
+  });
+
+  res.json({ ok: true, deletedMessages, deletedContact, filesRemoved });
 });
 
 // GET /api/saved-contacts?waNumber=xxx

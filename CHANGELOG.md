@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Delete a chat** — the 3-dot menu inside an open conversation now offers
+  *Delete chat history* (wipes every message, reaction and stored media for that
+  contact, keeping their name, tags and assignment) and *Delete contact & chat*
+  (also removes the saved contact record). Admin-only, behind a confirm dialog,
+  and recorded in the audit log. Deals and automation history are left intact.
+
 ## [1.2.1] - 2026-06-17
 
 ### Fixed

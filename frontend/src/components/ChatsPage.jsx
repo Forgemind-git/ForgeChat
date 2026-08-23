@@ -67,6 +67,13 @@ export default function ChatsPage({ subParts = [], navigate, user }) {
   const selectNumber = (n) => { setSelectedNumber(n); setSelectedContact(null); };
   const selectContact = (c) => setSelectedContact(c);
 
+  // A deleted conversation can't stay open — drop the selection and refetch the
+  // contact list so the row's last-message preview (or the row itself) updates.
+  const handleChatDeleted = useCallback(() => {
+    setSelectedContact(null);
+    setContactRefreshKey(k => k + 1);
+  }, []);
+
   // Drag the divider to resize the contacts list; the chat window (flex:1) takes the rest.
   const startResize = useCallback((e) => {
     e.preventDefault();
@@ -149,7 +156,9 @@ export default function ChatsPage({ subParts = [], navigate, user }) {
           key={`${selectedNumber}-${selectedContact}`}
           waNumber={selectedNumber}
           contactNumber={selectedContact}
+          user={user}
           onContactSaved={() => setContactRefreshKey(k => k + 1)}
+          onChatDeleted={handleChatDeleted}
         />
       ) : (
         <div style={{
