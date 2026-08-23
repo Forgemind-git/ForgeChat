@@ -607,7 +607,7 @@ router.delete('/contact', async (req, res) => {
 });
 
 // DELETE /api/chat-history?waNumber=xxx&contactNumber=xxx[&withContact=1]
-// Admin-only, irreversible. Wipes one conversation, keyed on the same
+// Irreversible. Wipes one conversation, keyed on the same
 // (wa_number, contact_number) pair everything else in this file is keyed on:
 // its chat_history rows, their reactions, and the read marker that drives the
 // unread badge. Media owned by those messages is unlinked from MEDIA_DIR —
@@ -619,22 +619,22 @@ router.delete('/contact', async (req, res) => {
 // and automation_executions are deliberately left alone: they are CRM history,
 // not chat history.
 router.delete('/chat-history', async (req, res) => {
-  // Destructive and unrecoverable, so it is gated on role rather than on
-  // conversation access — a BDA can read and reply to their chats, not erase them.
-  if (!isAdmin(req.user)) {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
   const waNumber = String(req.query.waNumber || req.body?.waNumber || '').replace(/\D/g, '');
   const contactNumber = String(req.query.contactNumber || req.body?.contactNumber || '').replace(/\D/g, '');
   const withContact = String(req.query.withContact ?? req.body?.withContact ?? '') === '1';
   if (!waNumber || !contactNumber) {
     return res.status(400).json({ error: 'waNumber and contactNumber required' });
   }
+  // Anyone who can open the conversation may erase it; admins bypass as always.
+  // Still fully audited below, so a deletion is always attributable.
+  if (!(await assertContactAccess(req, res, waNumber, contactNumber))) return;
 
   const client = await pool.connect();
   let mediaPaths = [];
   let deletedMessages = 0;
   let deletedContact = 0;
+  let deletedAgentRuns = 0;
+  let deletedWebhookEvents = 0;
   try {
     await client.query('BEGIN');
     // Read the media paths first — once the rows are gone there is no way back
@@ -660,6 +660,41 @@ router.delete('/chat-history', async (req, res) => {
       `DELETE FROM coexistence.conversation_reads WHERE wa_number = $1 AND contact_number = $2`,
       [waNumber, contactNumber]
     );
+    // AI-agent traces for this conversation. agent_runs.final_reply holds the
+    // text the agent actually sent this contact, and agent_run_steps (the full
+    // prompt / tool-call / output transcript) cascades off the run — so text
+    // would survive a chat wipe if we stopped at chat_history. These key on
+    // wa_account_id, not wa_number, hence the account lookup.
+    const acct = await client.query(
+      `SELECT id FROM coexistence.whatsapp_accounts
+        WHERE regexp_replace(display_phone_number, '\\D', '', 'g') = $1`,
+      [waNumber]
+    );
+    const accountIds = acct.rows.map(r => r.id);
+    if (accountIds.length > 0) {
+      const runs = await client.query(
+        `DELETE FROM coexistence.agent_runs
+          WHERE wa_account_id = ANY($1::bigint[]) AND contact_number = $2`,
+        [accountIds, contactNumber]
+      );
+      deletedAgentRuns = runs.rowCount;
+    }
+
+    // Raw Meta webhook payloads. These carry the verbatim message text and the
+    // media ids, so leaving them behind means a "deleted" chat is still fully
+    // readable in the webhook log. Matched on the four places a contact's
+    // number appears in Meta's envelope; jsonpath keeps it precise so we never
+    // catch a different contact's events.
+    const waEvents = await client.query(
+      `DELETE FROM coexistence.webhook_events
+        WHERE payload @? ('$.entry[*].changes[*].value.messages[*].from ? (@ == "' || $1 || '")')::jsonpath
+           OR payload @? ('$.entry[*].changes[*].value.statuses[*].recipient_id ? (@ == "' || $1 || '")')::jsonpath
+           OR payload @? ('$.entry[*].changes[*].value.contacts[*].wa_id ? (@ == "' || $1 || '")')::jsonpath
+           OR payload @? ('$.entry[*].changes[*].value.message_echoes[*].to ? (@ == "' || $1 || '")')::jsonpath`,
+      [contactNumber]
+    );
+    deletedWebhookEvents = waEvents.rowCount;
+
     if (withContact) {
       const c = await client.query(
         `DELETE FROM coexistence.contacts WHERE wa_number = $1 AND contact_number = $2`,
@@ -690,10 +725,10 @@ router.delete('/chat-history', async (req, res) => {
     action: withContact ? 'chat.delete_with_contact' : 'chat.delete_history',
     targetType: 'conversation',
     targetId: `${waNumber}:${contactNumber}`,
-    payload: { deletedMessages, deletedContact, filesRemoved },
+    payload: { deletedMessages, deletedContact, filesRemoved, deletedAgentRuns, deletedWebhookEvents },
   });
 
-  res.json({ ok: true, deletedMessages, deletedContact, filesRemoved });
+  res.json({ ok: true, deletedMessages, deletedContact, filesRemoved, deletedAgentRuns, deletedWebhookEvents });
 });
 
 // GET /api/saved-contacts?waNumber=xxx

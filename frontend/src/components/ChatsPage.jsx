@@ -136,6 +136,7 @@ export default function ChatsPage({ subParts = [], navigate, user }) {
             onSelectContact={selectContact}
             refreshKey={contactRefreshKey}
             user={user}
+            onChatDeleted={handleChatDeleted}
           />
           {/* Drag handle: resize contacts list ⇄ chat window */}
           <div

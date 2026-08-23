@@ -126,9 +126,8 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved, us
   const [headerSaving, setHeaderSaving] = useState(false);
   const tagMenuRef = useRef(null);
   const assignMenuRef = useRef(null);
-  // Chat deletion (admin only): null | 'history' | 'contact' — drives which
-  // confirm copy the shared modal shows and which flag the API call sends.
-  const isAdmin = user?.role === 'admin';
+  // Chat deletion: null | 'history' | 'contact' — drives which confirm copy the
+  // shared modal shows and which flag the API call sends.
   const [deleteMode, setDeleteMode] = useState(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState(null);
@@ -1080,10 +1079,9 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved, us
                   >
                     <Download size={15} color={C.textSecondary} /><span>Export chat</span>
                   </button>
-                  {/* Destructive actions are admin-only and mirror the backend
-                      role gate on DELETE /api/chat-history. */}
-                  {isAdmin && (
-                    <>
+                  {/* Anyone who can open this conversation may delete it — the
+                      backend applies the same assertContactAccess check. */}
+                  <>
                       <div style={{ height: 1, background: C.border }} />
                       <button
                         onClick={() => { setDeleteMode('history'); setMenuOpen(false); }}
@@ -1101,8 +1099,7 @@ export default function ChatWindow({ waNumber, contactNumber, onContactSaved, us
                       >
                         <Trash2 size={15} color={C.primary} /><span>Delete contact &amp; chat</span>
                       </button>
-                    </>
-                  )}
+                  </>
                 </div>
               )}
             </div>

@@ -11,8 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Delete a chat** — the 3-dot menu inside an open conversation now offers
   *Delete chat history* (wipes every message, reaction and stored media for that
   contact, keeping their name, tags and assignment) and *Delete contact & chat*
-  (also removes the saved contact record). Admin-only, behind a confirm dialog,
-  and recorded in the audit log. Deals and automation history are left intact.
+  (also removes the saved contact record). Available both from the open chat and
+  from a hover menu on each row of the chat list, behind a confirm dialog, and
+  recorded in the audit log.
+
+  The wipe covers everything holding that conversation's content: messages,
+  reactions, the read marker, stored media on disk, the AI agent's run history
+  and step transcripts, and the raw Meta webhook payloads (which carry the
+  verbatim message text). Deals and automation history are left intact — they
+  are CRM history, not chat history.
 
 ## [1.2.1] - 2026-06-17
 
